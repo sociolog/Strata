@@ -51,6 +51,8 @@ bool Exl3LaneMoe::init(int n_embd, int n_ff, std::string& err) {
     down_done_.reset(new std::atomic<int>[B]);
     const char* f = std::getenv("STRATA_EXL3_LANE_FUSED");
     if (f != nullptr) fused_ = std::atoi(f) != 0;
+    const char* wh = std::getenv("STRATA_EXL3_LANE_WHOLE");
+    if (wh != nullptr) whole_ = std::atoi(wh) != 0;
     return true;
 }
 
@@ -107,7 +109,10 @@ void Exl3LaneMoe::batch(ExpertPool* pool, const Exl3ExpertJob* jobs, int n) {
             for (int i = 0; i < tasks; ++i) fn(this, i, 0);
         ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     };
-    if (fused_) {
+    const int threads = pool != nullptr ? pool->workers() + (pool->host_works() ? 1 : 0) : 1;
+    if (whole_ && pool != nullptr && n >= threads) {
+        phase(n, &task_whole, ms_gu);   // the whole time under gate/up
+    } else if (fused_) {
         // the counters are reset before the publish (run_tasks' release), so every task sees them at zero
         for (int b = 0; b < n; ++b) {
             gu_done_[(size_t) b].store(0, std::memory_order_relaxed);
@@ -181,6 +186,16 @@ void Exl3LaneMoe::task_mid(void* ctx, int task, int /*thread*/) {
         for (int i = 0; i < 128; ++i) h[i] = silu(g[i]) * u[i];
         s.bsd(b, t, c) = exl3_cpu_prepare_block(j.e.down.suh + c0, h, s.xd(b, t) + c0);
     }
+}
+
+// expert b alone, by one thread: its tasks of the four phases in their order (the serial run's work for it)
+void Exl3LaneMoe::task_whole(void* ctx, int b, int thread) {
+    Exl3LaneMoe& s = *(Exl3LaneMoe*) ctx;
+    const int bands = s.ff_ / 128;
+    for (int i = 0; i < 2 * s.pgu_; ++i) task_gu(ctx, b * 2 * s.pgu_ + i, thread);
+    for (int c = 0; c < bands; ++c) task_mid(ctx, b * bands + c, thread);
+    for (int q = 0; q < s.pdn_; ++q) task_down(ctx, b * s.pdn_ + q, thread);
+    for (int c = 0; c < s.hb_; ++c) task_out(ctx, b * s.hb_ + c, thread);
 }
 
 void Exl3LaneMoe::wait_for(const std::atomic<int>& c, int target) const {

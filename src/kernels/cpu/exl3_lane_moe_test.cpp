@@ -133,21 +133,25 @@ void test_moe(const std::vector<cpu::Exl3Expert>& experts, const std::string& wh
     char buf[96];
     std::snprintf(buf, sizeof buf, "%zu rows, worst %.2e of the row's largest", r, worst);
     report(what + ": split vs unsplit", finite && worst < 1e-4, buf);
-    // the pool, three sizes, the four phases and the fused one: the serial rows bit for bit
-    for (const bool fused : {false, true})
+    // the pool, three sizes, the four phases, the fused one and whole experts: the serial rows bit for bit
+    for (const int mode : {0, 1, 2})   // 0 four phases, 1 fused, 2 whole experts where the batch allows
         for (int workers : {1, 3, 9}) {
+            const bool fused = mode == 1;
             cpu::ExpertPool pool(workers, /*pin=*/false, /*host_works=*/true);
             make_jobs(experts, xs, pooled, jobs);
             moe.set_fused(fused);
+            moe.set_whole(mode == 2);
             const bool ran = moe.run(pool, jobs.data(), (int) jobs.size(), err);
             moe.set_fused(false);
+            moe.set_whole(false);
             if (!ran) {
                 report(what + " pool", false, err);
                 return;
             }
             size_t diff = 0;
             for (size_t i = 0; i < serial.size(); ++i) diff += std::memcmp(&serial[i], &pooled[i], sizeof(float)) != 0;
-            report(what + ": " + (fused ? "fused " : "") + "pool of " + std::to_string(workers) + " (+ host) vs serial",
+            report(what + ": " + (mode == 2 ? "whole " : fused ? "fused " : "") + "pool of " + std::to_string(workers) +
+                       " (+ host) vs serial",
                    diff == 0, std::to_string(diff) + " of " + std::to_string(serial.size()) + " differ");
         }
     // a job that does not match the shape is refused with a message, nothing run

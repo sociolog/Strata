@@ -52,6 +52,12 @@ public:
     /// STRATA_EXL3_LANE_FUSED=0 keeps the four phases (an A/B arm).
     void set_fused(bool on) { fused_ = on; }
     bool fused() const { return fused_; }
+    /// With at least as many experts in a batch as the pool has threads, one task an expert (its pieces, bands and
+    /// rows in the serial order, by one thread): no dependencies, every expert one sequential read.  The same work in
+    /// the same order: the rows are the other modes' bit for bit.  OFF by default - measured (K4, 10 experts a batch,
+    /// 9 workers + host): 70.8 against the fused phase's 67.1 us an expert at 1 token, 79.0 / 70.9 at 2, level at 3
+    /// (the batch waits for its slowest thread's expert; the fused pieces balance).  STRATA_EXL3_LANE_WHOLE=1 for A/B.
+    void set_whole(bool on) { whole_ = on; }
 
     /// Accumulated wall time of the four phases (ms), and what went through them.
     double ms_gu = 0, ms_mid = 0, ms_down = 0, ms_out = 0;
@@ -65,6 +71,7 @@ private:
     static void task_down(void* ctx, int task, int thread);
     static void task_out(void* ctx, int task, int thread);
     static void task_fused(void* ctx, int task, int thread);
+    static void task_whole(void* ctx, int task, int thread);
     void wait_for(const std::atomic<int>& c, int target) const;
     float* xg(int b, int t) { return buf_.data() + off_xg_ + ((size_t) b * MAXT + t) * (size_t) h_; }
     float* xu(int b, int t) { return buf_.data() + off_xu_ + ((size_t) b * MAXT + t) * (size_t) h_; }
@@ -85,6 +92,7 @@ private:
     const Exl3ExpertJob* jobs_ = nullptr;   // the batch in flight
     int nb_ = 0;                            // its size
     bool fused_ = true;
+    bool whole_ = false;
     // the fused phase's counters, per batch slot: gate/up pieces done, a band's down input ready, down pieces done
     std::unique_ptr<std::atomic<int>[]> gu_done_, mid_ready_, down_done_;
 };
