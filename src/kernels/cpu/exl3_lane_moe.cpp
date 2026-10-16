@@ -4,7 +4,16 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define EXL3_LANE_PAUSE() _mm_pause()
+#else
+#include <thread>
+#define EXL3_LANE_PAUSE() std::this_thread::yield()
+#endif
 
 namespace strata::kernels::cpu {
 
@@ -37,6 +46,11 @@ bool Exl3LaneMoe::init(int n_embd, int n_ff, std::string& err) {
     off_xd_ = off_pu_ + n_pg;
     off_pd_ = off_xd_ + n_xd;
     bs_.assign(B * T * 3 * (size_t) hb_, 0.0f);
+    gu_done_.reset(new std::atomic<int>[B]);
+    mid_ready_.reset(new std::atomic<int>[B * (size_t) pdn_]);
+    down_done_.reset(new std::atomic<int>[B]);
+    const char* f = std::getenv("STRATA_EXL3_LANE_FUSED");
+    if (f != nullptr) fused_ = std::atoi(f) != 0;
     return true;
 }
 
@@ -85,6 +99,7 @@ bool Exl3LaneMoe::run_serial(const Exl3ExpertJob* jobs, int n, std::string& err)
 
 void Exl3LaneMoe::batch(ExpertPool* pool, const Exl3ExpertJob* jobs, int n) {
     jobs_ = jobs;
+    nb_ = n;
     auto phase = [&](int tasks, ExpertPool::TaskFn fn, double& ms) {
         const auto t0 = std::chrono::steady_clock::now();
         if (pool != nullptr) pool->run_tasks(tasks, fn, this);
@@ -92,10 +107,20 @@ void Exl3LaneMoe::batch(ExpertPool* pool, const Exl3ExpertJob* jobs, int n) {
             for (int i = 0; i < tasks; ++i) fn(this, i, 0);
         ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     };
-    phase(n * 2 * pgu_, &task_gu, ms_gu);
-    phase(n * (ff_ / 128), &task_mid, ms_mid);
-    phase(n * pdn_, &task_down, ms_down);
-    phase(n * hb_, &task_out, ms_out);
+    if (fused_) {
+        // the counters are reset before the publish (run_tasks' release), so every task sees them at zero
+        for (int b = 0; b < n; ++b) {
+            gu_done_[(size_t) b].store(0, std::memory_order_relaxed);
+            down_done_[(size_t) b].store(0, std::memory_order_relaxed);
+            for (int q = 0; q < pdn_; ++q) mid_ready_[(size_t) b * pdn_ + q].store(0, std::memory_order_relaxed);
+        }
+        phase(n * (2 * pgu_ + ff_ / 128 + pdn_ + hb_), &task_fused, ms_gu);   // the whole time under gate/up
+    } else {
+        phase(n * 2 * pgu_, &task_gu, ms_gu);
+        phase(n * (ff_ / 128), &task_mid, ms_mid);
+        phase(n * pdn_, &task_down, ms_down);
+        phase(n * hb_, &task_out, ms_out);
+    }
     for (int i = 0; i < n; ++i) {
         ++experts;
         expert_tokens += jobs[i].nt;
@@ -156,6 +181,45 @@ void Exl3LaneMoe::task_mid(void* ctx, int task, int /*thread*/) {
         for (int i = 0; i < 128; ++i) h[i] = silu(g[i]) * u[i];
         s.bsd(b, t, c) = exl3_cpu_prepare_block(j.e.down.suh + c0, h, s.xd(b, t) + c0);
     }
+}
+
+void Exl3LaneMoe::wait_for(const std::atomic<int>& c, int target) const {
+    while (c.load(std::memory_order_acquire) < target) EXL3_LANE_PAUSE();
+}
+
+// the four phases as one: tasks [gate/up pieces | mid bands | down pieces | out bands], each block expert-major; a
+// task's inputs come only from tasks of its own expert in the blocks before, so they were claimed first and finish
+// without waiting on anything later (no deadlock).  The work of each task is the phased one's, in the same order.
+void Exl3LaneMoe::task_fused(void* ctx, int task, int thread) {
+    Exl3LaneMoe& s = *(Exl3LaneMoe*) ctx;
+    const int n = s.nb_, bands = s.ff_ / 128;
+    const int n_gu = n * 2 * s.pgu_, n_mid = n * bands, n_down = n * s.pdn_;
+    if (task < n_gu) {
+        task_gu(ctx, task, thread);
+        s.gu_done_[(size_t) (task / (2 * s.pgu_))].fetch_add(1, std::memory_order_release);
+        return;
+    }
+    task -= n_gu;
+    if (task < n_mid) {
+        const int b = task / bands, c = task % bands;
+        s.wait_for(s.gu_done_[(size_t) b], 2 * s.pgu_);
+        task_mid(ctx, task, thread);
+        // the down matrix's input block c (= down piece c, pdn_ == bands) is ready
+        s.mid_ready_[(size_t) b * s.pdn_ + c].store(1, std::memory_order_release);
+        return;
+    }
+    task -= n_mid;
+    if (task < n_down) {
+        const int b = task / s.pdn_, q = task % s.pdn_;
+        s.wait_for(s.mid_ready_[(size_t) b * s.pdn_ + q], 1);
+        task_down(ctx, task, thread);
+        s.down_done_[(size_t) b].fetch_add(1, std::memory_order_release);
+        return;
+    }
+    task -= n_down;
+    const int b = task / s.hb_;
+    s.wait_for(s.down_done_[(size_t) b], s.pdn_);   // every down piece, hence every mid band (bsd) of the expert
+    task_out(ctx, task, thread);
 }
 
 // down, piece q of expert b: its 8 slices (input block q) for every column and every token

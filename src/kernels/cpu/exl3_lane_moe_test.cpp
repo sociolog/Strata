@@ -5,7 +5,7 @@
 //   exl3_lane_moe_test --real <model dir>  plus the RAM tier of layers 0-1 against the file, and the MoE on it
 //
 // 1. Fixed cuts: the pool's rows are the serial run's bit for bit with 1, 3 and 9 workers (the split never depends on
-//    the thread count), for 1..3 tokens an expert and batches past kMaxBatch.
+//    the thread count), for 1..3 tokens an expert and batches past kMaxBatch - in four phases and fused into one.
 // 2. The rows against an unsplit reference (each matrix in one split-K pass, exl3_cpu_band_out): equal up to the order
 //    of the piece sums - measured 1.1e-5 / 1.4e-5 of the row's largest (K4 / K5, random weights through gate/up,
 //    SwiGLU and down); the limit is 1e-4, where a wrong cut or band would be of order 1.
@@ -133,19 +133,23 @@ void test_moe(const std::vector<cpu::Exl3Expert>& experts, const std::string& wh
     char buf[96];
     std::snprintf(buf, sizeof buf, "%zu rows, worst %.2e of the row's largest", r, worst);
     report(what + ": split vs unsplit", finite && worst < 1e-4, buf);
-    // the pool, three sizes: the serial rows bit for bit
-    for (int workers : {1, 3, 9}) {
-        cpu::ExpertPool pool(workers, /*pin=*/false, /*host_works=*/true);
-        make_jobs(experts, xs, pooled, jobs);
-        if (!moe.run(pool, jobs.data(), (int) jobs.size(), err)) {
-            report(what + " pool", false, err);
-            return;
+    // the pool, three sizes, the four phases and the fused one: the serial rows bit for bit
+    for (const bool fused : {false, true})
+        for (int workers : {1, 3, 9}) {
+            cpu::ExpertPool pool(workers, /*pin=*/false, /*host_works=*/true);
+            make_jobs(experts, xs, pooled, jobs);
+            moe.set_fused(fused);
+            const bool ran = moe.run(pool, jobs.data(), (int) jobs.size(), err);
+            moe.set_fused(false);
+            if (!ran) {
+                report(what + " pool", false, err);
+                return;
+            }
+            size_t diff = 0;
+            for (size_t i = 0; i < serial.size(); ++i) diff += std::memcmp(&serial[i], &pooled[i], sizeof(float)) != 0;
+            report(what + ": " + (fused ? "fused " : "") + "pool of " + std::to_string(workers) + " (+ host) vs serial",
+                   diff == 0, std::to_string(diff) + " of " + std::to_string(serial.size()) + " differ");
         }
-        size_t diff = 0;
-        for (size_t i = 0; i < serial.size(); ++i) diff += std::memcmp(&serial[i], &pooled[i], sizeof(float)) != 0;
-        report(what + ": pool of " + std::to_string(workers) + " (+ host) vs serial", diff == 0,
-               std::to_string(diff) + " of " + std::to_string(serial.size()) + " differ");
-    }
     // a job that does not match the shape is refused with a message, nothing run
     cpu::Exl3ExpertJob bad = jobs[0];
     bad.e.down.n = 1280;

@@ -11,13 +11,18 @@
 //            B   down in split-K pieces of 128 inputs (one input block each)
 //            H2  per 128-column band: the pieces summed in order, the outputs' transform
 //          fixed cuts, so the sums do not depend on the thread count
+//   engine the engine's own path: Strata's ExpertPool (T-1 pinned workers + the host, as --pool-workers T-1) running
+//          Exl3LaneMoe's four phases, --batch experts at a time
+//   fused  the same with Exl3LaneMoe's phases fused into one (per-expert dependencies, no barriers)
 //
 // Prints GB/s of weights and the pool's time per expert and per expert-token (an expert's wall time on T threads).
 //
-//     exl3_lane_bench [--K 4,5] [--threads 9,10] [--nt 1,2,3,4,8] [--mb 4096] [--reps 5] [--mode own,split]
+//     exl3_lane_bench [--K 4,5] [--threads 9,10] [--nt 1,2,3,4,8] [--mb 4096] [--reps 5] [--mode own,split,engine,fused]
 //                     [--batch 4] [--kernel rows|bands] [--ram-gbs N]
 #include "strata/kernels/cpu/exl3_lane.hpp"
+#include "strata/kernels/cpu/exl3_lane_moe.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
 #include <algorithm>
@@ -451,8 +456,8 @@ int main(int argc, char** argv) {
             !check_split(L, blobs, std::min<int>(batch, (int) E), x, std::min(3, kMaxT), std::max(1, threads[0])))
             return 1;
         for (const std::string& mode : modes) {
-            if (mode != "own" && mode != "split") {
-                std::printf("  mode %s: unknown (own, split)\n", mode.c_str());
+            if (mode != "own" && mode != "split" && mode != "engine" && mode != "fused") {
+                std::printf("  mode %s: unknown (own, split, engine, fused)\n", mode.c_str());
                 continue;
             }
             for (int nt : nts)
@@ -479,6 +484,48 @@ int main(int argc, char** argv) {
                             for (auto& t : th) t.join();
                             secs.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
                         }
+                    } else if (mode == "engine" || mode == "fused") {
+                        // T threads = T-1 pinned pool workers + this thread as the pool's host (pinned where the engine
+                        // puts its host loop)
+                        cpu::ExpertPool pool(std::max(1, T - 1), /*pin=*/true, /*host_works=*/true);
+                        const cpu::ThreadAffinity prev = cpu::pin_current_thread(cpu::planned_host_core());
+                        cpu::Exl3LaneMoe moe;
+                        std::string err;
+                        if (!moe.init(kH, kFF, err)) {
+                            std::fprintf(stderr, "exl3_lane_bench: %s\n", err.c_str());
+                            return 1;
+                        }
+                        moe.set_fused(mode == "fused");
+                        std::vector<cpu::Exl3ExpertJob> jobs((size_t) batch);
+                        std::vector<float> outb((size_t) batch * kMaxT * kH);
+                        for (int rep = 0; rep < reps; ++rep) {
+                            moe.ms_gu = moe.ms_mid = moe.ms_down = moe.ms_out = 0;
+                            const auto t0 = std::chrono::steady_clock::now();
+                            for (size_t e0 = 0; e0 + (size_t) batch <= E; e0 += (size_t) batch) {
+                                for (int b = 0; b < batch; ++b) {
+                                    const uint8_t* blob = blobs + (e0 + (size_t) b) * L.bytes;
+                                    cpu::Exl3ExpertJob& j = jobs[(size_t) b];
+                                    j.e = cpu::Exl3Expert{L.part(blob, 0), L.part(blob, 1), L.part(blob, 2)};
+                                    j.nt = nt;
+                                    for (int t = 0; t < nt; ++t) {
+                                        j.x[t] = x[t];
+                                        j.out[t] = &outb[((size_t) b * kMaxT + t) * kH];
+                                    }
+                                }
+                                if (!moe.run(pool, jobs.data(), batch, err)) {
+                                    std::fprintf(stderr, "exl3_lane_bench: %s\n", err.c_str());
+                                    return 1;
+                                }
+                            }
+                            secs.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                            if (rep == 0 || secs.back() <= *std::min_element(secs.begin(), secs.end())) {
+                                pt.a = moe.ms_gu / 1e3;
+                                pt.h1 = moe.ms_mid / 1e3;
+                                pt.b = moe.ms_down / 1e3;
+                                pt.h2 = moe.ms_out / 1e3;
+                            }
+                        }
+                        cpu::restore_thread_affinity(prev);
                     } else {
                         Pool pool(T);
                         SplitBufs sb(batch);
@@ -503,7 +550,7 @@ int main(int argc, char** argv) {
                                 mode.c_str(), nt, T, gbs, us, us_best, us / nt,
                                 ram > 0 ? (" = " + std::to_string((int) std::lround(100 * gbs / ram)) + "% of RAM").c_str()
                                         : "");
-                    if (mode == "split") {
+                    if (mode != "own") {
                         const double n = (double) done;
                         std::printf("        phases per expert (fastest round): gate/up %.2f, band+SwiGLU %.2f, down %.2f, "
                                     "out %.2f us\n",

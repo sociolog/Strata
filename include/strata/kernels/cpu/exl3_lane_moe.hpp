@@ -13,7 +13,9 @@
 #include "strata/kernels/cpu/exl3_lane.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -43,6 +45,13 @@ public:
     /// The same on the calling thread alone, the same cuts and order (tests: the rows equal run's bit for bit).
     bool run_serial(const Exl3ExpertJob* jobs, int n, std::string& err);
     static constexpr int kMaxBatch = 32;
+    /// One pool phase a batch instead of four: every task waits only for its own expert's inputs (per-expert counters,
+    /// the dependencies always earlier in the claim order, so it cannot deadlock) - no barrier between the phases and
+    /// no tail of one phase before the next starts.  The same cuts and sums: the rows are the four phases' bit for bit.
+    /// ON by default (measured, K4, 10 threads: 61.1 vs 64.6 us an expert at 10 experts a batch, 64.7 vs 72.0 at 3);
+    /// STRATA_EXL3_LANE_FUSED=0 keeps the four phases (an A/B arm).
+    void set_fused(bool on) { fused_ = on; }
+    bool fused() const { return fused_; }
 
     /// Accumulated wall time of the four phases (ms), and what went through them.
     double ms_gu = 0, ms_mid = 0, ms_down = 0, ms_out = 0;
@@ -55,6 +64,8 @@ private:
     static void task_mid(void* ctx, int task, int thread);
     static void task_down(void* ctx, int task, int thread);
     static void task_out(void* ctx, int task, int thread);
+    static void task_fused(void* ctx, int task, int thread);
+    void wait_for(const std::atomic<int>& c, int target) const;
     float* xg(int b, int t) { return buf_.data() + off_xg_ + ((size_t) b * MAXT + t) * (size_t) h_; }
     float* xu(int b, int t) { return buf_.data() + off_xu_ + ((size_t) b * MAXT + t) * (size_t) h_; }
     float* pg(int b, int p, int t) { return buf_.data() + off_pg_ + (((size_t) b * pgu_ + p) * MAXT + t) * (size_t) ff_; }
@@ -72,6 +83,10 @@ private:
     std::vector<float> buf_;
     std::vector<float> bs_;
     const Exl3ExpertJob* jobs_ = nullptr;   // the batch in flight
+    int nb_ = 0;                            // its size
+    bool fused_ = true;
+    // the fused phase's counters, per batch slot: gate/up pieces done, a band's down input ready, down pieces done
+    std::unique_ptr<std::atomic<int>[]> gu_done_, mid_ready_, down_done_;
 };
 
 }  // namespace strata::kernels::cpu

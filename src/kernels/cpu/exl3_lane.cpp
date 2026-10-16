@@ -627,6 +627,16 @@ EXL3_AVX2_INLINE __m256i avx2_gather(const __m256i (&C)[K]) {
 struct Avx2Consts {
     __m256i mult, ones8, ones16, low16;
 };
+
+// up to this many activations a tile's two halves are done at once (2N accumulators); more, one half after the
+// other (N accumulators)
+#ifndef EXL3_AVX2_BOTH_MAX_N
+#define EXL3_AVX2_BOTH_MAX_N 3
+#endif
+template <int K>
+constexpr int exl3_lane_both_max() {
+    return EXL3_AVX2_BOTH_MAX_N;
+}
 EXL3_AVX2_INLINE Avx2Consts avx2_consts() {
     return {_mm256_set1_epi32((int) kMul1), _mm256_set1_epi8(1), _mm256_set1_epi16(1), _mm256_set1_epi32(0xffff)};
 }
@@ -745,7 +755,7 @@ EXL3_AVX2 void band_avx2_n(const Exl3Part& m, const float* const* xh, int tc0, i
         for (int t = 0; t < 8; ++t) {
             __m256i C[K];
             avx2_classes<K>(row + t * W, C);
-            if constexpr (N <= 3) {
+            if constexpr (N <= exl3_lane_both_max<K>()) {
                 __m256 lo[N], hi[N];
                 for (int i = 0; i < N; ++i) lo[i] = acc[t][0][i], hi[i] = acc[t][1][i];
                 avx2_rows_n2<K, N, 0>(C, xk, lo, hi, k);
@@ -793,7 +803,7 @@ EXL3_AVX2 void rows_avx2_n(const Exl3Part& m, const float* const* xh, int ks0, i
                 avx2_rows<K, 0>(C, xk[0], lo, hi, k);
                 _mm256_storeu_ps(acc[0] + t * 16, lo);
                 _mm256_storeu_ps(acc[0] + t * 16 + 8, hi);
-            } else if constexpr (N <= 3) {
+            } else if constexpr (N <= exl3_lane_both_max<K>()) {
                 __m256 lo[N], hi[N];
                 for (int i = 0; i < N; ++i)
                     lo[i] = _mm256_loadu_ps(acc[i] + t * 16), hi[i] = _mm256_loadu_ps(acc[i] + t * 16 + 8);
