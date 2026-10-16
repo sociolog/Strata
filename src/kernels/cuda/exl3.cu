@@ -96,16 +96,20 @@ __global__ void widen_kernel(const uint16_t* __restrict__ s, float* __restrict__
     if (i < n) d[i] = dh2f(s[i]);
 }
 
+// one block a (row block, column); the columns stride by gridDim.y, which CUDA caps at 65,535 - the lm_head's
+// 248,320 columns in grid.y failed to launch on NVIDIA (invalid configuration), leaving the head untransformed
 __global__ void had_rows_kernel(float* __restrict__ w, int k, int n) {
     (void)k;
-    int rb = blockIdx.x, c = blockIdx.y;
-    float b[HAD];
-    for (int i = 0; i < HAD; ++i) b[i] = w[(long)(rb * HAD + i) * n + c];
-    for (int step = 1; step < HAD; step <<= 1)
-        for (int i = 0; i < HAD; ++i)
-            if ((i & step) == 0) { float a = b[i], d = b[i | step]; b[i] = a + d; b[i | step] = a - d; }
-    const float inv = 0.08838834764831845f;
-    for (int i = 0; i < HAD; ++i) w[(long)(rb * HAD + i) * n + c] = b[i] * inv;
+    const int rb = blockIdx.x;
+    for (int c = blockIdx.y; c < n; c += gridDim.y) {
+        float b[HAD];
+        for (int i = 0; i < HAD; ++i) b[i] = w[(long)(rb * HAD + i) * n + c];
+        for (int step = 1; step < HAD; step <<= 1)
+            for (int i = 0; i < HAD; ++i)
+                if ((i & step) == 0) { float a = b[i], d = b[i | step]; b[i] = a + d; b[i | step] = a - d; }
+        const float inv = 0.08838834764831845f;
+        for (int i = 0; i < HAD; ++i) w[(long)(rb * HAD + i) * n + c] = b[i] * inv;
+    }
 }
 
 __global__ void had_cols_kernel(float* __restrict__ w, int k, int n) {
@@ -158,11 +162,17 @@ void exl3_reconstruct_weight(const uint16_t* trellis, int ki, int nj, int bits, 
     }
     decode_kernel<<<dim3(nj, ki), 256, 0, st>>>(trellis, ki, nj, words, bits, cb, d_what, n);
     widen_kernel<<<(int)((nelem + 255) / 256), 256, 0, st>>>(d_what, d_w, nelem);
-    had_rows_kernel<<<dim3(k / HAD, n), 1, 0, st>>>(d_w, k, n);
+    had_rows_kernel<<<dim3(k / HAD, n < 65535 ? n : 65535), 1, 0, st>>>(d_w, k, n);   // grid.y: CUDA's limit
     had_cols_kernel<<<dim3(k, n / HAD), 1, 0, st>>>(d_w, k, n);
     scale_rows_kernel<<<dim3(k), 128, 0, st>>>(d_w, n, suh);
     scale_cols_kernel<<<dim3(n), 128, 0, st>>>(d_w, k, n, svh);
     f32_to_f16_kernel<<<(int)((nelem + 255) / 256), 256, 0, st>>>(d_w, out, nelem);
+    // a failed launch here leaves a wrong weight behind (and the error pending for whoever checks next): stop with it
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) {
+        std::fprintf(stderr, "exl3_reconstruct_weight (%d x %d, K %d): a launch failed: %s\n", k, n, bits,
+                     cudaGetErrorString(e));
+        std::abort();
+    }
     (void)cudaFree(d_what);
     (void)cudaFree(d_w);
 }

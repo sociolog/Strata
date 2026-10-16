@@ -3699,6 +3699,11 @@ int main(int argc, char** argv) {
     if (!o.exl3_dir.empty()) {
         exl3_pack = std::make_unique<strata::core::Exl3Pack>(o.exl3_dir);
         if (!exl3_pack->build(wt, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+        // the loader's kernels are not checked one by one: a launch error left pending here is a wrong weight
+        if (const cudaError_t pe = cudaGetLastError(); pe != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: the EXL3 loader left a CUDA error: %s\n", cudaGetErrorString(pe));
+            return 1;
+        }
         std::fprintf(stderr, "strata generate: EXL3 %s: %zu roles, %.1f MiB EXL3 linears, %.1f MiB staged, in %.1f s\n",
                      o.exl3_dir.c_str(), wt.all().size(), (double) exl3_pack->exl3_bytes() / (1 << 20),
                      (double) exl3_pack->arena_bytes() / (1 << 20), load_s());
@@ -16034,7 +16039,8 @@ int main(int argc, char** argv) {
             std::printf("%-24s   wait-park %.3f  drain %.3f  re-park %.3f  ms/token\n",
                         "  pool phases", wp / per, dr / per, rp / per);
         }
-        std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
+        // (an EXL3 model has no GGUF expert source: --exl3 skips it, and this line dereferenced null on exit)
+        if (srcp != nullptr) std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
             std::printf("  CUDA%d experts           %lld routed entries computed\n",
                         r + 1, (long long) remote_experts[(size_t) r].computed());
