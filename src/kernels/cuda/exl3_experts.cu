@@ -159,6 +159,12 @@ struct Exl3ExpertStream::Impl {
     long long ram_hits = 0, ram_misses = 0;
     int cur_layer = 0;                            // the layer `run` is on (the queue is host-side, single-threaded)
 
+    // --exl3-lane's GPU share (launch_resident / finish_resident): the resident experts of the call in flight
+    std::vector<Exl3Mat> rg, ru, rd;
+    std::vector<int> rrow;
+    bool res_pending = false;
+    long long res_runs = 0;
+
     // STRATA_EXL3_TIME=1: per-token upload/ffn/d2h milliseconds and the cache hit rate
     long long hits = 0, misses = 0;
     double up_ms = 0, ffn_ms = 0, d2h_ms = 0, call_ms = 0;
@@ -691,5 +697,89 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
     }
     return true;
 }
+
+bool Exl3ExpertStream::preload(int layer, const int* experts, int n, const void* const* pieces, std::string& err) {
+    if (impl_->cache <= 0 || layer < 0 || layer >= (int) impl_->layers.size()) {
+        err = "EXL3 stream: no VRAM expert cache to seed (layer " + std::to_string(layer) + ")";
+        return false;
+    }
+    Impl::Layer& L = impl_->layers[(size_t) layer];
+    for (int i = 0; i < n && L.filled < impl_->cache; ++i) {
+        const int e = experts[i];
+        if (L.at.count(e) != 0) continue;
+        const int s = L.filled;
+        Impl::Slot* sl[3] = {&L.g[(size_t) s], &L.u[(size_t) s], &L.d[(size_t) s]};
+        for (int r = 0; r < 3; ++r) {
+            const void* const* pc = pieces + (size_t) i * 9 + (size_t) r * 3;
+            if (pc[0] == nullptr || pc[1] == nullptr || pc[2] == nullptr ||
+                cudaMemcpy(sl[r]->tr, pc[0], sl[r]->trb, cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemcpy(sl[r]->suh, pc[1], sl[r]->suhb, cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemcpy(sl[r]->svh, pc[2], sl[r]->svhb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "EXL3 stream: seeding layer " + std::to_string(layer) + " expert " + std::to_string(e) + " failed: " +
+                      cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        }
+        ++L.filled;
+        L.at[e] = s;
+        L.tick[(size_t) s] = ++L.clock;
+    }
+    return true;
+}
+
+bool Exl3ExpertStream::resident(int layer, int e) const {
+    return impl_->cache > 0 && layer >= 0 && layer < (int) impl_->layers.size() &&
+           impl_->layers[(size_t) layer].at.count(e) != 0;
+}
+
+bool Exl3ExpertStream::launch_resident(int layer, const float* x_f32, const int* ids, const uint8_t* is_res, int k,
+                                       float* out, void* stream) {
+    if (impl_->res_pending) return false;   // the previous call was not finished
+    if (k <= 0) return true;
+    if (k > impl_->max_k || impl_->cache <= 0 || layer < 0 || layer >= (int) impl_->layers.size()) return false;
+    cudaStream_t st = (cudaStream_t) stream;
+    const long n = impl_->n_embd;
+    Impl::Layer& L = impl_->layers[(size_t) layer];
+    impl_->rg.clear();
+    impl_->ru.clear();
+    impl_->rd.clear();
+    impl_->rrow.clear();
+    for (int i = 0; i < k; ++i) {
+        if (is_res[i] == 0) continue;
+        const auto it = L.at.find(ids[i]);
+        if (it == L.at.end()) return false;   // not resident: the caller's mask is wrong
+        const int s = it->second;
+        L.tick[(size_t) s] = ++L.clock;
+        impl_->rg.push_back(L.gm[(size_t) s]);
+        impl_->ru.push_back(L.um[(size_t) s]);
+        impl_->rd.push_back(L.dm[(size_t) s]);
+        impl_->rrow.push_back(i);
+    }
+    const int nr = (int) impl_->rrow.size();
+    if (nr == 0) return true;
+    f32_to_f16_rows_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(x_f32, impl_->d_x, n);
+    exl3_moe_rows_part(impl_->rg.data(), impl_->ru.data(), impl_->rd.data(), nr, impl_->d_x, impl_->d_hit, st);
+    f16_to_f32_rows_kernel<<<(unsigned)((n * nr + 255) / 256), 256, 0, st>>>(impl_->d_hit, impl_->d_out, n * nr);
+    for (int r = 0; r < nr; ++r)
+        if (cudaMemcpyAsync(out + (size_t) impl_->rrow[(size_t) r] * (size_t) n, impl_->d_out + (size_t) r * (size_t) n,
+                            (size_t) n * 4, cudaMemcpyDeviceToHost, st) != cudaSuccess)
+            return false;
+    impl_->res_runs += nr;
+    impl_->res_pending = true;
+    return true;
+}
+
+bool Exl3ExpertStream::finish_resident(void* stream) {
+    if (!impl_->res_pending) return true;
+    impl_->res_pending = false;
+    const cudaError_t e = cudaStreamSynchronize((cudaStream_t) stream);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "exl3 stream: the resident experts' FFN failed: %s\n", cudaGetErrorString(e));
+        return false;
+    }
+    return true;
+}
+
+long long Exl3ExpertStream::resident_runs() const { return impl_->res_runs; }
 
 }  // namespace strata::kernels

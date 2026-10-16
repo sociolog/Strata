@@ -60,6 +60,23 @@ public:
 
     // out[i*n_embd] = ffn(layer, expert ids[i], x) for i in [0,k).  `x_f32` and `out` are HOST fp32.
     bool run(int layer, const float* x_f32, const int* ids, int k, float* out, void* stream);
+
+    // ---- --exl3-lane's GPU share: the VRAM cache holds each layer's hottest experts (seeded once, never evicted),
+    // the CPU lane computes the rest from its RAM tier.  Nothing is read from the file on these paths.
+    /// Seeds layer `layer`'s free slots with `experts` in order (the rest stay on the CPU once the slots are full);
+    /// `pieces` holds 9 host pointers an expert: gate trellis, suh, svh, then up's, then down's (the sizes are the
+    /// slots').  False and a message if the cache is off or a copy fails.
+    bool preload(int layer, const int* experts, int n, const void* const* pieces, std::string& err);
+    /// Whether layer `layer`'s VRAM cache holds expert `e` (no LRU update, nothing read).
+    bool resident(int layer, int e) const;
+    /// Enqueues on `stream` the FFN of the experts ids[i] with is_res[i] != 0 (each must be resident) and the copies of
+    /// their rows into out + i * n_embd (HOST fp32, as `run`); returns at once, so the CPU can work meanwhile.
+    bool launch_resident(int layer, const float* x_f32, const int* ids, const uint8_t* is_res, int k, float* out,
+                         void* stream);
+    /// Waits for launch_resident's rows.
+    bool finish_resident(void* stream);
+    /// launch_resident's experts so far (the hit count of the GPU share).
+    long long resident_runs() const;
     size_t bytes() const;
     int slots_per_layer() const;
     /// the host cache's slots per layer and its bytes (0 when it is off)

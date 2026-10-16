@@ -192,6 +192,13 @@ public:
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
 
+    /// EXL3 (exl3_lane_moe.cpp): one phase of `n` independent tasks on every participating thread - `fn(ctx, task,
+    /// thread)`, `thread` 0..workers()-1 for a worker and workers() for the host - back when every task is done and
+    /// every worker has parked again (the same claim protocol and stall watchdog as the row phases).  The tasks must
+    /// write disjoint memory; `ctx` and what it points to must outlive the call.  At most 65,535 tasks.
+    using TaskFn = void (*)(void* ctx, int task, int thread);
+    void run_tasks(int n, TaskFn fn, void* ctx);
+
     /// Total `_mm_pause` iterations spent waiting, over all workers, is no longer counted - see the note on the
     /// atomics below.  It was a LOCKED read-modify-write in the park loop, so measuring the contention added to
     /// it.
@@ -300,6 +307,9 @@ private:
     };
     const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;
+    // run_tasks state: mode 7
+    TaskFn task_fn_ = nullptr;
+    void* task_ctx_ = nullptr;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
 };

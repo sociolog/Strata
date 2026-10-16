@@ -705,6 +705,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+        } else if (mode_ == 7) {
+            // EXL3 (run_tasks): the caller's task function; the host counts as thread n_
+            task_fn_(task_ctx_, ci, id >= 0 ? id : n_);
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows (the layer's own n_ff / n_embd: Flash-Next's
             // FF / H, or another family's smaller expert)
@@ -866,6 +869,23 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     }
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
+    ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void ExpertPool::run_tasks(int n, TaskFn fn, void* ctx) {
+    if (n <= 0) return;
+    if (fn == nullptr || n > 0xffff) {
+        std::fprintf(stderr, "strata: expert pool task phase of %d tasks (%s) is out of range\n", n,
+                     fn == nullptr ? "no function" : "more than 65,535");
+        std::abort();
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    task_fn_ = fn;
+    task_ctx_ = ctx;
+    run_phase(7, n);
+    mode_ = 0;
+    task_fn_ = nullptr;
+    task_ctx_ = nullptr;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 

@@ -1365,7 +1365,7 @@ endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3.cpp
-            src/kernels/cpu/exl3_lane.cpp)
+            src/kernels/cpu/exl3_lane.cpp src/kernels/cpu/exl3_lane_moe.cpp src/kernels/cpu/exl3_ram.cpp)
 # exl3_lane.cpp takes no per-file ISA flags: its AVX-512 and AVX2 kernels carry target attributes and run where
 # cpu_avx512bw_ok() / cpu_avx2_ok() say so, the scalar tier everywhere else
 target_include_directories(strata_kernels_cpu PUBLIC include)
@@ -1483,6 +1483,10 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME exl3_lane_test COMMAND exl3_lane_test)
   add_test(NAME exl3_lane_test_force_avx2
            COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_AVX2=1 $<TARGET_FILE:exl3_lane_test>)
+  # the lane's MoE on the expert pool (fixed cuts: the same rows with 1, 3 and 9 workers) and the RAM tier (--real)
+  add_executable(exl3_lane_moe_test src/kernels/cpu/exl3_lane_moe_test.cpp)
+  target_link_libraries(exl3_lane_moe_test PRIVATE strata_kernels_cpu)
+  add_test(NAME exl3_lane_moe_test COMMAND exl3_lane_moe_test)
 endif()
 add_executable(exl3_lane_bench src/kernels/cpu/exl3_lane_bench.cpp)
 target_link_libraries(exl3_lane_bench PRIVATE strata_kernels_cpu)
@@ -1497,6 +1501,11 @@ if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA))
   target_include_directories(exl3_gemv_parity PRIVATE ${_strata_gpu_include_directories} include)
   target_link_libraries(exl3_gemv_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   add_test(NAME exl3_gemv_parity COMMAND exl3_gemv_parity)
+  # the CPU lane (exl3_lane.cpp) against exl3_gemv_f32 and exl3_moe_rows; --real <dir> adds a model's experts
+  add_executable(exl3_lane_gpu_parity src/kernels/exl3_lane_gpu_parity.cpp)
+  target_include_directories(exl3_lane_gpu_parity PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(exl3_lane_gpu_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  add_test(NAME exl3_lane_gpu_parity COMMAND exl3_lane_gpu_parity)
   # PleTable::open_exl3 (the EXL3 n-gram table) against the numpy codec.
   add_executable(ple_exl3_parity src/kernels/ple_exl3_parity.cpp)
   target_include_directories(ple_exl3_parity PRIVATE ${_strata_gpu_include_directories} include)

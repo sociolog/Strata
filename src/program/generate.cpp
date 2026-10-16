@@ -89,6 +89,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/exl3_pack.hpp"
 #include "strata/kernels/exl3_experts.hpp"
+#include "strata/kernels/cpu/exl3_ram.hpp"
 #include "strata/core/family_layout.hpp"
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
@@ -427,6 +428,8 @@ struct Options {
     std::string ple_gguf;              // the ORIGINAL second GGUF shard: the PLE table is not in the pack
     std::string exl3_dir;              // an EXL3 model dir (docs/EXL3.md): weights come from safetensors, not a pack
     std::string ple_exl3;              // the EXL3 n-gram table (ngram_embedding.safetensors)
+    bool exl3_lane = false;           // EXL3: every routed expert on the CPU lane from a RAM tier (exl3_lane_moe.hpp)
+    std::string exl3_lane_profile;    // --exl3-lane: seed the GPU stream's VRAM cache from this profile (the GPU share)
     bool no_ple = false;              // explicit diagnostic ablation; never a normal inference default
     bool stream_token = false;        // R2.6 experiment: ordered work on the session stream
     bool check_logits = false;        // optional full-vocabulary finite scan
@@ -985,6 +988,14 @@ void usage() {
                  "                       development machine: 0.0% hits at 4 GiB and at 19.5 GiB, because the misses\n"
                  "                       were first-time experts; it pays where the working set fits in RAM+VRAM\n"
                  "                       (`auto` = a quarter of what the host reports free, up to 4 GiB)\n"
+                 "  --exl3-lane          EXL3: every routed expert on the CPU lane (src/kernels/cpu/exl3_lane.cpp, the\n"
+                 "                       expert pool's threads) from a RAM tier loaded at start - all layers' experts,\n"
+                 "                       57 GiB at 4.05 bpw - instead of the GPU stream; the GPU keeps the dense work.\n"
+                 "                       STRATA_EXL3_LANE_IO=N: the load's read threads (default 8)\n"
+                 "  --exl3-lane-profile P  with --exl3-lane: a GPU share - the stream's VRAM cache (--expert-cache N\n"
+                 "                       slots a layer, auto unless given) seeded once from the RAM tier with each layer's\n"
+                 "                       hottest experts by profile P (tools/make_profile.py's format); those run on the\n"
+                 "                       GPU while the lane computes the rest\n"
                  "  --expert-cache N     R4: keep N expert blobs resident in VRAM and compute their rows on the\n"
                  "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.  Measured at 4096 slots\n"
                  "                       with --expert-cache-per-layer: 54.4%% hits, CPU pool drain 19.1 -> 10.3\n"
@@ -1141,18 +1152,78 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
     }
 }
 
-/// The EXL3 expert pool: streams each layer's routed experts from the model's safetensors and runs them.
+/// The EXL3 expert pool: streams each layer's routed experts from the model's safetensors and runs them - or, with
+/// --exl3-lane, runs every one of them on the CPU lane from the RAM tier (the expert pool's threads).
 struct Exl3Drive {
     strata::kernels::Exl3ExpertStream* stream = nullptr;
     int cur_layer = 0;
+    // --exl3-lane
+    strata::kernels::cpu::Exl3ExpertRam* ram = nullptr;
+    strata::kernels::cpu::Exl3LaneMoe* moe = nullptr;
+    strata::kernels::cpu::ExpertPool* pool = nullptr;
+    std::vector<strata::kernels::cpu::Exl3ExpertJob> jobs;
+    double cpu_ms = 0;
+    int64_t calls = 0;
+    int64_t gpu_rows = 0, cpu_rows = 0;   // with a GPU share: the routed experts each side computed
 };
 void drive_exl3_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                      int64_t k, float* out) {
     (void) weights;   // `moe_combine` applies the router weights on the device
     Exl3Drive* t = (Exl3Drive*) user;
     { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) std::fprintf(stderr, "strata generate: prior cuda error before the EXL3 pool: %s\n", cudaGetErrorString(e)); }
-    if (t->stream == nullptr) { std::memset(out, 0, (size_t) n_embd * (size_t) k * sizeof(float)); return; }
     const int layer = t->cur_layer++;
+    if (t->ram != nullptr) {
+        // the CPU lane: one job a routed expert (the token's activation, its own unweighted row); with a GPU share
+        // (--exl3-lane-profile), the experts its VRAM cache holds run there at the same time, their rows copied in
+        const Clock::time_point a = Clock::now();
+        std::string err;
+        bool ok = layer >= 0 && layer < t->ram->n_layers() && k > 0 && k <= 64;
+        if (ok) {
+            uint8_t res[64] = {};
+            int nres = 0;
+            for (int64_t i = 0; i < k; ++i)
+                if (ids[i] < 0 || ids[i] >= t->ram->n_expert()) { ok = false; err = "a routed expert id is out of range"; break; }
+            if (ok && t->stream != nullptr) {
+                for (int64_t i = 0; i < k; ++i) nres += (res[i] = t->stream->resident(layer, ids[i]) ? 1 : 0);
+                if (nres > 0 && !t->stream->launch_resident(layer, x_f, ids, res, (int) k, out, nullptr)) {
+                    ok = false;
+                    err = "the GPU share could not launch its resident experts";
+                }
+            }
+            int njobs = 0;
+            if (ok) {
+                t->jobs.assign((size_t) k, strata::kernels::cpu::Exl3ExpertJob{});
+                for (int64_t i = 0; i < k; ++i) {
+                    if (res[i]) continue;
+                    strata::kernels::cpu::Exl3ExpertJob& j = t->jobs[(size_t) njobs++];
+                    j.e = t->ram->expert(layer, ids[i]);
+                    j.nt = 1;
+                    j.x[0] = x_f;
+                    j.out[0] = out + (size_t) i * (size_t) n_embd;
+                }
+                if (njobs > 0) ok = t->moe->run(*t->pool, t->jobs.data(), njobs, err);
+            }
+            if (nres > 0 && !t->stream->finish_resident(nullptr) && ok) {
+                ok = false;
+                err = "the GPU share's resident experts failed";
+            }
+            t->gpu_rows += nres;
+            t->cpu_rows += njobs;
+        } else {
+            err = "layer " + std::to_string(layer) + " is outside the RAM tier's " + std::to_string(t->ram->n_layers());
+        }
+        if (!ok) {
+            // only a bug gets here (the tier checked every expert's shape at load): a wrong row would be weighted and
+            // added downstream, so the engine stops with the reason instead of answering from it
+            std::fprintf(stderr, "strata generate: EXL3 CPU lane failed at layer %d: %s - stopping\n", layer, err.c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
+        t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
+        ++t->calls;
+        return;
+    }
+    if (t->stream == nullptr) { std::memset(out, 0, (size_t) n_embd * (size_t) k * sizeof(float)); return; }
     if (!t->stream->run(layer, x_f, ids, (int) k, out, nullptr))
         std::fprintf(stderr, "strata generate: EXL3 expert stream failed at layer %d\n", layer);
 }
@@ -2325,6 +2396,8 @@ int main(int argc, char** argv) {
             if (!(nb != nullptr && nb[0] == '0')) o.native_bf16 = true;
         }
         else if (a == "--ple-exl3") o.ple_exl3 = next("--ple-exl3");
+        else if (a == "--exl3-lane") o.exl3_lane = true;
+        else if (a == "--exl3-lane-profile") o.exl3_lane_profile = next("--exl3-lane-profile");
         else if (a == "--tokens") {
             if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
             std::string e;
@@ -6449,7 +6522,82 @@ int main(int argc, char** argv) {
     Drive drive;
     Exl3Drive exl3_drive;
     std::unique_ptr<strata::kernels::Exl3ExpertStream> exl3_stream;
-    if (!o.exl3_dir.empty()) {
+    std::unique_ptr<strata::kernels::cpu::Exl3ExpertRam> exl3_ram;
+    std::unique_ptr<strata::kernels::cpu::Exl3LaneMoe> exl3_moe;
+    if (o.exl3_lane && o.exl3_dir.empty()) {
+        std::fprintf(stderr, "strata generate: --exl3-lane needs --exl3 <dir>\n");
+        return 2;
+    }
+    if (o.exl3_lane) {
+        // every routed expert on the CPU lane, from a RAM tier of the whole model's experts (no GPU stream, no VRAM
+        // expert cache: the GPU keeps the dense work)
+        int io = 8;
+        if (const char* v = std::getenv("STRATA_EXL3_LANE_IO")) io = std::max(1, std::atoi(v));
+        exl3_ram = std::make_unique<strata::kernels::cpu::Exl3ExpertRam>();
+        if (!exl3_ram->open(o.exl3_dir, (int) g.n_layers, (int) g.n_expert, io, 0, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        exl3_moe = std::make_unique<strata::kernels::cpu::Exl3LaneMoe>();
+        if (!exl3_moe->init((int) g.n_embd, (int) g.n_ff, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        exl3_drive.ram = exl3_ram.get();
+        exl3_drive.moe = exl3_moe.get();
+        exl3_drive.pool = &pool;
+        if (!o.exl3_lane_profile.empty()) {
+            // the GPU share: #1764's stream with its VRAM cache seeded once, from the RAM tier, with each layer's
+            // hottest experts by the profile; never evicted, nothing read from the file
+            std::vector<std::pair<int32_t, int32_t>> ranked;
+            int64_t pslots = 0;
+            if (!strata::core::read_expert_profile(o.exl3_lane_profile, g.n_layers, g.n_expert, ranked, pslots, err)) {
+                std::fprintf(stderr, "strata generate: --exl3-lane-profile: %s\n", err.c_str());
+                return 1;
+            }
+            const Clock::time_point s0 = Clock::now();
+            exl3_stream = std::make_unique<strata::kernels::Exl3ExpertStream>(
+                o.exl3_dir, (int) g.n_embd, (int) g.n_layers, o.expert_cache_given ? o.expert_cache : -1, nullptr, 0);
+            const int slots = exl3_stream->slots_per_layer();
+            if (slots <= 0) {
+                std::fprintf(stderr, "strata generate: EXL3 GPU share: no VRAM for expert slots - every routed expert "
+                                     "stays on the CPU lane\n");
+                exl3_stream.reset();
+            } else {
+                std::vector<std::vector<int>> per((size_t) g.n_layers);
+                for (const auto& pr : ranked) per[(size_t) pr.first].push_back(pr.second);
+                std::vector<const void*> pieces;
+                int64_t seeded = 0;
+                for (int64_t l = 0; l < g.n_layers; ++l) {
+                    const int take = (int) std::min<size_t>(per[(size_t) l].size(), (size_t) slots);
+                    pieces.assign((size_t) take * 9, nullptr);
+                    for (int i = 0; i < take; ++i) {
+                        const strata::kernels::cpu::Exl3Expert x = exl3_ram->expert((int) l, per[(size_t) l][(size_t) i]);
+                        const strata::kernels::cpu::Exl3Part* p3[3] = {&x.gate, &x.up, &x.down};
+                        for (int r = 0; r < 3; ++r) {
+                            pieces[(size_t) i * 9 + (size_t) r * 3 + 0] = p3[r]->trellis;
+                            pieces[(size_t) i * 9 + (size_t) r * 3 + 1] = p3[r]->suh;
+                            pieces[(size_t) i * 9 + (size_t) r * 3 + 2] = p3[r]->svh;
+                        }
+                    }
+                    if (!exl3_stream->preload((int) l, per[(size_t) l].data(), take, pieces.data(), err)) {
+                        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                        return 1;
+                    }
+                    seeded += take;
+                }
+                exl3_drive.stream = exl3_stream.get();
+                std::fprintf(stderr, "strata generate: EXL3 GPU share: %d slots a layer, %lld experts seeded from %s "
+                                     "(%.2f GiB of VRAM) in %.1f s\n", slots, (long long) seeded,
+                             o.exl3_lane_profile.c_str(), (double) exl3_stream->bytes() / (double) (1ull << 30),
+                             std::chrono::duration<double>(Clock::now() - s0).count());
+            }
+        }
+        static const char* tiers[] = {"scalar", "AVX2", "AVX-512"};
+        std::fprintf(stderr, "strata generate: EXL3 CPU lane: %s; every routed expert on the %d pool workers%s, %s "
+                             "kernels\n", exl3_ram->describe().c_str(), pool.workers(),
+                     pool.host_works() ? " + the host thread" : "", tiers[strata::kernels::cpu::exl3_cpu_tier()]);
+    } else if (!o.exl3_dir.empty()) {
         // The EXL3 stream keeps its own per-layer cache: `--expert-cache N` counts slots per layer there (the
         // GGUF count is global because its blobs are one pool), `auto`/unset sizes it from the free VRAM after
         // this instance's buffers, and 0 turns it off.
@@ -16028,6 +16176,20 @@ int main(int argc, char** argv) {
                         (ms_ple + ms_embed + ms_layers + ms_head + ms_readback + ms_sample) / pt, decode_ms);
         }
         if (const std::string io = ple_table.io_report(); !io.empty()) std::printf("  %s\n", io.c_str());
+        if (exl3_drive.ram != nullptr && exl3_drive.calls > 0) {
+            // --exl3-lane: per position (prompt and decode alike: the lane runs on both), its four pool phases
+            const double positions = (double) exl3_drive.calls / (double) g.n_layers;
+            const strata::kernels::cpu::Exl3LaneMoe& m = *exl3_drive.moe;
+            const double lane_ms = m.ms_gu + m.ms_mid + m.ms_down + m.ms_out;
+            std::printf("%-24s %.3f ms/position (gate/up %.3f, mid %.3f, down %.3f, out %.3f), %.1f experts a layer, "
+                        "%.1f GB/s of expert weights\n", "  EXL3 CPU lane", exl3_drive.cpu_ms / positions,
+                        m.ms_gu / positions, m.ms_mid / positions, m.ms_down / positions, m.ms_out / positions,
+                        (double) m.experts / (double) exl3_drive.calls, lane_ms > 0 ? (double) m.bytes / lane_ms / 1e6 : 0.0);
+            if (exl3_drive.gpu_rows + exl3_drive.cpu_rows > 0)
+                std::printf("%-24s %.1f%% of the routed experts on the GPU share, %.1f%% on the lane\n", "  EXL3 split",
+                            100.0 * (double) exl3_drive.gpu_rows / (double) (exl3_drive.gpu_rows + exl3_drive.cpu_rows),
+                            100.0 * (double) exl3_drive.cpu_rows / (double) (exl3_drive.gpu_rows + exl3_drive.cpu_rows));
+        }
         // **THE DENOMINATOR IS THE POSITIONS THE POOL ACTUALLY RAN ON, NOT THE DECODED TOKENS (A6).**
         // `drive_pool` is called once per layer per position and PREFILL runs the loop too, so accumulating
         // `cpu_ms` over prefill and then dividing by `decoded` inflates this figure.  `drive.calls / n_layers`
