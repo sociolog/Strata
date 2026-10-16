@@ -6661,7 +6661,11 @@ int main(int argc, char** argv) {
     // 0.514 ms of CPU work per layer.  A per-layer CPU expert pool cannot be hidden behind a strictly serial
     // residual chain; the CPU term is answered by Phase 3's VRAM expert cache, not by this pipeline.
 
-    if (!o.exl3_dir.empty()) { strata::kernels::exl3_gemv_reserve(8192, 262144); strata::kernels::exl3_shared_reserve((int) g.n_ff); }   // before capture
+    if (!o.exl3_dir.empty()) {   // before capture (and before any token graph runs: growing these later waits for it)
+        strata::kernels::exl3_gemv_reserve(8192, 262144);
+        strata::kernels::exl3_shared_reserve((int) g.n_ff);
+        strata::kernels::exl3_moe_reserve(64, (int) g.n_embd, (int) g.n_ff);   // the stream's max_k
+    }
     // ---- the graphs
     strata::core::SessionGraphs gr;
     if (!o.no_capture && !native_pack) {   // plan v0.3 P6: a native pack runs verify windows only

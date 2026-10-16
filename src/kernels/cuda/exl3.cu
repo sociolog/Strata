@@ -10,6 +10,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 
 namespace strata::kernels {
@@ -512,6 +513,62 @@ namespace {
 // Run gate/up/silu/down for every expert (batched, grid.z = expert) and return the process-wide device fp16
 // buffer holding each expert's down output (n_experts x n).  Shared by the weighted `exl3_moe_ffn` and the
 // unweighted `exl3_moe_rows`.
+// moe_run_experts' device workspace, process-wide.  Every buffer grows by its own size (the old function-local ones
+// grew the gate/up/SwiGLU and down rows only when ff or n grew, not when the expert count did - a later, larger count
+// wrote past them), and exl3_moe_reserve sizes it all up front: a cudaFree here while the token graph spins on its
+// doorbell waits for that graph, which waits for this call - the engine hung in exactly that (--exl3-lane's GPU share,
+// whose first layer runs fewer experts than a later one).
+struct MoeWs {
+    Exl3Mat* d_gate = nullptr; Exl3Mat* d_up = nullptr; Exl3Mat* d_down = nullptr;
+    uint16_t* d_g = nullptr; uint16_t* d_u = nullptr; uint16_t* d_h = nullptr; uint16_t* d_d = nullptr;
+    float* d_xh = nullptr; float* d_z = nullptr; int* d_pinv = nullptr;
+    size_t mats = 0, gh = 0, dd = 0, xh = 0, z = 0;   // capacities: experts, then elements
+};
+MoeWs g_moe;
+
+template <typename T>
+void moe_grow(T*& p, size_t& cap, size_t want, const char* what) {
+    if (want <= cap) return;
+    (void) cudaFree(p);
+    p = nullptr;
+    if (cudaMalloc((void**) &p, want * sizeof(T)) != cudaSuccess) {
+        size_t fb = 0, tb = 0;
+        (void) cudaMemGetInfo(&fb, &tb);
+        std::fprintf(stderr, "exl3_moe: cudaMalloc(%s, %zu B) failed: %zu MiB free of %zu MiB\n", what, want * sizeof(T),
+                     fb >> 20, tb >> 20);
+        std::abort();
+    }
+    cap = want;
+}
+
+void moe_ws_ensure(int n_experts, int ff, int n, int maxk, int maxn) {
+    MoeWs& w = g_moe;
+    const size_t ne = (size_t) n_experts;
+    size_t c = w.mats;
+    moe_grow(w.d_gate, c, ne, "gate mats");
+    c = w.mats;
+    moe_grow(w.d_up, c, ne, "up mats");
+    c = w.mats;
+    moe_grow(w.d_down, c, ne, "down mats");
+    w.mats = std::max(w.mats, ne);
+    c = w.gh;
+    moe_grow(w.d_g, c, (size_t) ff * ne, "gate rows");
+    c = w.gh;
+    moe_grow(w.d_u, c, (size_t) ff * ne, "up rows");
+    c = w.gh;
+    moe_grow(w.d_h, c, (size_t) ff * ne, "SwiGLU rows");
+    w.gh = std::max(w.gh, (size_t) ff * ne);
+    moe_grow(w.d_d, w.dd, (size_t) n * ne, "down rows");
+    moe_grow(w.d_xh, w.xh, (size_t) maxk * ne, "transformed inputs");
+    moe_grow(w.d_z, w.z, (size_t) maxn * ne, "sums");
+    if (w.d_pinv == nullptr) {
+        if (cudaMalloc((void**) &w.d_pinv, 256 * 4) != cudaSuccess) std::abort();
+        int pinv[256];
+        build_pinv(pinv);
+        (void) cudaMemcpy(w.d_pinv, pinv, 256 * 4, cudaMemcpyHostToDevice);
+    }
+}
+
 uint16_t* moe_run_experts(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down, int n_experts,
                           const uint16_t* x, cudaStream_t st) {
     const int k = gate[0].ki * 16;
@@ -519,40 +576,15 @@ uint16_t* moe_run_experts(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat*
     const int n = down[0].nj * 16;
     const int maxk = k > ff ? k : ff;      // xh: gate/up transform k, down transforms ff
     const int maxn = ff > n ? ff : n;      // z: gate/up produce ff, down produces n
-    static Exl3Mat* d_gate = nullptr; static Exl3Mat* d_up = nullptr; static Exl3Mat* d_down = nullptr;
-    static int cne = 0;
-    size_t msz = (size_t) n_experts * sizeof(Exl3Mat);
-    if (n_experts > cne) {
-        (void)cudaFree(d_gate); (void)cudaFree(d_up); (void)cudaFree(d_down);
-        d_gate = d_up = d_down = nullptr;
-        if (cudaMalloc((void**)&d_gate, msz) || cudaMalloc((void**)&d_up, msz) || cudaMalloc((void**)&d_down, msz)) {
-            const cudaError_t me = cudaGetLastError(); size_t fb=0,tb=0; const cudaError_t gi = cudaMemGetInfo(&fb,&tb); std::fprintf(stderr, "exl3_moe: cudaMalloc(msz=%zu) failed: %s; meminfo rc=%s %zu/%zu MiB\n", msz, cudaGetErrorString(me), cudaGetErrorString(gi), fb>>20, tb>>20); std::abort();
-        }
-        cne = n_experts;
-    }
+    moe_ws_ensure(n_experts, ff, n, maxk, maxn);
+    MoeWs& w = g_moe;
+    Exl3Mat* d_gate = w.d_gate; Exl3Mat* d_up = w.d_up; Exl3Mat* d_down = w.d_down;
+    uint16_t* d_g = w.d_g; uint16_t* d_u = w.d_u; uint16_t* d_h = w.d_h; uint16_t* d_d = w.d_d;
+    float* d_xh = w.d_xh; float* d_z = w.d_z; int* d_pinv = w.d_pinv;
+    const size_t msz = (size_t) n_experts * sizeof(Exl3Mat);
     (void)cudaMemcpyAsync(d_gate, gate, msz, cudaMemcpyHostToDevice, st);
     (void)cudaMemcpyAsync(d_up, up, msz, cudaMemcpyHostToDevice, st);
     (void)cudaMemcpyAsync(d_down, down, msz, cudaMemcpyHostToDevice, st);
-    static uint16_t* d_g = nullptr; static uint16_t* d_u = nullptr; static uint16_t* d_h = nullptr;
-    static uint16_t* d_d = nullptr; static float* d_xh = nullptr; static float* d_z = nullptr; static int* d_pinv = nullptr;
-    static int cff = 0, cn = 0, cmk = 0, cmn = 0;
-    if (ff > cff) {
-        (void)cudaFree(d_g); (void)cudaFree(d_u); (void)cudaFree(d_h); d_g = d_u = d_h = nullptr;
-        if (cudaMalloc((void**)&d_g, (size_t)ff * n_experts * 2) || cudaMalloc((void**)&d_u, (size_t)ff * n_experts * 2) ||
-            cudaMalloc((void**)&d_h, (size_t)ff * n_experts * 2)) {
-            size_t fb=0,tb=0; cudaMemGetInfo(&fb,&tb);
-            std::fprintf(stderr, "exl3_moe: cudaMalloc(ff=%d k=%d -> %.1f MiB) failed: %zu MiB free of %zu MiB\n", ff, n_experts, (double)ff*n_experts*2*3/(1<<20), fb>>20, tb>>20);
-            std::abort(); }
-        cff = ff;
-    }
-    if (n > cn) {
-        (void)cudaFree(d_d); d_d = nullptr;
-        if (cudaMalloc((void**)&d_d, (size_t)n * n_experts * 2)) { std::fprintf(stderr, "exl3_moe: cudaMalloc failed\n"); std::abort(); }
-        cn = n;
-    }
-    if (maxk * n_experts > cmk) { (void)cudaFree(d_xh); d_xh = nullptr; if (cudaMalloc((void**)&d_xh, (size_t)maxk * n_experts * 4)) std::abort(); cmk = maxk * n_experts; }
-    if (maxn * n_experts > cmn) { (void)cudaFree(d_z); d_z = nullptr; if (cudaMalloc((void**)&d_z, (size_t)maxn * n_experts * 4)) std::abort(); cmn = maxn * n_experts; }
-    if (!d_pinv) { if (cudaMalloc((void**)&d_pinv, 256 * 4)) std::abort(); int pinv[256]; build_pinv(pinv); (void)cudaMemcpy(d_pinv, pinv, 256 * 4, cudaMemcpyHostToDevice); }
     int gy_g = (gate[0].ki + 15) / 16; if (gy_g < 1) gy_g = 1;
     int gy_d = (down[0].ki + 15) / 16; if (gy_d < 1) gy_d = 1;
     prescale_batched_kernel<<<dim3(k / HAD, n_experts), HAD, 0, st>>>(x, 0, d_gate, d_xh, k, d_z, (long) n_experts * ff);
@@ -591,6 +623,11 @@ void exl3_moe_rows_part(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* d
     const int n = down[0].nj * 16;
     uint16_t* d_d = moe_run_experts(gate, up, down, k, x, st);
     (void) cudaMemcpyAsync(out, d_d, (size_t)k * n * 2, cudaMemcpyDeviceToDevice, st);
+}
+
+void exl3_moe_reserve(int max_experts, int n_embd, int n_ff) {
+    if (max_experts <= 0 || n_embd <= 0 || n_ff <= 0) return;
+    moe_ws_ensure(max_experts, n_ff, n_embd, std::max(n_embd, n_ff), std::max(n_ff, n_embd));
 }
 
 void exl3_moe_rows(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down, const int* ids,

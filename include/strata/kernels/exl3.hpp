@@ -67,4 +67,8 @@ void exl3_shared_expert(const float* x, const Exl3Mat* gate, const Exl3Mat* up, 
 // Pre-allocate the persistent GEMV workspace (call before graph capture; cudaMalloc is illegal in a capture).
 void exl3_gemv_reserve(int max_k, int max_n);
 
+// Pre-allocate the routed-expert FFN's workspace (exl3_moe_ffn / exl3_moe_rows[_part]) for up to `max_experts` experts
+// a call, before a token graph runs: growing it later frees device memory, which waits for that graph.
+void exl3_moe_reserve(int max_experts, int n_embd, int n_ff);
+
 }  // namespace strata::kernels
