@@ -130,17 +130,21 @@ void build_perm(int* perm) {
 
 // ---- Hadamard 128 (natural-order Sylvester, scaled 1/sqrt(128)) ----
 
+// built once, on first use, by a function-local static (thread-safe since C++11; the old `static bool init` flag
+// raced when two threads made the first call at once)
 const float (*had128())[128] {
-    static float h[128][128];
-    static bool init = false;
-    if (!init) {
+    struct Table {
+        float h[128][128];
+    };
+    static const Table t = [] {
+        Table x;
         for (int i = 0; i < 128; ++i)
             for (int j = 0; j < 128; ++j)
-                h[i][j] = ((__builtin_popcount((unsigned)(i & j)) & 1) ? -1.0f : 1.0f) /
-                          std::sqrt(128.0f);
-        init = true;
-    }
-    return (const float (*)[128])h;
+                x.h[i][j] = ((__builtin_popcount((unsigned)(i & j)) & 1) ? -1.0f : 1.0f) /
+                            std::sqrt(128.0f);
+        return x;
+    }();
+    return t.h;
 }
 
 void had_rows(std::vector<float>& m, int rows, int cols) {
@@ -173,14 +177,27 @@ void had_cols(std::vector<float>& m, int rows, int cols) {
     }
 }
 
+// one table per codebook, each built on first use by a function-local static (thread-safe, as had128)
 const uint16_t* lut_for(Exl3Codebook cb) {
-    static std::vector<uint16_t> luts[3];
-    int idx = (int)cb;
-    if (luts[idx].empty()) {
-        luts[idx].resize(1u << 16);
-        exl3_codebook_lut(cb, luts[idx].data());
+    auto build = [](Exl3Codebook c) {
+        std::vector<uint16_t> v(1u << 16);
+        exl3_codebook_lut(c, v.data());
+        return v;
+    };
+    switch (cb) {
+        case Exl3Codebook::ThreeInst: {
+            static const std::vector<uint16_t> t = build(Exl3Codebook::ThreeInst);
+            return t.data();
+        }
+        case Exl3Codebook::Mcg: {
+            static const std::vector<uint16_t> t = build(Exl3Codebook::Mcg);
+            return t.data();
+        }
+        default: {
+            static const std::vector<uint16_t> t = build(Exl3Codebook::Mul1);
+            return t.data();
+        }
     }
-    return luts[idx].data();
 }
 
 }  // namespace

@@ -1364,7 +1364,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3.cpp)
+            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3.cpp
+            src/kernels/cpu/exl3_lane.cpp)
+# exl3_lane.cpp takes no per-file ISA flags: its AVX-512 and AVX2 kernels carry target attributes and run where
+# cpu_avx512bw_ok() / cpu_avx2_ok() say so, the scalar tier everywhere else
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1469,6 +1472,20 @@ if(STRATA_BUILD_TESTS)
     message(STATUS "STRATA tests: no python3 with numpy found - exl3_parity is not registered")
   endif()
 endif()
+
+# The EXL3 CPU lane (src/kernels/cpu/exl3_lane.cpp, ported from project-maya's CPU lane): every tier against the
+# scalar oracle above, weight by weight (the tile layout), against an exact model of its own arithmetic (the vector
+# tiers bit for bit), and the whole product on the Flash's expert shapes.  CPU-only, no model, no GPU.
+# exl3_lane_bench: the lane's time per expert from DRAM, measured as kq_cpu_bench measures the GGUF pairs.
+if(STRATA_BUILD_TESTS)
+  add_executable(exl3_lane_test src/kernels/cpu/exl3_lane_test.cpp)
+  target_link_libraries(exl3_lane_test PRIVATE strata_kernels_cpu)
+  add_test(NAME exl3_lane_test COMMAND exl3_lane_test)
+  add_test(NAME exl3_lane_test_force_avx2
+           COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_AVX2=1 $<TARGET_FILE:exl3_lane_test>)
+endif()
+add_executable(exl3_lane_bench src/kernels/cpu/exl3_lane_bench.cpp)
+target_link_libraries(exl3_lane_bench PRIVATE strata_kernels_cpu)
 
 # EXL3 GPU reconstruct against the CPU reference (synthetic, no model).
 if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA))
