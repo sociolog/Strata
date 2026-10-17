@@ -23,6 +23,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -1083,6 +1084,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         copy_from_mapped(inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
     } else if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
         ne->gather_dev(tok_, T, emb_, cs);
+        broadcast_streams(emb_, R_, N, (int) HC, T, cs);
+    } else if (const WeightRef* we = wt.find("token_embd.weight");
+               we != nullptr && (we->kind == WeightKind::Bf16InF32 || we->kind == WeightKind::F16InF32)) {
+        // EXL3: the model's token_embd is BF16 (or F16) rows - embed_row's gather, the window's ids read on the device
+        if (we->data == nullptr || we->ne0 != (int64_t) N || we->ne1 <= 0) {
+            err = "verify: the EXL3 token_embd.weight is not a [n_embd, n_vocab] table";
+            return false;
+        }
+        strata::kernels::exl3_embed_gather_rows((const uint16_t*) we->data, we->ne0, we->ne1, tok_, T,
+                                                we->kind == WeightKind::Bf16InF32, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
     } else {
         const WeightRef* w = wt.find("token_embd.weight");

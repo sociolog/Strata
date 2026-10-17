@@ -1165,6 +1165,12 @@ struct Exl3Drive {
     double cpu_ms = 0;
     int64_t calls = 0;
     int64_t gpu_rows = 0, cpu_rows = 0;   // with a GPU share: the routed experts each side computed
+    // the verify windows (--spec): their hook is not told n_embd; each call groups its (token, slot) entries per expert
+    int64_t n_embd = 0;
+    int64_t win_calls = 0, win_entries = 0, win_jobs = 0;
+    double win_ms = 0;
+    std::vector<int16_t> job_of;      // n_expert entries: a window's expert -> its job (-1: none yet)
+    std::vector<int32_t> touched;     // the experts the call gave a job; job_of is reset through them
 };
 void drive_exl3_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                      int64_t k, float* out) {
@@ -1226,6 +1232,64 @@ void drive_exl3_pool(void* user, const float* x_f, const int32_t* ids, const flo
     if (t->stream == nullptr) { std::memset(out, 0, (size_t) n_embd * (size_t) k * sizeof(float)); return; }
     if (!t->stream->run(layer, x_f, ids, (int) k, out, nullptr))
         std::fprintf(stderr, "strata generate: EXL3 expert stream failed at layer %d\n", layer);
+}
+
+/// The verify window's pool on the EXL3 CPU lane (--exl3-lane with --spec): the window's n_tok tokens route k experts
+/// each.  The entries are grouped per distinct expert, so an expert several tokens share is read from the RAM tier
+/// once for all of them (the lane's multi-token kernels); each (token, slot) row is written UNWEIGHTED at out[t*k + j]
+/// (the window's combine applies the router weights).  It publishes no GPU plan: the window then writes an empty one
+/// and every row comes from here (the residency table the spec loop gives the window marks every expert absent).
+void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                           int64_t layer) {
+    Exl3Drive* t = (Exl3Drive*) user;
+    const Clock::time_point a = Clock::now();
+    namespace cpu = strata::kernels::cpu;
+    std::string err;
+    bool ok = t->ram != nullptr && t->moe != nullptr && t->pool != nullptr && t->n_embd > 0;
+    if (!ok) err = "the CPU lane is not set up";
+    else if (layer < 0 || layer >= t->ram->n_layers() || n_tok < 1 || n_tok > cpu::MAXT || k < 1 || k > 64) {
+        ok = false;
+        err = "the window's shape is outside the lane's (layer " + std::to_string(layer) + ", " + std::to_string(n_tok) +
+              " tokens, k " + std::to_string(k) + ")";
+    }
+    int njobs = 0;
+    if (ok) {
+        const int ne = t->ram->n_expert();
+        if ((int) t->job_of.size() != ne) t->job_of.assign((size_t) ne, -1);
+        t->jobs.resize((size_t) (n_tok * k));
+        t->touched.clear();
+        for (int64_t q = 0; q < n_tok && ok; ++q)
+            for (int64_t i = 0; i < k; ++i) {
+                const int32_t e = ids[q * k + i];
+                if (e < 0 || e >= ne) { ok = false; err = "a routed expert id is out of range"; break; }
+                int16_t& s = t->job_of[(size_t) e];
+                if (s < 0) {
+                    s = (int16_t) njobs;
+                    cpu::Exl3ExpertJob& nj = t->jobs[(size_t) njobs++];
+                    nj = cpu::Exl3ExpertJob{};
+                    nj.e = t->ram->expert((int) layer, e);
+                    t->touched.push_back(e);
+                }
+                cpu::Exl3ExpertJob& j = t->jobs[(size_t) s];
+                if (j.nt >= cpu::MAXT) { ok = false; err = "an expert routed twice for one token"; break; }
+                j.x[j.nt] = x_f + (size_t) q * (size_t) t->n_embd;
+                j.out[j.nt] = out + (size_t) (q * k + i) * (size_t) t->n_embd;
+                ++j.nt;
+            }
+        for (int32_t e : t->touched) t->job_of[(size_t) e] = -1;
+        if (ok && njobs > 0) ok = t->moe->run(*t->pool, t->jobs.data(), njobs, err);
+    }
+    if (!ok) {
+        // as the single-token hook: a wrong row would be weighted and added downstream, so the engine stops
+        std::fprintf(stderr, "strata generate: EXL3 CPU lane failed in a verify window at layer %lld: %s - stopping\n",
+                     (long long) layer, err.c_str());
+        std::fflush(stderr);
+        std::abort();
+    }
+    t->win_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
+    ++t->win_calls;
+    t->win_entries += n_tok * k;
+    t->win_jobs += njobs;
 }
 
 /// Plan v0.3 P6: the pool for a verify window.
@@ -6559,6 +6623,7 @@ int main(int argc, char** argv) {
         exl3_drive.ram = exl3_ram.get();
         exl3_drive.moe = exl3_moe.get();
         exl3_drive.pool = &pool;
+        exl3_drive.n_embd = g.n_embd;
         if (!o.exl3_lane_profile.empty()) {
             // the GPU share: #1764's stream with its VRAM cache seeded once, from the RAM tier, with each layer's
             // hottest experts by the profile; never evicted, nothing read from the file
@@ -15554,7 +15619,28 @@ int main(int argc, char** argv) {
         // --spec-follow: the run ends with the continuation
         const int64_t max_new = follow.empty() ? o.max_new : std::min<int64_t>(o.max_new, (int64_t) follow.size());
         int64_t follow_differ = 0, follow_emitted = 0;
-        if (thits.d_res == nullptr) {
+        // --exl3-lane: no VRAM expert tier - the windows get a residency table of their own that marks every expert
+        // absent, so each routed expert of a window goes to the lane (drive_exl3_pool_multi) and the window's hit path
+        // finds nothing to do.  (Not `thits`: the single-token graph reads that one with the GGUF tier's buffers.)
+        const bool exl3_win = exl3_drive.ram != nullptr;
+        int32_t* exl3_res = nullptr;
+        struct Exl3ResFree {
+            int32_t** p;
+            ~Exl3ResFree() { if (*p != nullptr) cudaFree(*p); }
+        } exl3_res_free{&exl3_res};
+        if (exl3_win) {
+            if (exl3_drive.stream != nullptr) {
+                std::fprintf(stderr, "strata generate: --spec with --exl3-lane runs every routed expert on the lane; "
+                                     "drop --exl3-lane-profile (the GPU share has no multi-token path yet)\n");
+                return 2;
+            }
+            host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
+            if (cudaMalloc((void**) &exl3_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
+                res_put(exl3_res) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: the EXL3 windows' residency table could not be staged\n");
+                return 1;
+            }
+        } else if (thits.d_res == nullptr) {
             std::fprintf(stderr, "strata generate: --spec needs the device residency table (--expert-profile, "
                                  "--expert-cache and the token graph)\n");
             return 2;
@@ -15562,12 +15648,13 @@ int main(int argc, char** argv) {
         mem_mark("the head and the prompt path");
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
-        vh.d_res = thits.d_res;
+        vh.d_res = exl3_win ? exl3_res : thits.d_res;
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
-        vh.cache_base = thits.cache_base;
-        vh.blob = thits.blob;
-        vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
-        vh.n_slots = xcache.slots();
+        // EXL3: nothing is resident, so the arena base and blob size are never used for an address - only checked
+        vh.cache_base = exl3_win ? (const uint8_t*) exl3_res : thits.cache_base;
+        vh.blob = exl3_win ? 1 : thits.blob;
+        vh.slot_off = exl3_win ? nullptr : xcache.slot_offsets();   // E-6: the device plan's pointers
+        vh.n_slots = exl3_win ? 0 : xcache.slots();
         if (pcie_balance()) ver.set_pcie_balance(&drive.d.pcie_model);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -15596,7 +15683,9 @@ int main(int argc, char** argv) {
         const int64_t files0 = src.file_reads(), ram0 = src.ram_reads();
         const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
         const double fms0 = src.file_ms();
-        if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        // (EXL3: no VRAM tier to adapt - the usage stays empty, so no swap round runs)
+        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !exl3_win)
+            drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         // before every window: the device's table follows the host's (the tier's evictions while its copies are in
         // flight - see the serve path); the hook's captures live in this block, so it is taken off the verifier when the
         // block ends
@@ -15899,7 +15988,8 @@ int main(int argc, char** argv) {
             if (adapt_nowait()) apply_pending(false);
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-            if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
+            if (!(exl3_win ? ver.run(T, window.data(), p, &drive_exl3_pool_multi, &exl3_drive, outv.data(), err)
+                           : ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err))) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -16018,6 +16108,11 @@ int main(int argc, char** argv) {
         std::printf("%-24s", "accepted per round");
         for (size_t i = 0; i < accepted_hist.size(); ++i) std::printf(" %zu:%lld", i, (long long) accepted_hist[i]);
         std::printf("\n");
+        if (exl3_win && exl3_drive.win_calls > 0)
+            std::printf("%-24s %.3f ms a window-layer; %.2f experts read for %.2f routed (token, expert) entries\n",
+                        "EXL3 lane in windows", exl3_drive.win_ms / (double) exl3_drive.win_calls,
+                        (double) exl3_drive.win_jobs / (double) exl3_drive.win_calls,
+                        (double) exl3_drive.win_entries / (double) exl3_drive.win_calls);
         if (rounds > 0)
             std::printf("%-24s wait for rings %.3f  pool %.3f  host %.3f  commit %.3f ms/round; CPU experts %.2f "
                         "distinct / %.2f routed per layer\n",

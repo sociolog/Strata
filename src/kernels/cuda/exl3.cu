@@ -664,6 +664,21 @@ __global__ void embed_gather_kernel(const uint16_t* __restrict__ row, long n, in
     else out[i] = __half2float(*(const __half*) &h);
 }
 
+// The verify window's (and the MTP drafter's) gather: row t = table[tok[t]], the ids read on the device, so a captured
+// graph replays with each window's tokens.  The same conversion as embed_gather_kernel.  An id outside the table (the
+// vocabulary never makes one) gives a zero row: the window's own argmax then rejects every draft after it.
+__global__ void embed_gather_rows_kernel(const uint16_t* __restrict__ table, long n, long n_rows,
+                                         const int32_t* __restrict__ tok, int bf16, float* __restrict__ out) {
+    const long i = (long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long t = blockIdx.y, r = tok[t];
+    float* o = out + t * n + i;
+    if (r < 0 || r >= n_rows) { *o = 0.0f; return; }
+    const uint16_t h = table[r * n + i];
+    if (bf16) { uint32_t f = (uint32_t) h << 16; float v; __builtin_memcpy(&v, &f, 4); *o = v; }
+    else *o = __half2float(*(const __half*) &h);
+}
+
 
 __global__ void silu_mul_f32_kernel(const float* __restrict__ g, const float* __restrict__ u, float* __restrict__ h, long n) {
     long i = (long) blockIdx.x * blockDim.x + threadIdx.x;
@@ -718,6 +733,13 @@ void exl3_shared_expert(const float* x, const Exl3Mat* gate, const Exl3Mat* up, 
 void exl3_embed_gather(const uint16_t* row, int64_t n, bool bf16, float* out, void* stream) {
     cudaStream_t st = (cudaStream_t) stream;
     embed_gather_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(row, n, bf16 ? 1 : 0, out);
+}
+
+void exl3_embed_gather_rows(const uint16_t* table, int64_t n, int64_t n_rows, const int32_t* tok, int n_tok, bool bf16,
+                            float* out, void* stream) {
+    if (n_tok <= 0 || n <= 0) return;
+    const dim3 grid((unsigned)((n + 255) / 256), (unsigned) n_tok);
+    embed_gather_rows_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(table, n, n_rows, tok, bf16 ? 1 : 0, out);
 }
 
 

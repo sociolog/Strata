@@ -58,6 +58,10 @@ void exl3_moe_rows(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down, 
 // Gather one embedding row stored as F16 (bf16=false) or BF16 (bf16=true) into f32.  The EXL3 model's
 // token_embd is BF16; the engine's `embed_row` otherwise requires an S2/S4/S8 table.
 void exl3_embed_gather(const uint16_t* row, int64_t n, bool bf16, float* out, void* stream);
+// The same for n_tok rows whose token ids sit on the device (the verify window, the MTP drafter): out[t * n ..] =
+// table row tok[t] as f32; an id outside [0, n_rows) gives a zero row.
+void exl3_embed_gather_rows(const uint16_t* table, int64_t n, int64_t n_rows, const int32_t* tok, int n_tok, bool bf16,
+                            float* out, void* stream);
 
 // The MoE shared expert for EXL3 weights: out = (down(silu(gate(x)) * up(x))) * sigmoid(w_ginp . x).
 void exl3_shared_reserve(int n_ff);
