@@ -163,13 +163,17 @@ struct Exl3Pack::Impl {
     std::map<std::string, std::string> weight_map;
     std::map<std::string, std::unique_ptr<SafetensorsFile>> shards;
     std::vector<void*> dev_allocs;   // Exl3Mat uploads + arena
+    void* host_embed = nullptr;      // the token table in page-locked host memory (STRATA_EXL3_EMBED_HOST)
 
     explicit Impl(const std::string& d) : dir(d), model(d) {
         std::ifstream in(d + "/model.safetensors.index.json", std::ios::binary);
         std::ostringstream ss; ss << in.rdbuf();
         weight_map = exl3_detail::parse_weight_map(ss.str());
     }
-    ~Impl() { for (void* p : dev_allocs) (void) cudaFree(p); }
+    ~Impl() {
+        for (void* p : dev_allocs) (void) cudaFree(p);
+        if (host_embed != nullptr) (void) cudaFreeHost(host_embed);
+    }
 
     const SafetensorsFile& shard(const std::string& name) {
         auto it = shards.find(name);
@@ -591,7 +595,16 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
         }
         for (const RoleSpec& r : kPle) if (!r.exl3) add(r, r.hf, r.engine);
 
-        uint64_t need = 0;
+        // STRATA_EXL3_EMBED_HOST=0 keeps the BF16 token table (1.2 GB at 248K x 2560) in VRAM.  By default it is
+        // page-locked host memory the gathers read in place over the bus - a few rows a window, a prompt chunk's rows
+        // once - and its VRAM goes to the EXL3 VRAM tier instead.  If the host allocation fails it stays in VRAM.
+        static const bool embed_host_env = [] {
+            const char* v = std::getenv("STRATA_EXL3_EMBED_HOST");
+            return v == nullptr || v[0] != '0';
+        }();
+        bool embed_host = embed_host_env;
+        auto on_host = [&](const Staged& s) { return embed_host && !s.r->deq && s.engine == "token_embd.weight"; };
+        uint64_t need = 0, need_host = 0;
         for (const Staged& s : staged) {
             if (s.r->deq) {   // reconstructed to BF16 [in, out]
                 Exl3Linear L = im.model.linear(s.hf);
@@ -603,13 +616,39 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
             const StTensor* t = nullptr; im.raw_data(s.hf, &t);
             if (!t) { err = "exl3: missing tensor " + s.hf; return false; }
             const uint64_t bytes = t->nelem() * (s.r->form == Form::F32 ? 4 : 2);
-            need += (bytes + 255) & ~(uint64_t) 255;
+            (on_host(s) ? need_host : need) += (bytes + 255) & ~(uint64_t) 255;
+        }
+        if (need_host > 0 &&
+            cudaHostAlloc(&im.host_embed, (size_t) need_host, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            im.host_embed = nullptr;
+            std::fprintf(stderr, "exl3: WARNING: %.0f MiB of page-locked host memory for the token table could not be "
+                                 "allocated: it stays in VRAM\n", (double) need_host / (1 << 20));
+            embed_host = false;
+            need += need_host;
+            need_host = 0;
         }
         std::vector<uint8_t> host_arena((size_t) need);
         uint8_t* dst = host_arena.data();
         std::vector<std::pair<std::string, uint64_t>> placed;
+        uint8_t* hdst = (uint8_t*) im.host_embed;
         for (const Staged& s : staged) {
             WeightRef w;
+            if (on_host(s)) {   // staged in place in the page-locked table; the kernels take its device address
+                if (!stage_role(im, *s.r, g, s.hf, s.engine, hdst, w, err)) return false;
+                void* dp = nullptr;
+                if (cudaHostGetDevicePointer(&dp, im.host_embed, 0) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    err = "exl3: the page-locked token table has no device address (STRATA_EXL3_EMBED_HOST=0 keeps it "
+                          "in VRAM)";
+                    return false;
+                }
+                w.data = (uint8_t*) dp + ((const uint8_t*) w.data - (const uint8_t*) im.host_embed);
+                wt.set(s.engine, w);
+                std::fprintf(stderr, "exl3: the token table (%.0f MiB) in page-locked host memory, read in place "
+                                     "(STRATA_EXL3_EMBED_HOST=0: in VRAM)\n", (double) need_host / (1 << 20));
+                continue;
+            }
             if (!stage_role(im, *s.r, g, s.hf, s.engine, dst, w, err)) return false;
             placed.emplace_back(s.engine, (uint64_t) ((const uint8_t*) w.data - host_arena.data()));
             w.data = nullptr;   // filled in after the upload
