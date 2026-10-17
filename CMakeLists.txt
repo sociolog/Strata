@@ -357,6 +357,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # reference is the whole point - a kernel checked against another copy of itself proves nothing.
   add_library(strata_kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_gemv.cu
                           src/kernels/cuda/exl3.cu
+                          src/kernels/cuda/exl3_dev.cu
                           src/kernels/cuda/exl3_experts.cu
                           src/kernels/cuda/s_gemv.cu
                           src/kernels/cuda/s2_gemv_quads.cu
@@ -1506,6 +1507,18 @@ if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA))
   target_include_directories(exl3_lane_gpu_parity PRIVATE ${_strata_gpu_include_directories} include)
   target_link_libraries(exl3_lane_gpu_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   add_test(NAME exl3_lane_gpu_parity COMMAND exl3_lane_gpu_parity)
+  # the device kernels of the batched EXL3 paths (exl3_dev.cu: the verify window's grouped experts, the prompt path's
+  # expert step) against host references; --real <dir> adds a model's experts
+  if(TARGET strata_prefill)
+    add_executable(exl3_dev_parity src/kernels/exl3_dev_parity.cpp)
+    target_include_directories(exl3_dev_parity PRIVATE ${_strata_gpu_include_directories} include)
+    target_link_libraries(exl3_dev_parity PRIVATE strata_prefill strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+    # its host emulation of the device's rotations is exact only with every multiply and add rounded on its own
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      set_source_files_properties(src/kernels/exl3_dev_parity.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    endif()
+    add_test(NAME exl3_dev_parity COMMAND exl3_dev_parity)
+  endif()
   # PleTable::open_exl3 (the EXL3 n-gram table) against the numpy codec.
   add_executable(ple_exl3_parity src/kernels/ple_exl3_parity.cpp)
   target_include_directories(ple_exl3_parity PRIVATE ${_strata_gpu_include_directories} include)
