@@ -31,11 +31,13 @@ void Exl3VramTier::release() {
     base_ = nullptr;
     d_res_ = nullptr;
     h_res_.clear();
+    owner_.clear();
     slots_ = 0;
+    filled_ = 0;
 }
 
 bool Exl3VramTier::init(const cpu::Exl3ExpertRam& ram, const std::vector<std::pair<int32_t, int32_t>>& ranked,
-                        uint64_t budget, std::string& err, int device, const int32_t* exclude) {
+                        uint64_t budget, std::string& err, int device, const int32_t* exclude, int64_t spares) {
     release();
     const auto t0 = std::chrono::steady_clock::now();
     if (device < 0 && cudaGetDevice(&device) != cudaSuccess) {
@@ -55,7 +57,9 @@ bool Exl3VramTier::init(const cpu::Exl3ExpertRam& ram, const std::vector<std::pa
     // slots start 256-byte aligned (every part of a blob is 64-byte aligned within it, as in the RAM tier)
     slot_bytes_ = (slot_bytes_ + 255) & ~(uint64_t) 255;
     h_res_.assign((size_t) (n_layers_ * n_expert_), -1);
-    const int64_t want = std::min<int64_t>((int64_t) (budget / slot_bytes_), (int64_t) ranked.size());
+    const int64_t fit = (int64_t) (budget / slot_bytes_);
+    const int64_t n_spare = std::clamp<int64_t>(spares, 0, fit);
+    const int64_t want = std::min<int64_t>(fit - n_spare, (int64_t) ranked.size());
     std::vector<std::pair<int32_t, int32_t>> take;
     take.reserve((size_t) std::max<int64_t>(want, 0));
     for (const auto& pr : ranked) {
@@ -68,7 +72,10 @@ bool Exl3VramTier::init(const cpu::Exl3ExpertRam& ram, const std::vector<std::pa
         r = (int32_t) take.size();
         take.push_back(pr);
     }
-    slots_ = (int64_t) take.size();
+    filled_ = (int64_t) take.size();
+    slots_ = filled_ + n_spare;
+    owner_.assign((size_t) slots_, -1);
+    for (int64_t s = 0; s < filled_; ++s) owner_[(size_t) s] = take[(size_t) s].first * (int32_t) n_expert_ + take[(size_t) s].second;
     auto fail = [&](const std::string& what, cudaError_t e) {
         err = "EXL3 VRAM tier (device " + std::to_string(device_) + "): " + what + ": " + cudaGetErrorString(e);
         (void) cudaGetLastError();
@@ -81,7 +88,7 @@ bool Exl3VramTier::init(const cpu::Exl3ExpertRam& ram, const std::vector<std::pa
         if (cudaError_t e = cudaMalloc((void**) &base_, (size_t) slots_ * slot_bytes_); e != cudaSuccess)
             return fail(std::to_string(slots_) + " slots of " + std::to_string(slot_bytes_) + " bytes", e);
         // one copy a slot, in order, from the RAM tier (page-locked or not: the driver stages a pageable source)
-        for (int64_t s = 0; s < slots_; ++s) {
+        for (int64_t s = 0; s < filled_; ++s) {
             const auto [l, e] = take[(size_t) s];
             if (cudaError_t ce = cudaMemcpy(base_ + (uint64_t) s * slot_bytes_, ram.blob(l, e), (size_t) ram.blob_bytes(l),
                                             cudaMemcpyHostToDevice);
@@ -93,6 +100,41 @@ bool Exl3VramTier::init(const cpu::Exl3ExpertRam& ram, const std::vector<std::pa
         e != cudaSuccess)
         return fail("the residency table's upload", e);
     load_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return true;
+}
+
+bool Exl3VramTier::assign(int64_t slot, int32_t key, std::string& err) {
+    if (slot < 0 || slot >= slots_ || owner_[(size_t) slot] >= 0 || key < 0 || key >= (int32_t) h_res_.size() ||
+        h_res_[(size_t) key] >= 0) {
+        err = "EXL3 VRAM tier: assign of expert " + std::to_string(key) + " to slot " + std::to_string(slot) +
+              ": the slot is taken or the expert resident already";
+        return false;
+    }
+    h_res_[(size_t) key] = (int32_t) slot;
+    owner_[(size_t) slot] = key;
+    const DeviceScope on(device_);
+    if (const cudaError_t e = cudaMemcpy(d_res_ + key, &h_res_[(size_t) key], sizeof(int32_t), cudaMemcpyHostToDevice);
+        e != cudaSuccess) {
+        err = std::string("EXL3 VRAM tier: the residency table's update: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
+
+bool Exl3VramTier::release_slot(int64_t slot, std::string& err) {
+    const int32_t key = slot >= 0 && slot < slots_ ? owner_[(size_t) slot] : -1;
+    if (key < 0) {
+        err = "EXL3 VRAM tier: slot " + std::to_string(slot) + " holds no expert";
+        return false;
+    }
+    h_res_[(size_t) key] = -1;
+    owner_[(size_t) slot] = -1;
+    const DeviceScope on(device_);
+    if (const cudaError_t e = cudaMemcpy(d_res_ + key, &h_res_[(size_t) key], sizeof(int32_t), cudaMemcpyHostToDevice);
+        e != cudaSuccess) {
+        err = std::string("EXL3 VRAM tier: the residency table's update: ") + cudaGetErrorString(e);
+        return false;
+    }
     return true;
 }
 

@@ -433,6 +433,7 @@ struct Options {
     std::string exl3_lane_profile;    // --exl3-lane: fill the EXL3 VRAM tier from this routing profile (the GPU share)
     int64_t exl3_vram_tier_mib = -1;  // --exl3-vram-tier: that tier's VRAM in MiB; -1 auto (what is left), 0 none
     int64_t exl3_helper_tier_mib = 0; // --exl3-helper-tier: a second tier on the helper card, MiB; -1 auto, 0 none
+    int exl3_tier_adapt = 32;         // --exl3-tier-adapt: experts the VRAM tier swaps in a round (0: static)
     bool no_ple = false;              // explicit diagnostic ablation; never a normal inference default
     bool stream_token = false;        // R2.6 experiment: ordered work on the session stream
     bool check_logits = false;        // optional full-vocabulary finite scan
@@ -1001,11 +1002,17 @@ void usage() {
                  "                       rest.  STRATA_EXL3_OLD_SHARE=1: #1764's per-layer stream cache instead (no --spec)\n"
                  "  --exl3-vram-tier MIB|auto  that tier's VRAM (auto, the default: what is free once the model, the\n"
                  "                       prompt's buffers are gone, minus STRATA_EXL3_TIER_RESERVE_MIB for the verify\n"
-                 "                       window's buffers and graphs, default 512; 0: no tier).  A fixed size gives two runs\n"
-                 "                       the same experts on the GPU (an oracle comparison of --spec against single-token)\n"
+                 "                       window's buffers and graphs, default 512; 0: no tier).  A fixed size and\n"
+                 "                       --exl3-tier-adapt 0 give two runs the same experts on the GPU (an oracle\n"
+                 "                       comparison of --spec against single-token)\n"
                  "  --exl3-helper-tier MIB|auto  the profile's next-hottest experts in a second tier on the run's\n"
                  "                       device 1 (CUDA_VISIBLE_DEVICES=1,2: the helper card), run there beside the lane\n"
                  "                       (auto: its free VRAM minus STRATA_EXL3_HELPER_RESERVE_MIB, default 512; default 0)\n"
+                 "  --exl3-tier-adapt N  with --spec: the VRAM tier follows the decode - each verify round swaps in up\n"
+                 "                       to N of the experts the lane computed most (copied during the next round,\n"
+                 "                       in place at the boundary after), out go the tier's least used.  Default 32\n"
+                 "                       (21K: 76 -> 88 tok/s); 0: static, as an oracle comparison with a single-token\n"
+                 "                       run needs.  STRATA_EXL3_ADAPT_HELPER=1: the helper's tier adapts too (slower)\n"
                  "  --expert-cache N     R4: keep N expert blobs resident in VRAM and compute their rows on the\n"
                  "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.  Measured at 4096 slots\n"
                  "                       with --expert-cache-per-layer: 54.4%% hits, CPU pool drain 19.1 -> 10.3\n"
@@ -1162,6 +1169,150 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
     }
 }
 
+/// --exl3-tier-adapt N: the VRAM tiers follow the text being decoded.  The windows count their routes (each tier's per
+/// slot, the lane's per expert; decayed each round), and at every round boundary the experts the lane computed most
+/// are copied into spare slots - N into the main tier, then N more into the helper's (--exl3-helper-tier) - during the
+/// next round, on a stream of each tier's device, from the page-locked RAM tier, to replace at the boundary after that
+/// each tier's least-used experts.  The tables change only at a boundary, when no window runs.  Which experts a GPU
+/// computes then depends on the decode's history, so a --spec-oracle comparison against a single-token run needs it
+/// off (--exl3-tier-adapt 0).
+// STRATA_EXL3_ADAPT_HELPER=1: the helper's tier adapts too.  Off by default: at 21K it read fewer experts on the lane
+// (1.38 a window-layer against 1.54) but decoded slower (87.0 against 88.3 tok/s) - its copies share the helper card's
+// link with the windows' activations and rows
+inline bool exl3_adapt_helper() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_EXL3_ADAPT_HELPER"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+struct Exl3Adapt {
+    struct Tier {
+        strata::kernels::Exl3VramTier* tier = nullptr;
+        std::vector<float> use;          // [slots]: its routes
+        std::vector<uint8_t> chosen;     // [slots]: the victim of a pending swap
+        std::vector<int32_t> spares;
+        struct Pending { int32_t slot, key, victim; float score; };
+        std::vector<Pending> pending;
+        cudaStream_t s = nullptr;
+    };
+    std::vector<Tier> tiers;   // [0] the main tier, [1] the helper's (optional)
+    const strata::kernels::cpu::Exl3ExpertRam* ram = nullptr;
+    int per_round = 0;
+    int64_t n_expert = 0;
+    float decay = 0.95f, margin = 1.0f;
+    std::vector<float> miss;   // [n_layers * n_expert]: the lane's routes
+    int64_t swaps = 0, swaps_help = 0, rounds = 0;
+    bool init(strata::kernels::Exl3VramTier* main, strata::kernels::Exl3VramTier* help,
+              const strata::kernels::cpu::Exl3ExpertRam* r, int n, std::string& err) {
+        ram = r;
+        per_round = n;
+        n_expert = main->n_expert();
+        // STRATA_EXL3_ADAPT_DECAY (default 0.95 a round) and STRATA_EXL3_ADAPT_MARGIN (a swap's least gain in decayed
+        // routes, default 1)
+        if (const char* v = std::getenv("STRATA_EXL3_ADAPT_DECAY")) decay = std::clamp((float) std::atof(v), 0.5f, 1.0f);
+        if (const char* v = std::getenv("STRATA_EXL3_ADAPT_MARGIN")) margin = std::max(0.0f, (float) std::atof(v));
+        miss.assign((size_t) (main->n_layers() * n_expert), 0.0f);
+        for (strata::kernels::Exl3VramTier* x : {main, help}) {
+            if (x == nullptr) continue;
+            Tier ts;
+            ts.tier = x;
+            ts.use.assign((size_t) x->slots(), 0.0f);
+            ts.chosen.assign((size_t) x->slots(), 0);
+            for (int64_t q = 0; q < x->slots(); ++q)
+                if (x->owner(q) < 0) ts.spares.push_back((int32_t) q);
+            if (ts.spares.empty()) {
+                err = "--exl3-tier-adapt: a VRAM tier has no spare slots";
+                return false;
+            }
+            const strata::core::OnDevice on(x->device());
+            if (cudaStreamCreateWithFlags(&ts.s, cudaStreamNonBlocking) != cudaSuccess) {
+                err = std::string("--exl3-tier-adapt: a copy stream: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            tiers.push_back(std::move(ts));
+        }
+        return true;
+    }
+    // a window-layer's routes: the main tier's (on_gpu) and the helper's (on_help) per slot, the lane's per expert
+    void count(int64_t layer, const int32_t* ids, int64_t n, const bool* on_gpu, const bool* on_help) {
+        const int32_t* r0 = tiers[0].tier->h_res() + layer * n_expert;
+        const int32_t* r1 = tiers.size() > 1 ? tiers[1].tier->h_res() + layer * n_expert : nullptr;
+        for (int64_t i = 0; i < n; ++i) {
+            if (on_gpu[i]) tiers[0].use[(size_t) r0[ids[i]]] += 1.0f;
+            else if (on_help[i]) { if (r1 != nullptr) tiers[1].use[(size_t) r1[ids[i]]] += 1.0f; }
+            else miss[(size_t) (layer * n_expert + ids[i])] += 1.0f;
+        }
+    }
+    // a round boundary (no window runs): the last boundary's copies made resident, the counts decayed, the next copies
+    // issued - the most-missed experts to the main tier first, the next ones to the helper's
+    bool round(std::string& err) {
+        ++rounds;
+        for (size_t ti = 0; ti < tiers.size(); ++ti) {
+            Tier& T = tiers[ti];
+            if (T.pending.empty()) continue;
+            if (const cudaError_t e = cudaStreamSynchronize(T.s); e != cudaSuccess) {
+                err = std::string("--exl3-tier-adapt: an expert's copy: ") + cudaGetErrorString(e);
+                return false;
+            }
+            for (const Tier::Pending& p : T.pending) {
+                if (!T.tier->release_slot(p.victim, err) || !T.tier->assign(p.slot, p.key, err)) return false;
+                T.use[(size_t) p.slot] = p.score;
+                miss[(size_t) p.key] = 0.0f;
+                T.use[(size_t) p.victim] = 0.0f;
+                T.chosen[(size_t) p.victim] = 0;
+                T.spares.push_back(p.victim);
+                ++(ti == 0 ? swaps : swaps_help);
+            }
+            T.pending.clear();
+        }
+        for (float& m : miss) m *= decay;
+        for (Tier& T : tiers)
+            for (float& u : T.use) u *= decay;
+        std::vector<std::pair<float, int32_t>> cand;
+        for (int32_t key = 0; key < (int32_t) miss.size(); ++key)
+            if (miss[(size_t) key] > margin) cand.emplace_back(miss[(size_t) key], key);
+        const size_t want = std::min(cand.size(), (size_t) per_round * tiers.size());
+        if (want == 0) return true;
+        std::partial_sort(cand.begin(), cand.begin() + (std::ptrdiff_t) want, cand.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        size_t next = 0;   // the next candidate, best first
+        for (Tier& T : tiers) {
+            const size_t nc = std::min({(size_t) per_round, T.spares.size(), want - next});
+            if (nc == 0) continue;
+            std::vector<std::pair<float, int32_t>> vict;
+            for (int32_t q = 0; q < (int32_t) T.use.size(); ++q)
+                if (T.tier->owner(q) >= 0 && !T.chosen[(size_t) q]) vict.emplace_back(T.use[(size_t) q], q);
+            const size_t nv = std::min(nc, vict.size());
+            std::partial_sort(vict.begin(), vict.begin() + (std::ptrdiff_t) nv, vict.end(),
+                              [](const auto& a, const auto& b) { return a.first < b.first; });
+            const strata::core::OnDevice on(T.tier->device());
+            for (size_t i = 0; i < nv && next < want; ++i) {
+                if (cand[next].first <= vict[i].first + margin) break;
+                const int32_t key = cand[next].second, victim = vict[i].second, slot = T.spares.back();
+                const int layer = (int) (key / n_expert), e = (int) (key % n_expert);
+                if (const cudaError_t ce = cudaMemcpyAsync(T.tier->slot_ptr(slot), ram->blob(layer, e),
+                                                           (size_t) ram->blob_bytes(layer), cudaMemcpyHostToDevice, T.s);
+                    ce != cudaSuccess) {
+                    err = std::string("--exl3-tier-adapt: an expert's copy: ") + cudaGetErrorString(ce);
+                    return false;
+                }
+                T.spares.pop_back();
+                T.chosen[(size_t) victim] = 1;
+                T.pending.push_back({slot, key, victim, cand[next].first});
+                miss[(size_t) key] = -1e30f;   // pending: no candidate again until it lands (then 0)
+                ++next;
+            }
+        }
+        return true;
+    }
+    ~Exl3Adapt() {
+        for (Tier& T : tiers)
+            if (T.s != nullptr) {
+                const strata::core::OnDevice on(T.tier->device());
+                (void) cudaStreamSynchronize(T.s);
+                (void) cudaStreamDestroy(T.s);
+            }
+    }
+};
+
 /// The EXL3 expert pool: streams each layer's routed experts from the model's safetensors and runs them - or, with
 /// --exl3-lane, runs every one of them on the CPU lane from the RAM tier (the expert pool's threads).
 struct Exl3Drive {
@@ -1305,6 +1456,7 @@ struct Exl3Drive {
         }
     };
     X3Runner tok;    // the token path's share of the tier (device 0)
+    Exl3Adapt* adapt = nullptr;   // --exl3-tier-adapt: the windows' route counts
     X3Runner help;   // the helper tier's, both pools (device 1)
 };
 void drive_exl3_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
@@ -1496,6 +1648,7 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
         t->help_groups += h.groups;
         t->help_entries += h.entries;
     }
+    if (ok && t->adapt != nullptr && t->tier != nullptr) t->adapt->count(layer, ids, n_tok * k, on_gpu, on_help);
     if (ok) {
         const int ne = t->ram->n_expert();
         if ((int) t->job_of.size() != ne) t->job_of.assign((size_t) ne, -1);
@@ -2722,6 +2875,7 @@ int main(int argc, char** argv) {
         else if (a == "--ple-exl3") o.ple_exl3 = next("--ple-exl3");
         else if (a == "--exl3-lane") o.exl3_lane = true;
         else if (a == "--exl3-lane-profile") o.exl3_lane_profile = next("--exl3-lane-profile");
+        else if (a == "--exl3-tier-adapt") o.exl3_tier_adapt = std::max(0, std::atoi(next("--exl3-tier-adapt")));
         else if (a == "--exl3-vram-tier" || a == "--exl3-helper-tier") {
             const std::string v = next(a.c_str());
             int64_t& mib = a == "--exl3-vram-tier" ? o.exl3_vram_tier_mib : o.exl3_helper_tier_mib;
@@ -15789,7 +15943,9 @@ int main(int argc, char** argv) {
         int dev0 = 0;
         (void) cudaGetDevice(&dev0);
         exl3_tier = std::make_unique<strata::kernels::Exl3VramTier>();
-        if (!exl3_tier->init(*exl3_ram, exl3_ranked, budget, err, dev0) ||
+        // --exl3-tier-adapt N: 2N of its slots spare (the swaps' copies land there)
+        const int64_t spares = o.exl3_tier_adapt > 0 && o.spec >= 2 ? 2 * (int64_t) o.exl3_tier_adapt : 0;
+        if (!exl3_tier->init(*exl3_ram, exl3_ranked, budget, err, dev0, nullptr, spares) ||
             !exl3_drive.tok.init(dev0, 1, (int64_t) ss.k, g.n_embd, g.n_ff, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -15797,7 +15953,7 @@ int main(int argc, char** argv) {
         exl3_drive.tier = exl3_tier.get();
         cudaMemGetInfo(&fb, &tb);
         std::fprintf(stderr, "strata generate: EXL3 VRAM tier: the %lld hottest experts of %s (%.2f GiB, %.2f MB slots) in "
-                             "%.1f s; %.2f GiB of VRAM left\n", (long long) exl3_tier->slots(), o.exl3_lane_profile.c_str(),
+                             "%.1f s; %.2f GiB of VRAM left\n", (long long) exl3_tier->filled(), o.exl3_lane_profile.c_str(),
                      (double) exl3_tier->bytes() / (double) (1ull << 30), (double) exl3_tier->slot_bytes() / 1e6,
                      exl3_tier->load_seconds(), (double) fb / (double) (1ull << 30));
     }
@@ -15826,7 +15982,11 @@ int main(int argc, char** argv) {
             const uint64_t budget = o.exl3_helper_tier_mib > 0 ? (uint64_t) o.exl3_helper_tier_mib << 20
                                                                : (fb1 > reserve ? (uint64_t) fb1 - reserve : 0);
             exl3_helper = std::make_unique<strata::kernels::Exl3VramTier>();
-            if (!exl3_helper->init(*exl3_ram, exl3_ranked, budget, err, dev1, exl3_tier ? exl3_tier->h_res() : nullptr) ||
+            // --exl3-tier-adapt N (STRATA_EXL3_ADAPT_HELPER=0: the helper's tier stays static): 2N spare slots here too
+            const int64_t spares = o.exl3_tier_adapt > 0 && o.spec >= 2 && exl3_adapt_helper() ? 2 * (int64_t) o.exl3_tier_adapt
+                                                                                                  : 0;
+            if (!exl3_helper->init(*exl3_ram, exl3_ranked, budget, err, dev1, exl3_tier ? exl3_tier->h_res() : nullptr,
+                                   spares) ||
                 !exl3_drive.help.init(dev1, strata::kernels::cpu::MAXT, (int64_t) strata::kernels::cpu::MAXT * ss.k,
                                       g.n_embd, g.n_ff, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -15837,6 +15997,26 @@ int main(int argc, char** argv) {
                                  "%.1f s\n", dev1, (long long) exl3_helper->slots(), o.exl3_lane_profile.c_str(),
                          (double) exl3_helper->bytes() / (double) (1ull << 30), exl3_helper->load_seconds());
         }
+    }
+    // --exl3-tier-adapt: the tier's swaps (Exl3Adapt), from the page-locked RAM tier (locked here if the prompt path did
+    // not lock it)
+    Exl3Adapt exl3_adapt;
+    if (exl3_tier != nullptr && o.exl3_tier_adapt > 0 && o.spec >= 2) {
+        if (exl3_pin.p == nullptr) {
+            if (cudaHostRegister(const_cast<uint8_t*>(exl3_ram->mapping()), (size_t) exl3_ram->mapping_bytes(),
+                                 cudaHostRegisterPortable) == cudaSuccess)
+                exl3_pin.p = const_cast<uint8_t*>(exl3_ram->mapping());
+            else
+                (void) cudaGetLastError();   // pageable: each copy is staged by the driver (slower, still correct)
+        }
+        if (!exl3_adapt.init(exl3_tier.get(), exl3_adapt_helper() ? exl3_helper.get() : nullptr, exl3_ram.get(),
+                             o.exl3_tier_adapt, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        exl3_drive.adapt = &exl3_adapt;
+        std::fprintf(stderr, "strata generate: EXL3 VRAM tiers adapt: up to %d swaps a round each, %zu tier%s\n",
+                     o.exl3_tier_adapt, exl3_adapt.tiers.size(), exl3_adapt.tiers.size() == 1 ? "" : "s");
     }
     // (EXL3 + MTP: the drafter is bound to the EXL3 head before the prompt - see exl3_mtp above the batched prompt)
     // EXL3 lane + --spec: the prompt is read through the verify windows, up to 8 tokens a window with every token
@@ -16588,6 +16768,13 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
+            // --exl3-tier-adapt: the round boundary - no window runs until the next round's (the commit and the
+            // drafter read no tier table)
+            if (exl3_drive.adapt != nullptr && !exl3_drive.adapt->round(err)) {
+                if (adapt_thr.joinable()) adapt_thr.join();
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
             ++rounds;
             drafts_total += T - 1;
             drafts_ok += a;
@@ -16669,6 +16856,10 @@ int main(int argc, char** argv) {
                                                                               (double) exl3_drive.win_entries : 0.0,
                         (double) exl3_drive.help_entries / (double) exl3_drive.win_calls,
                         (double) exl3_drive.help_groups / (double) exl3_drive.win_calls);
+        if (exl3_drive.adapt != nullptr)
+            std::printf("%-24s %lld swaps in the main tier, %lld in the helper's, over %lld rounds (up to %d a round each)\n",
+                        "EXL3 tier adapt", (long long) exl3_drive.adapt->swaps, (long long) exl3_drive.adapt->swaps_help,
+                        (long long) exl3_drive.adapt->rounds, exl3_drive.adapt->per_round);
         // STRATA_VERIFY_PROFILE: the windows' GPU stages (the serve path prints the same report)
         if (const std::string pr = ver.profile_report(); !pr.empty()) std::printf("%-24s%s\n", "verify profile", pr.c_str());
         if (rounds > 0)

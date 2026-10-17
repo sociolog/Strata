@@ -26,12 +26,14 @@ public:
     /// expert) pairs, hottest first; pairs out of range or repeated are skipped, and so are those `exclude` - another
     /// tier's table, [n_layers][n_expert] - holds) from `ram`.  One allocation on `device` (-1: the current one), the
     /// residency table there too - everything before any graph capture.  A budget below one slot leaves the tier empty
-    /// (true).  False and a message on a failed allocation or copy, with nothing left allocated.
+    /// (true).  False and a message on a failed allocation or copy, with nothing left allocated.  `spares`: that many of
+    /// the slots are left empty, for an adaptive caller (assign / release_slot); they count in the budget.
     bool init(const cpu::Exl3ExpertRam& ram, const std::vector<std::pair<int32_t, int32_t>>& ranked, uint64_t budget,
-              std::string& err, int device = -1, const int32_t* exclude = nullptr);
+              std::string& err, int device = -1, const int32_t* exclude = nullptr, int64_t spares = 0);
     int device() const { return device_; }
 
-    int64_t slots() const { return slots_; }
+    int64_t slots() const { return slots_; }               ///< every slot, the spares included
+    int64_t filled() const { return filled_; }             ///< the slots filled from the ranking at init
     uint64_t slot_bytes() const { return slot_bytes_; }
     uint64_t bytes() const { return (uint64_t) slots_ * slot_bytes_; }
     const uint8_t* base() const { return base_; }
@@ -46,14 +48,22 @@ public:
         const int32_t s = h_res_[(size_t) (layer * n_expert_ + e)];
         return s < 0 ? nullptr : base_ + (uint64_t) s * slot_bytes_;
     }
+    /// Adaptive use (--exl3-tier-adapt): a slot's expert (layer * n_expert + e) or -1 (a spare); the slot's bytes; an
+    /// expert put in a spare slot its blob was copied into, and a slot given back as a spare.  Both tables change -
+    /// the host's and the device copy (synchronously) - so a caller does it only while no window or token graph runs.
+    int32_t owner(int64_t slot) const { return owner_[(size_t) slot]; }
+    uint8_t* slot_ptr(int64_t slot) const { return base_ + (uint64_t) slot * slot_bytes_; }
+    bool assign(int64_t slot, int32_t key, std::string& err);
+    bool release_slot(int64_t slot, std::string& err);
 
 private:
     void release();
     uint8_t* base_ = nullptr;
     int32_t* d_res_ = nullptr;
     std::vector<int32_t> h_res_;
+    std::vector<int32_t> owner_;   // slot -> its expert, -1 a spare
     int device_ = 0;
-    int64_t slots_ = 0, n_layers_ = 0, n_expert_ = 0;
+    int64_t slots_ = 0, filled_ = 0, n_layers_ = 0, n_expert_ = 0;
     uint64_t slot_bytes_ = 0;
     double load_s_ = 0.0;
 };
