@@ -17,11 +17,36 @@ NativeHead::~NativeHead() {
 }
 
 void NativeHead::unload() {
-    if (weights_) strata::kernels::native_q6_k_unpack(weights_);
+    if (weights_ && owned_) strata::kernels::native_q6_k_unpack(weights_);
     if (scratch_) cudaFree(scratch_);
-    if (weights_) cudaFree(weights_);
+    if (weights_ && owned_) cudaFree(weights_);
     scratch_ = nullptr;
     weights_ = nullptr;
+    owned_ = true;
+}
+
+bool NativeHead::adopt(const void* weights, int type, int64_t n_in, int64_t n_out, std::string& err) {
+    if (loaded()) { err = "native head is already loaded"; return false; }
+    if (weights == nullptr || n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256 ||
+        !strata::kernels::native_mmvq_supported(type)) {
+        err = "native head: an adopted head needs device blocks of a native MMVQ type and whole 256-value rows";
+        return false;
+    }
+    void* scratch = nullptr;
+    const cudaError_t status = cudaMalloc(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
+    if (status != cudaSuccess) {
+        err = std::string("native head scratch: ") + cudaGetErrorString(status);
+        return false;
+    }
+    weights_ = const_cast<void*>(weights);
+    owned_ = false;
+    { int d = -1; if (cudaGetDevice(&d) == cudaSuccess) device_ = d; }
+    scratch_ = scratch;
+    bytes_ = strata::kernels::native_mmvq_weight_bytes(type, (int) n_in, (int) n_out);
+    n_in_ = (int) n_in;
+    n_out_ = (int) n_out;
+    type_ = type;   // never Q6_K-packed: the blocks are not this head's to rearrange
+    return true;
 }
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {

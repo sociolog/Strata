@@ -10,6 +10,7 @@
 #include "strata/core/peer_experts.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
@@ -893,6 +894,17 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
         g_mp.stamp(0, cs);
         if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
             ne->gather_dev(tok_, T, emb_, cs);
+        } else if (we->kind == WeightKind::Bf16InF32 || we->kind == WeightKind::F16InF32) {
+            // EXL3: the model's token_embd is BF16 (F16) rows - the verify window's gather, the ids on the device
+            if (we->data == nullptr || we->ne0 != (int64_t) N || we->ne1 <= 0) {
+                err = "mtp: the EXL3 token_embd.weight is not a [n_embd, n_vocab] table";
+                return false;
+            }
+            strata::kernels::exl3_embed_gather_rows((const uint16_t*) we->data, we->ne0, we->ne1, tok_, T,
+                                                    we->kind == WeightKind::Bf16InF32, emb_, cs);
+        } else if (we->code_bits != 2 && we->code_bits != 4 && we->code_bits != 8) {
+            err = "mtp: token_embd.weight is neither BF16/F16 rows nor an S2/S4/S8 table";
+            return false;
         } else {
             const auto* codes = (const uint8_t*) we->data;
             const auto* scales = (const float*) (codes + we->codes_bytes);

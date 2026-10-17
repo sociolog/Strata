@@ -20,6 +20,10 @@ public:
     NativeHead& operator=(const NativeHead&) = delete;
 
     bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err);
+    /// EXL3 (the MTP drafter's head, 2026-10-17): wrap blocks another owner keeps on the device - the EXL3 pack's
+    /// requantized output.weight - instead of uploading a GGUF's.  `type` a native MMVQ type, n_out rows of n_in.
+    /// The blocks are not freed by unload (their owner frees them); `run` works (the head gets its own scratch).
+    bool adopt(const void* weights, int type, int64_t n_in, int64_t n_out, std::string& err);
     void unload();
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
     uint64_t weight_bytes() const { return bytes_; }
@@ -39,6 +43,7 @@ private:
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
     int device_ = -1;
+    bool owned_ = true;   // false for an adopted head: the weights belong to someone else
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row

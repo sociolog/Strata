@@ -15370,6 +15370,24 @@ int main(int argc, char** argv) {
         kvg_start(xcache.slots());
         if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
     }
+    // EXL3 + MTP (no batched prompt path, no GGUF head): the drafter's head reads the EXL3 pack's own requantized
+    // output.weight blocks (adopted, not copied), and the token loop below gives it its K/V cell for every prompt
+    // position (the batched path's on_chunk does the same per chunk).  The verify windows keep the per-token head.
+    strata::core::NativeHead exl3_mtp_head;
+    const bool exl3_mtp = !o.exl3_dir.empty() && !o.mtp.empty() && o.spec >= 2 && !native_pack;
+    if (exl3_mtp) {
+        const strata::core::WeightRef* wo = wt.find("output.weight");
+        if (wo == nullptr || wo->native_data == nullptr) {
+            std::fprintf(stderr, "strata generate: --mtp with --exl3 needs the requantized output.weight (the "
+                                 "default; not STRATA_EXL3_DENSE=exl3)\n");
+            return 1;
+        }
+        if (!exl3_mtp_head.adopt(wo->native_data, wo->native_type, wo->ne0, wo->ne1, err) ||
+            !mtp.bind(wt, &exl3_mtp_head, nullptr, err)) {
+            std::fprintf(stderr, "strata generate: --mtp with --exl3: %s\n", err.c_str());
+            return 1;
+        }
+    }
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
         if (native_pack) { spec_pos = pos; break; }
@@ -15588,6 +15606,15 @@ int main(int argc, char** argv) {
         // and the window advances: the token just decoded becomes the newest predecessor.
         ss.ple_prev[0] = ss.ple_prev[1];
         ss.ple_prev[1] = (int32_t) tok;
+        // EXL3 + MTP: the drafter's K/V cell for this prompt position - the residual the token left in ss.R, paired
+        // with the prompt's next token.  The last prompt position's cell is draft_first's, in the spec loop below.
+        if (exl3_mtp && pos + 1 < n_prompt) {
+            const int32_t nt = (int32_t) o.tokens[(size_t) (pos + 1)];
+            if (!mtp.prefill(ss.R, &nt, 1, pos, err)) {
+                std::fprintf(stderr, "strata generate: the MTP's prompt cell %lld: %s\n", (long long) pos, err.c_str());
+                return 1;
+            }
+        }
         tok = (pos + 1 < n_prompt) ? o.tokens[(size_t) (pos + 1)] : next;
         // Plan v0.3 P6: from the first generated token on, the speculative loop below takes over.
         if (o.spec > 0 && pos >= n_prompt - 1) { spec_pos = pos + 1; break; }
@@ -15661,7 +15688,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         const bool use_mtp = !o.mtp.empty();
-        if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
+        if (use_mtp && !mtp.bind(wt, exl3_mtp ? &exl3_mtp_head : &native_head, ver.final_R_all(), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
