@@ -2394,6 +2394,19 @@ int main(int argc, char** argv) {
             // STRATA_EXL3_NATIVE_BF16=0 keeps the old path for an A/B.
             const char* nb = std::getenv("STRATA_EXL3_NATIVE_BF16");
             if (!(nb != nullptr && nb[0] == '0')) o.native_bf16 = true;
+            // **AND THE REST OF THE NATIVE KERNEL SET --native TURNS ON** (2026-10-17, 3090, every routed expert on the
+            // CPU lane): the fused hyper-connection read, the native GDN, QSA + indexer, RoPE, router, MoE combine and
+            // PLE post-ops, on the session stream.  Not --native-ple-key: it needs GGUF dense projections.  Decode 21.7
+            // -> 24.6 tok/s (the token's GPU part ~17 -> ~11.6 ms, the lane's 29 ms unchanged); teacher-forced against
+            // the old kernels KL 0.0008 (max 0.008), the same top token at 157 of 158 positions.  It is also the
+            // arithmetic the verify windows reproduce (layer_verify_compatible).  STRATA_EXL3_NATIVE=0 keeps the old
+            // kernels for an A/B.
+            const char* nn = std::getenv("STRATA_EXL3_NATIVE");
+            if (!(nn != nullptr && nn[0] == '0')) {
+                o.stream_token = o.gr_native_mmvf = o.native_bf16_extra = true;
+                o.native_moe_combine = o.native_gdn = o.native_router = true;
+                o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
+            }
         }
         else if (a == "--ple-exl3") o.ple_exl3 = next("--ple-exl3");
         else if (a == "--exl3-lane") o.exl3_lane = true;
