@@ -24,6 +24,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/exl3.hpp"
+#include "strata/kernels/exl3_dev.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -649,6 +650,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     g_ = &g;
     ss_ = &ss;
     hits_ = hits;
+    x3_on_ = hits.exl3_lay != nullptr;
     head_ = head;
     max_t_ = max_t;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
@@ -667,6 +669,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               "--expert-cache auto, no VRAM was left for it - the 'no VRAM is left for the expert cache' line above "
               "says how much is short and what makes room (a smaller --max-context, --kv q4_0, setup --draft-vocab en, "
               "images on the CPU)";
+        return false;
+    }
+    if (x3_on_ && !strata::kernels::exl3::device_ok()) {
+        err = "verify: the EXL3 VRAM tier's kernels need an sm_80 or newer GPU";
         return false;
     }
     std::string why;
@@ -784,9 +790,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
-        hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
+        hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>({
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
+            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff),
+            x3_on_ ? 2 * T * K * (uint64_t) g.n_ff * sizeof(float) : 0}));   // --exl3: the grouped kernels' h and u
+        x3_cnt_ = x3_on_ ? b.take<uint32_t>(strata::kernels::exl3::group_counters((int) (T * K), (int) g.n_ff)) : nullptr;
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
@@ -1939,7 +1947,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (strata::kernels::cpu::expert_layout().native) {
             if (!qdedup)
                 if (!q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
-        } else
+        } else if (!x3_on_)   // (--exl3: the EXL3 groups read xm itself, F32)
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
         stamp(l, 18, grp);
         return true;
@@ -1970,7 +1978,34 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging.
         // `gy`: the native launch's groups side by side (0: cap, one block row per possible group).
+        bool x3_ok = true;
         auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf) {
+            if (x3_on_) {
+                // --exl3: the tier's EXL3 experts over the group's F32 MoE input (pre's xm), each group's weights decoded
+                // once for its entries, every entry the bits it gets alone (exl3_dev.hpp); no PCIe share on this path
+                if (gy != 0) return;
+                namespace x3 = strata::kernels::exl3;
+                x3::GroupArgs a;
+                a.grp_ptr = gp;
+                a.grp_start = gs;
+                a.n_groups = gn;
+                a.ent_tok = p_tok;
+                a.ent_dst = p_dst;
+                a.x = mixed_ + (size_t) tb * N;
+                a.x_stride = (size_t) N;
+                a.out = dst_buf;
+                a.out_stride = (size_t) N;
+                a.h = (float*) hit_scratch_;
+                a.u = a.h + (size_t) capx * (size_t) g.n_ff;
+                a.cnt = x3_cnt_;
+                a.lay = hits_.exl3_lay[(size_t) l];
+                a.max_groups = (int) cap;
+                a.max_entries = (int) cap;
+                a.n_embd = (int) N;
+                a.n_ff = (int) g.n_ff;
+                if (!x3::grouped_experts(a, cs)) x3_ok = false;
+                return;
+            }
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
@@ -2009,7 +2044,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+            if (sink_.pcie_mode == 2 && !x3_on_) {                 // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
@@ -2020,6 +2055,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
             grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
             stamp(l, 22, grp);
+            if (!x3_ok) {
+                err = "verify: the EXL3 tier's grouped experts did not launch at layer " + std::to_string(l);
+                return false;
+            }
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,

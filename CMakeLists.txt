@@ -358,6 +358,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_gemv.cu
                           src/kernels/cuda/exl3.cu
                           src/kernels/cuda/exl3_dev.cu
+                          src/kernels/cuda/exl3_tier.cu
                           src/kernels/cuda/exl3_experts.cu
                           src/kernels/cuda/s_gemv.cu
                           src/kernels/cuda/s2_gemv_quads.cu

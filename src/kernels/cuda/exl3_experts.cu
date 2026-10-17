@@ -164,6 +164,13 @@ struct Exl3ExpertStream::Impl {
     std::vector<int> rrow;
     bool res_pending = false;
     long long res_runs = 0;
+    // STRATA_EXL3_SHARE_PROF=1 (a measurement, off by default): where a call's time goes - the expert kernels, the
+    // rows' copies back to the host (one D2H a row), and the host's wait in finish_resident - one stderr line per 4,800
+    // calls (100 tokens of 48 layers)
+    cudaEvent_t prof_ev[3] = {};
+    bool prof_armed = false;
+    double prof_kernel_ms = 0, prof_copy_ms = 0, prof_wait_ms = 0;
+    long long prof_calls = 0, prof_rows = 0;
 
     // STRATA_EXL3_TIME=1: per-token upload/ffn/d2h milliseconds and the cache hit rate
     long long hits = 0, misses = 0;
@@ -757,14 +764,22 @@ bool Exl3ExpertStream::launch_resident(int layer, const float* x_f32, const int*
     }
     const int nr = (int) impl_->rrow.size();
     if (nr == 0) return true;
+    static const bool prof = [] { const char* v = std::getenv("STRATA_EXL3_SHARE_PROF"); return v != nullptr && v[0] == '1'; }();
+    if (prof && impl_->prof_ev[0] == nullptr)
+        for (cudaEvent_t& ev : impl_->prof_ev) (void) cudaEventCreate(&ev);
+    impl_->prof_armed = prof && impl_->prof_ev[2] != nullptr;
+    if (impl_->prof_armed) cudaEventRecord(impl_->prof_ev[0], st);
     f32_to_f16_rows_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(x_f32, impl_->d_x, n);
     exl3_moe_rows_part(impl_->rg.data(), impl_->ru.data(), impl_->rd.data(), nr, impl_->d_x, impl_->d_hit, st);
     f16_to_f32_rows_kernel<<<(unsigned)((n * nr + 255) / 256), 256, 0, st>>>(impl_->d_hit, impl_->d_out, n * nr);
+    if (impl_->prof_armed) cudaEventRecord(impl_->prof_ev[1], st);
     for (int r = 0; r < nr; ++r)
         if (cudaMemcpyAsync(out + (size_t) impl_->rrow[(size_t) r] * (size_t) n, impl_->d_out + (size_t) r * (size_t) n,
                             (size_t) n * 4, cudaMemcpyDeviceToHost, st) != cudaSuccess)
             return false;
+    if (impl_->prof_armed) cudaEventRecord(impl_->prof_ev[2], st);
     impl_->res_runs += nr;
+    impl_->prof_rows += nr;
     impl_->res_pending = true;
     return true;
 }
@@ -772,10 +787,26 @@ bool Exl3ExpertStream::launch_resident(int layer, const float* x_f32, const int*
 bool Exl3ExpertStream::finish_resident(void* stream) {
     if (!impl_->res_pending) return true;
     impl_->res_pending = false;
+    const auto w0 = std::chrono::steady_clock::now();
     const cudaError_t e = cudaStreamSynchronize((cudaStream_t) stream);
     if (e != cudaSuccess) {
         std::fprintf(stderr, "exl3 stream: the resident experts' FFN failed: %s\n", cudaGetErrorString(e));
         return false;
+    }
+    if (impl_->prof_armed) {
+        Impl& m = *impl_;
+        m.prof_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+        float a = 0, b = 0;
+        if (cudaEventElapsedTime(&a, m.prof_ev[0], m.prof_ev[1]) == cudaSuccess) m.prof_kernel_ms += a;
+        if (cudaEventElapsedTime(&b, m.prof_ev[1], m.prof_ev[2]) == cudaSuccess) m.prof_copy_ms += b;
+        if (++m.prof_calls % 4800 == 0) {
+            const double c = (double) m.prof_calls;
+            std::fprintf(stderr, "exl3 GPU share profile: %lld calls, %.2f rows a call; per call: expert kernels %.1f us, "
+                                 "row copies %.1f us (%.1f us a row), host wait in finish %.1f us\n", m.prof_calls,
+                         (double) m.prof_rows / c, 1000.0 * m.prof_kernel_ms / c, 1000.0 * m.prof_copy_ms / c,
+                         1000.0 * m.prof_copy_ms / (double) std::max<long long>(1, m.prof_rows),
+                         1000.0 * m.prof_wait_ms / c);
+        }
     }
     return true;
 }

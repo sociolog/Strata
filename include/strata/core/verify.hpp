@@ -62,6 +62,9 @@ struct AdaptGate {
 
 class NativeHead;
 class RemoteExpertOpt;
+}  // namespace strata::core
+namespace strata::kernels::exl3 { struct ExpertLayout; }
+namespace strata::core {
 
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
 using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
@@ -74,6 +77,10 @@ struct VerifyHits {
     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
     int64_t blob = 0;
+    /// --exl3: the VRAM tier's experts are EXL3 blobs (kernels/exl3_tier.hpp) laid out as this per-layer table says
+    /// (n_layers entries; null: a GGUF pack).  The window's VRAM groups then run on the EXL3 grouped kernels
+    /// (kernels/exl3_dev.hpp) over the window's F32 MoE input; the pool publishes those groups (no PCIe share).
+    const strata::kernels::exl3::ExpertLayout* exl3_lay = nullptr;
 };
 
 class Verifier {
@@ -610,6 +617,8 @@ private:
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
+    bool x3_on_ = false;           // --exl3: VerifyHits::exl3_lay given - the VRAM groups are EXL3 experts
+    uint32_t* x3_cnt_ = nullptr;   // their kernels' gate/up pair counters (zero between launches)
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     uint16_t* sh_bf16_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
