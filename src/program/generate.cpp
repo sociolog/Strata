@@ -15388,9 +15388,20 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    // EXL3 lane + --spec: the prompt is read through the verify windows, up to 8 tokens a window with every token
+    // committed (the serve path's prompt reader), instead of token by token: an expert several prompt tokens route to
+    // is read from RAM once.  The windows' per-token arithmetic is the token path's, so the answer is the same.  The
+    // last prompt token is then the first window (T = 1), as for a native pack.  A one-token prompt keeps the token
+    // loop.  STRATA_EXL3_WINDOW_PROMPT=0 reads it token by token (the A/B).
+    const bool exl3_win_prompt = exl3_drive.ram != nullptr && o.spec >= 2 && !native_pack && n_prompt >= 2 &&
+                                 pos_start < n_prompt - 1 && [] {
+                                     const char* v = std::getenv("STRATA_EXL3_WINDOW_PROMPT");
+                                     return !(v != nullptr && v[0] == '0');
+                                 }();
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
         if (native_pack) { spec_pos = pos; break; }
+        if (exl3_win_prompt) { spec_pos = n_prompt - 1; tok = o.tokens[(size_t) (n_prompt - 1)]; break; }
         if (pos >= o.max_context) {
             std::fprintf(stderr, "strata generate: ran out of context at position %lld\n", (long long) pos);
             return 2;
@@ -15683,7 +15694,9 @@ int main(int argc, char** argv) {
         vh.slot_off = exl3_win ? nullptr : xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = exl3_win ? 0 : xcache.slots();
         if (pcie_balance()) ver.set_pcie_balance(&drive.d.pcie_model);
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+        // (the EXL3 prompt reader's windows take up to kVerifyMaxT tokens; the decode windows stay within --spec)
+        const int ver_max_t = exl3_win_prompt ? std::max(o.spec, strata::kernels::kVerifyMaxT) : o.spec;
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, ver_max_t, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -15908,14 +15921,53 @@ int main(int argc, char** argv) {
             ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
             return true;
         };
+        // EXL3: the prompt through the verify windows (see exl3_win_prompt): every token committed, the picks discarded
+        // (no head sampling), the drafter's cells from each window's rows (the serve path's reader)
+        if (exl3_win_prompt) {
+            const Clock::time_point tw = Clock::now();
+            struct NoHeadSampling {
+                strata::core::Verifier& v;
+                explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
+                ~NoHeadSampling() { v.set_head_sampling(true); }
+            } no_head_sampling(ver);
+            const int S_prompt = ver_max_t;
+            std::vector<int32_t> win((size_t) S_prompt), outw((size_t) S_prompt), nxt((size_t) S_prompt);
+            int64_t prompt_windows = 0;
+            for (int64_t q = pos_start; q < n_prompt - 1;) {
+                const int T = (int) std::min<int64_t>(S_prompt, n_prompt - 1 - q);
+                for (int t = 0; t < T; ++t) {
+                    win[(size_t) t] = (int32_t) o.tokens[(size_t) (q + t)];
+                    nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (q + t + 1)];
+                }
+                if (!ver.run(T, win.data(), q, &drive_exl3_pool_multi, &exl3_drive, outw.data(), err) ||
+                    !ver.commit(T, err) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, err))) {
+                    std::fprintf(stderr, "strata generate: the prompt's verify window at %lld: %s\n", (long long) q,
+                                 err.c_str());
+                    return 1;
+                }
+                q += T;
+                ++prompt_windows;
+            }
+            if (!ver.wait_commit(err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
+            prefill_ms += ms;
+            std::fprintf(stderr, "strata generate: the prompt through verify windows: %lld tokens in %lld windows of up "
+                                 "to %d, %.1f ms (%.1f tok/s)\n", (long long) (n_prompt - 1 - pos_start),
+                         (long long) prompt_windows, S_prompt, ms,
+                         ms > 0 ? 1000.0 * (double) (n_prompt - 1 - pos_start) / ms : 0.0);
+        }
         int64_t p = spec_pos;
         int32_t x = (int32_t) tok;
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
         // plan v0.3 P6: with a native pack the first window is the last prompt token alone (it produces the first
-        // generated token and the MTP's first cell); otherwise the token loop already did that.
-        bool first_window = native_pack;
+        // generated token and the MTP's first cell); otherwise the token loop already did that.  (So with the EXL3
+        // prompt read through windows.)
+        bool first_window = native_pack || exl3_win_prompt;
         if (use_mtp && !first_window &&
             !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
