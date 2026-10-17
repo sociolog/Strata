@@ -3144,7 +3144,12 @@ int main(int argc, char** argv) {
         }
     }
 #endif
-    if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
+    if (o.prefill_auto && !o.exl3_dir.empty()) {
+        // --exl3: nothing to lend either, but every chunk streams nearly all the experts once (~61 GB at 4.05 bpw), so
+        // auto takes its ceiling (auto:N, 8192 bare) and the EXL3 setup halves it until its buffers fit
+        o.prefill_auto = false;
+        o.prefill_chunk = o.prefill_auto_max;
+    } else if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
         o.prefill_chunk = 2048;
     }
@@ -6601,6 +6606,15 @@ int main(int argc, char** argv) {
     std::unique_ptr<strata::kernels::Exl3ExpertStream> exl3_stream;
     std::unique_ptr<strata::kernels::cpu::Exl3ExpertRam> exl3_ram;
     std::unique_ptr<strata::kernels::cpu::Exl3LaneMoe> exl3_moe;
+    // --exl3-lane: a blob's parts per layer (the GPU prompt path's view of the RAM tier's experts)
+    std::vector<strata::kernels::exl3::ExpertLayout> exl3_lay;
+    // --exl3-lane with --prefill: the batched prompt path's view of the RAM tier's experts, and the tier page-locked for
+    // its copy engine (declared after the tier, so it is unregistered before the tier is unmapped)
+    strata::prefill::Exl3PromptExperts exl3_pf;
+    struct Exl3Pin {
+        void* p = nullptr;
+        ~Exl3Pin() { if (p != nullptr) (void) cudaHostUnregister(p); }
+    } exl3_pin;
     if (o.exl3_lane && o.exl3_dir.empty()) {
         std::fprintf(stderr, "strata generate: --exl3-lane needs --exl3 <dir>\n");
         return 2;
@@ -6624,6 +6638,25 @@ int main(int argc, char** argv) {
         exl3_drive.moe = exl3_moe.get();
         exl3_drive.pool = &pool;
         exl3_drive.n_embd = g.n_embd;
+        {
+            // a blob's parts, per layer (offsets from its first byte; the tier's own layout, which expert() reads): what
+            // the GPU prompt path reads of an expert
+            namespace x3 = strata::kernels::exl3;
+            exl3_lay.assign((size_t) g.n_layers, x3::ExpertLayout{});
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                const strata::kernels::cpu::Exl3Expert x = exl3_ram->expert((int) l, 0);
+                const uint8_t* b = exl3_ram->blob((int) l, 0);
+                const strata::kernels::cpu::Exl3Part* p3[3] = {&x.gate, &x.up, &x.down};
+                x3::ExpertLayout& L = exl3_lay[(size_t) l];
+                for (int r = 0; r < 3; ++r) {
+                    L.trellis[r] = (size_t) ((const uint8_t*) p3[r]->trellis - b);
+                    L.suh[r] = (size_t) ((const uint8_t*) p3[r]->suh - b);
+                    L.svh[r] = (size_t) ((const uint8_t*) p3[r]->svh - b);
+                    L.K[r] = p3[r]->K;
+                }
+                L.cb = 2;   // the tier takes mul1 experts only (checked at its load)
+            }
+        }
         if (!o.exl3_lane_profile.empty()) {
             // the GPU share: #1764's stream with its VRAM cache seeded once, from the RAM tier, with each layer's
             // hottest experts by the profile; never evicted, nothing read from the file
@@ -6675,6 +6708,36 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: EXL3 CPU lane: %s; every routed expert on the %d pool workers%s, %s "
                              "kernels\n", exl3_ram->describe().c_str(), pool.workers(),
                      pool.host_works() ? " + the host thread" : "", tiers[strata::kernels::cpu::exl3_cpu_tier()]);
+        if (o.prefill_chunk > 0) {
+            // --prefill: every prompt chunk streams the experts the GPU does not hold out of this tier.  Page-locked,
+            // the copy engine reads the blobs in place at the link's speed; pageable, the driver would stage each copy
+            // through its own buffer (slower, and the issuing thread waits on it).
+            const Clock::time_point p0 = Clock::now();
+            const cudaError_t pe = cudaHostRegister(const_cast<uint8_t*>(exl3_ram->mapping()),
+                                                    (size_t) exl3_ram->mapping_bytes(), cudaHostRegisterPortable);
+            if (pe == cudaSuccess) {
+                exl3_pin.p = const_cast<uint8_t*>(exl3_ram->mapping());
+                std::fprintf(stderr, "strata generate: EXL3 RAM tier page-locked for the prompt path (%.1f GiB in %.1f s)\n",
+                             (double) exl3_ram->mapping_bytes() / (double) (1ull << 30),
+                             std::chrono::duration<double>(Clock::now() - p0).count());
+            } else {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata generate: WARNING: the EXL3 RAM tier could not be page-locked (%s): the "
+                                     "prompt path's copies are staged by the driver, slower\n", cudaGetErrorString(pe));
+            }
+            exl3_pf.host = [r = exl3_ram.get()](int64_t l, int64_t e) { return r->blob((int) l, (int) e); };
+            exl3_pf.lay = exl3_lay;
+            exl3_pf.blob.assign((size_t) g.n_layers, 0);
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                exl3_pf.blob[(size_t) l] = exl3_ram->blob_bytes((int) l);
+                exl3_pf.max_blob = std::max(exl3_pf.max_blob, exl3_pf.blob[(size_t) l]);
+            }
+            // STRATA_EXL3_PF_RING: the copy ring's slots (default 512 = a layer's experts, 1.27 GB at 4.05 bpw, freed after
+            // the prompt; 128 read 21K at 1,984 tok/s, 512 at 2,335, 1024 no more); STRATA_EXL3_PF_LIGHT: the
+            // most rows of a chunk an expert may have and still take the tensor-core kernels (default 64, Maya's)
+            if (const char* v = std::getenv("STRATA_EXL3_PF_RING")) exl3_pf.ring = std::atoi(v);
+            if (const char* v = std::getenv("STRATA_EXL3_PF_LIGHT")) exl3_pf.light_rows = std::max(0, std::atoi(v));
+        }
     } else if (!o.exl3_dir.empty()) {
         // The EXL3 stream keeps its own per-layer cache: `--expert-cache N` counts slots per layer there (the
         // GGUF count is global because its blobs are one pool), `auto`/unset sizes it from the free VRAM after
@@ -15233,6 +15296,26 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // EXL3 + MTP (no GGUF head): the drafter's head reads the EXL3 pack's own requantized output.weight blocks (adopted,
+    // not copied).  Bound before the prompt, so the batched path's on_chunk can fill the drafter's cells per chunk; the
+    // token loop below gives it its cell for every prompt position it reads itself.  The verify windows keep the
+    // per-token head.
+    strata::core::NativeHead exl3_mtp_head;
+    const bool exl3_mtp = !o.exl3_dir.empty() && !o.mtp.empty() && o.spec >= 2 && !native_pack;
+    if (exl3_mtp) {
+        const strata::core::WeightRef* wo = wt.find("output.weight");
+        if (wo == nullptr || wo->native_data == nullptr) {
+            std::fprintf(stderr, "strata generate: --mtp with --exl3 needs the requantized output.weight (the "
+                                 "default; not STRATA_EXL3_DENSE=exl3)\n");
+            return 1;
+        }
+        if (!exl3_mtp_head.adopt(wo->native_data, wo->native_type, wo->ne0, wo->ne1, err) ||
+            !mtp.bind(wt, &exl3_mtp_head, nullptr, err)) {
+            std::fprintf(stderr, "strata generate: --mtp with --exl3: %s\n", err.c_str());
+            return 1;
+        }
+    }
+
     // ---- plan v0.3 P5: the prompt's conditioning positions [0, n_prompt - 1) in batched chunks.  The token loop
     // then starts at the last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
@@ -15249,9 +15332,33 @@ int main(int argc, char** argv) {
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     std::vector<std::pair<int32_t, int32_t>> lent;     // (residency index, slot) lent to the prompt path
     const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
-    if (o.prefill_chunk > 0 && n_prompt > 1) {
+    // --exl3: the batched path reads the lane's RAM tier (its experts' source), and pays from a few hundred tokens on:
+    // each chunk streams nearly every expert of every layer once (~61 GB at 4.05 bpw), so a shorter prompt is read by
+    // the verify windows (the lane) instead.  STRATA_EXL3_PF_MIN: that floor in tokens (default 256).
+    const bool exl3_model = !o.exl3_dir.empty();
+    if (exl3_model && o.prefill_chunk > 0 && !exl3_pf.host) {
+        std::fprintf(stderr, "strata generate: --prefill with --exl3 needs --exl3-lane (the lane's RAM tier is where the "
+                             "prompt path reads the experts from)\n");
+        return 2;
+    }
+    const int64_t exl3_pf_min = [] {
+        const char* v = std::getenv("STRATA_EXL3_PF_MIN");
+        return v != nullptr ? std::max<int64_t>(1, std::atoll(v)) : (int64_t) 256;
+    }();
+    const bool exl3_batched = exl3_model && o.prefill_chunk > 0 && n_batched >= exl3_pf_min;
+    if (exl3_model && o.prefill_chunk > 0 && !exl3_batched)
+        std::fprintf(stderr, "strata generate: a %lld-token prompt is below the EXL3 batched path's %lld: read by the "
+                             "verify windows\n", (long long) n_batched, (long long) exl3_pf_min);
+    if (o.prefill_chunk > 0 && n_prompt > 1 && (!exl3_model || exl3_batched)) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
+        if (exl3_batched) {
+            // equal chunks: every chunk streams the experts once whatever its size, so a short last chunk would cost
+            // nearly a whole one - the prompt is cut into as few chunks as the chunk size allows, of equal size
+            const int64_t max_chunk = std::max<int64_t>(256, o.prefill_chunk);
+            const int64_t pieces = (n_batched + max_chunk - 1) / max_chunk;
+            o.prefill_chunk = ((n_batched + pieces - 1) / pieces + 15) / 16 * 16;
+        }
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
             int64_t chunk = o.prefill_chunk;
             int64_t k = plan_lend(chunk);             // auto: the largest chunk that fits; fixed: halved to fit
@@ -15290,15 +15397,39 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
-        if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
-        if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
-                          host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
-                          borrow_bytes)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
+        if (exl3_batched) {
+            // the EXL3 experts (prefill.hpp: Exl3PromptExperts); no expert source, cache or CPU share of the GGUF kind.
+            // A chunk whose buffers do not fit beside the model is halved until they do.
+            const Clock::time_point i0 = Clock::now();
+            for (;;) {
+                prefill.set_exl3(&exl3_pf);
+                if (prefill.init(wt, g, ss, nullptr, nullptr, nullptr, o.prefill_chunk, main_cs, err)) break;
+                if (o.prefill_chunk <= 512 || err.find("do not fit") == std::string::npos) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                    return 1;
+                }
+                std::fprintf(stderr, "strata generate: %s - trying %lld\n", err.c_str(), (long long) (o.prefill_chunk / 2));
+                prefill.reset();
+                o.prefill_chunk /= 2;
+            }
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            std::fprintf(stderr, "strata generate: EXL3 prompt path: chunks of %lld tokens, a %d-slot copy ring of %.2f MB "
+                                 "experts (%.1f s to set up; %.1f GiB of VRAM left)\n", (long long) o.prefill_chunk,
+                         std::clamp(exl3_pf.ring, 16, 1024), (double) exl3_pf.max_blob / 1e6,
+                         std::chrono::duration<double>(Clock::now() - i0).count(), (double) fb / (double) (1ull << 30));
+        } else {
+            if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
+            if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
+                              host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
+                              borrow_bytes)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
         }
         if (!o.mtp.empty()) {
-            if (!mtp.bind(wt, &native_head, nullptr, err)) {
+            // (EXL3: bound to the EXL3 head above, before the prompt)
+            if (!exl3_mtp && !mtp.bind(wt, &native_head, nullptr, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -15363,6 +15494,8 @@ int main(int argc, char** argv) {
         if (ps.experts_direct > 0)
             std::fprintf(stderr, "strata generate: prompt MMQ read %lld of the %lld resident experts in their slots "
                                  "(STRATA_MMQ_DIRECT)\n", (long long) ps.experts_direct, (long long) ps.experts_resident);
+        // --exl3: this run reads no other prompt; the prompt path's buffers go back for the VRAM tier below
+        if (exl3_batched) prefill.reset();
     }
 
     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
@@ -15370,24 +15503,7 @@ int main(int argc, char** argv) {
         kvg_start(xcache.slots());
         if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
     }
-    // EXL3 + MTP (no batched prompt path, no GGUF head): the drafter's head reads the EXL3 pack's own requantized
-    // output.weight blocks (adopted, not copied), and the token loop below gives it its K/V cell for every prompt
-    // position (the batched path's on_chunk does the same per chunk).  The verify windows keep the per-token head.
-    strata::core::NativeHead exl3_mtp_head;
-    const bool exl3_mtp = !o.exl3_dir.empty() && !o.mtp.empty() && o.spec >= 2 && !native_pack;
-    if (exl3_mtp) {
-        const strata::core::WeightRef* wo = wt.find("output.weight");
-        if (wo == nullptr || wo->native_data == nullptr) {
-            std::fprintf(stderr, "strata generate: --mtp with --exl3 needs the requantized output.weight (the "
-                                 "default; not STRATA_EXL3_DENSE=exl3)\n");
-            return 1;
-        }
-        if (!exl3_mtp_head.adopt(wo->native_data, wo->native_type, wo->ne0, wo->ne1, err) ||
-            !mtp.bind(wt, &exl3_mtp_head, nullptr, err)) {
-            std::fprintf(stderr, "strata generate: --mtp with --exl3: %s\n", err.c_str());
-            return 1;
-        }
-    }
+    // (EXL3 + MTP: the drafter is bound to the EXL3 head before the prompt - see exl3_mtp above the batched prompt)
     // EXL3 lane + --spec: the prompt is read through the verify windows, up to 8 tokens a window with every token
     // committed (the serve path's prompt reader), instead of token by token: an expert several prompt tokens route to
     // is read from RAM once.  The windows' per-token arithmetic is the token path's, so the answer is the same.  The

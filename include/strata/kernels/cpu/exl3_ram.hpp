@@ -32,6 +32,13 @@ public:
     bool loaded() const { return base_ != nullptr; }
     /// Pointers into the tier (valid while it lives); layer and expert must be in range.
     Exl3Expert expert(int layer, int e) const;
+    /// Expert e of `layer` as one blob (gate's trellis first; expert() gives the parts) and a blob's bytes in `layer`:
+    /// what the GPU paths copy (the prompt path's stream, the VRAM tier).
+    const uint8_t* blob(int layer, int e) const;
+    uint64_t blob_bytes(int layer) const;
+    /// The tier's one mapping and its length (page-aligned): what is page-locked for the copy engine to read in place.
+    const uint8_t* mapping() const { return base_; }
+    uint64_t mapping_bytes() const { return map_bytes_; }
     uint64_t bytes() const { return bytes_; }
     double load_seconds() const { return load_s_; }
     int n_layers() const { return (int) lay_.size(); }

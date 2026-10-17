@@ -15,12 +15,14 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/kernels/exl3_dev.hpp"
 
 #include <cstdint>
 #include <functional>
 #include <future>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace strata::core { class PeerExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
@@ -39,6 +41,19 @@ struct PrefillStats {
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
     double ms_ple = 0;
+};
+
+/// An --exl3 model's routed experts for the prompt path (docs/EXL3.md): every expert of every layer is one blob in host
+/// memory - the CPU lane's RAM tier (kernels/cpu/exl3_ram.hpp), page-locked so the copy engine reads it - and some may
+/// also have a copy in VRAM.  Each blob holds gate, up and down (trellis, suh, svh) at the layer's offsets.
+struct Exl3PromptExperts {
+    std::function<const uint8_t*(int64_t layer, int64_t e)> host;   ///< the expert's blob in host memory
+    std::function<const uint8_t*(int64_t layer, int64_t e)> vram;   ///< its VRAM copy, or null (may be left empty)
+    std::vector<kernels::exl3::ExpertLayout> lay;                    ///< per layer: the blob's parts
+    std::vector<uint64_t> blob;                                      ///< per layer: an expert's bytes
+    uint64_t max_blob = 0;
+    int ring = 512;         ///< slots of the copy ring (each max_blob bytes; 16..1024): one layer of experts ahead
+    int light_rows = 64;    ///< an expert with at most this many rows of a chunk takes the tensor-core kernels
 };
 
 }  // namespace strata::prefill
@@ -230,6 +245,16 @@ public:
     /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
     /// for a chunk. Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
+    /// --exl3: the routed experts are this EXL3 model's (`x`, which must outlive this object; null: a GGUF pack, as
+    /// before).  Every chunk then streams each expert that has no VRAM copy through a ring of `x->ring` slots of the
+    /// model's expert size, layer by layer in id order (the copy engine reads the page-locked RAM tier), and each layer's
+    /// routed experts are decoded straight from their trellis (kernels/exl3_dev.hpp) - an expert few of the chunk's
+    /// rows route to on the tensor cores, the others decoded once to FP16 and multiplied by cuBLAS.  The rows come out
+    /// unweighted, in the FP16 expert path's order, and the combine is the same.  Not bit-identical to the token path (FP16
+    /// weights and rotated activations, products summed in another order), as no prompt path here is.  Set before
+    /// `init` and before any `bytes_needed` (the ring's slot is the model's expert, not a pack's blob): one EXL3 model a
+    /// process.  The GGUF experts' code paths are not changed.
+    void set_exl3(const Exl3PromptExperts* x);
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
     /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.

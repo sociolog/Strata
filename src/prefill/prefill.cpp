@@ -24,6 +24,8 @@
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/exl3.hpp"
+#include "strata/kernels/exl3_dev.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -128,8 +130,14 @@ using Clock = std::chrono::steady_clock;
 constexpr float EPS = 1e-6f;
 constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
+// --exl3 (Prefill::set_exl3): the routed experts are an EXL3 model's blobs, streamed through a ring of slots of their
+// own size and count (0: a GGUF pack, the rules below)
+uint64_t g_x3_blob = 0;
+int g_x3_ring = 0;
 // plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
-inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
+inline int64_t MAXBLOB() {
+    return g_x3_blob > 0 ? (int64_t) g_x3_blob : (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+}
 constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
 // The staged walk's ring when its MMQ groups take the staged experts too: two groups, so a slot is refilled only after
 // the group that read it was gathered (the walk stages at most STAGE_GRP - MMQ_GROUP - 1 entries ahead)
@@ -271,7 +279,10 @@ inline bool fused_ring() {
 }
 // the largest ring: 512 slots; 1024 with the Q2_0 pack's fused experts (P3's smaller buffers, measured there) - the
 // native packs' fused layers were measured at 512
-inline int ring_cap() { return fused_ring() && !strata::kernels::cpu::expert_layout().native ? RING_MAX : 512; }
+inline int ring_cap() {
+    if (g_x3_blob > 0) return RING_MAX;   // --exl3: up to two layers of experts ahead (set_exl3)
+    return fused_ring() && !strata::kernels::cpu::expert_layout().native ? RING_MAX : 512;
+}
 // The ring's budget in bytes: the measured slot counts above, at the blob size they were measured with.  It is
 // bytes and not slots because a slot is one whole blob and the blob is the pack's - see the note above.
 inline constexpr uint64_t Q2_0_BLOB = 1382400ull;   // the blob of the pack the ring was tuned on
@@ -305,6 +316,7 @@ inline int ring_budget_slots() {
     return (int) (n <= 0 ? 0 : (n > cap ? cap : n));
 }
 inline int ring_slots(size_t T) {
+    if (g_x3_blob > 0) return g_x3_ring;   // --exl3: every chunk streams through the EXL3 ring (set_exl3)
     const char* v = std::getenv("STRATA_PREFILL_RING");
 #if defined(STRATA_USE_HIP)
     // S6: with the opt-in RDNA4 matrix-core attention (STRATA_HIP_WMMA=1) a 96-slot ring: measured with it, 9070 XT
@@ -949,6 +961,19 @@ struct Prefill::Impl {
     uint16_t* dq_d[DQ] = {};
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
+    // --exl3 (set_exl3): the model's routed experts (host blobs, VRAM copies, layouts); the device copy of a layer's
+    // row offsets, which the tensor-core kernels read an expert's rows from
+    const Exl3PromptExperts* x3 = nullptr;
+    int32_t* x3_bounds = nullptr;
+    // ...and the streams a layer's EXL3 experts are spread over (STRATA_EXL3_PF_STREAMS, default 8; [0] is cs): one
+    // expert's GEMMs are ~410 x 640 at 21K tokens, a quarter of the card's SMs, so several run side by side.  Each stream
+    // has its own cuBLAS handle (x3_gemm[0] unused: cs has `gemm`), FP16 weight buffer (gate+up, then down) and event
+    static constexpr int X3_STREAMS = 8;
+    int x3_ns = 1;
+    cudaStream_t x3_s[X3_STREAMS] = {};
+    cudaEvent_t x3_ev[X3_STREAMS] = {};
+    std::unique_ptr<Gemm> x3_gemm[X3_STREAMS];
+    uint16_t* x3_dq[X3_STREAMS] = {};
     // this layout's GU, H and Xq are the fused path's (moe_bufs' `fused`), so a layer that runs MMQ or the FP16 path may
     // only write stream_all_min() - 1 of its rows into them; fused_layout() keeps the two in step (#583, #954)
     bool fused_bufs = false;
@@ -1045,6 +1070,15 @@ void Prefill::reset() {
 void Prefill::release() {
     if (!impl_) return;
     impl_->hand_worker.reset();   // idle here (run drains the chain before it returns); joins its thread
+    for (int q = 1; q < Impl::X3_STREAMS; ++q)   // --exl3: the expert streams (their weight buffers are in `owned`)
+        if (impl_->x3_s[q]) {
+            cudaStreamSynchronize(impl_->x3_s[q]);
+            impl_->x3_gemm[q].reset();
+            cudaStreamDestroy(impl_->x3_s[q]);
+            impl_->x3_s[q] = nullptr;
+        }
+    for (cudaEvent_t& e : impl_->x3_ev)
+        if (e) { cudaEventDestroy(e); e = nullptr; }
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
@@ -1402,6 +1436,47 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
               std::to_string(o.failed_bytes >> 20) + " MiB)";
         return false;
     }
+    if (m.x3 != nullptr) {   // --exl3: what the expert step reads, checked once
+        const Exl3PromptExperts& x = *m.x3;
+        if (!x.host || (int64_t) x.lay.size() < g.n_layers || (int64_t) x.blob.size() < g.n_layers || x.max_blob == 0 ||
+            g_x3_blob != x.max_blob) {
+            err = "prefill: the EXL3 experts are not set up (set_exl3 before init, a layout and a size per layer)";
+            return false;
+        }
+        if (m.Xs == nullptr || m.Hh == nullptr || m.GU == nullptr || m.Dm == nullptr || m.x3_bounds == nullptr ||
+            m.ring <= STAGE) {
+            err = "prefill: this layout has no FP16 expert buffers or no stream ring for the EXL3 experts";
+            return false;
+        }
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            if (x.blob[(size_t) l] > x.max_blob || x.lay[(size_t) l].K[0] != x.lay[(size_t) l].K[1]) {
+                err = "prefill: EXL3 layer " + std::to_string(l) + ": an expert larger than the ring's slot, or gate and "
+                      "up of different K";
+                return false;
+            }
+        // the expert streams (Impl::x3_s), made here - no graph runs during a prompt chunk, and nothing is made later.
+        // A failed allocation reads "do not fit" (the caller halves the chunk)
+        const char* v = std::getenv("STRATA_EXL3_PF_STREAMS");
+        m.x3_ns = std::clamp(v != nullptr ? std::atoi(v) : 8, 1, Impl::X3_STREAMS);
+        m.x3_s[0] = m.cs;
+        for (int q = 0; q < m.x3_ns; ++q) {
+            const char* what = nullptr;
+            if (q > 0 && cudaStreamCreateWithFlags(&m.x3_s[q], cudaStreamNonBlocking) != cudaSuccess) what = "stream";
+            else if (cudaEventCreateWithFlags(&m.x3_ev[q], cudaEventDisableTiming) != cudaSuccess) what = "event";
+            else if (cudaMalloc((void**) &m.x3_dq[q], (size_t) (1280 * N + N * 640) * 2) != cudaSuccess) what = "weights";
+            if (what == nullptr && q > 0) {
+                m.x3_gemm[q] = std::make_unique<Gemm>();
+                if (!m.x3_gemm[q]->init(m.x3_s[q], 0, err)) what = "cuBLAS handle";
+            }
+            if (what != nullptr) {
+                (void) cudaGetLastError();
+                err = "prefill: the EXL3 expert stream " + std::to_string(q) + "'s " + what + " (and its buffers) do not fit" +
+                      (err.empty() ? std::string() : ": " + err);
+                return false;
+            }
+            m.owned.push_back(m.x3_dq[q]);
+        }
+    }
     return true;
 }
 
@@ -1473,6 +1548,8 @@ bool Prefill::carve(size_t T, void* alloc) {
         if (base == nullptr) ok = false;
     }
     for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
+    // --exl3: a layer's row offsets on the device (an expert's rows for the tensor-core kernels; bytes_needed counts it)
+    m.x3_bounds = g_x3_blob > 0 ? o.take<int32_t>((size_t) m.g->n_expert + 1, ok) : nullptr;
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
@@ -2180,6 +2257,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+    if (g_x3_blob > 0) o.take<int32_t>((size_t) g.n_expert + 1, ok);   // --exl3: a layer's row offsets (carve)
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
@@ -2225,6 +2303,12 @@ int64_t Prefill::ring_max_slots() {
 
 int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
+void Prefill::set_exl3(const Exl3PromptExperts* x) {
+    impl_->x3 = x;
+    // the ring's slot is the model's largest expert; at most ring_cap() slots (the events init makes), more than STAGE
+    g_x3_blob = x != nullptr ? x->max_blob : 0;
+    g_x3_ring = x != nullptr ? std::clamp(x->ring, STAGE + 8, RING_MAX) : 0;
+}
 void Prefill::arm_cpu_share(bool applies, bool by_default) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     if (applies && by_default && cpu_share_explicit() == -2.0 && !g_share_default) {
@@ -2531,7 +2615,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         bool batched = hand_in_ == nullptr && m.tok_dev != nullptr;
         const core::NativeEmbed* nemb = core::native_embed();
         const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
-        if (batched && nemb == nullptr &&
+        // --exl3: the model's table is BF16 (or F16) rows, gathered for the whole chunk at once (embed_row's per-token
+        // gather, the same F32 values)
+        const bool emb16 = wemb != nullptr && wemb->data != nullptr && wemb->ne0 == g.n_embd &&
+                           (wemb->kind == core::WeightKind::Bf16InF32 || wemb->kind == core::WeightKind::F16InF32);
+        if (batched && nemb == nullptr && !emb16 &&
             (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
              (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
             batched = false;
@@ -2547,6 +2635,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             if (nemb) {
                 nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
+            } else if (emb16) {
+                strata::kernels::exl3_embed_gather_rows((const uint16_t*) wemb->data, wemb->ne0, wemb->ne1, m.tok_dev,
+                                                        (int) T, wemb->kind == core::WeightKind::Bf16InF32, m.emb, m.cs);
             } else {
                 const auto* codes = (const uint8_t*) wemb->data;
                 const auto* scales = (const float*) (codes + wemb->codes_bytes);
@@ -2672,7 +2763,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
-        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        // --exl3: every chunk streams (the EXL3 ring is sized for it; at a few hundred tokens nearly every expert is
+        // routed already, and the engine reads shorter prompts through its verify windows instead)
+        const bool stream_all = m.ring > STAGE && (m.x3 != nullptr || (T >= stream_all_min() && m.src != nullptr));
+        // a streamed entry's bytes: the EXL3 model's expert, or the pack's blob
+        auto entry_bytes = [&](int64_t layer) -> size_t {
+            return m.x3 != nullptr ? (size_t) m.x3->blob[(size_t) layer] : (size_t) lay0.blob_bytes(layer);
+        };
         // the CPU share: this chunk takes the pool if no other stage of a layer split has it now (released at the end
         // of the chunk, after the last layer's CPU thread is joined)
         struct PoolHold {
@@ -2727,6 +2824,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                    if (m.x3 != nullptr) {   // --exl3: every expert not in VRAM, by DMA from the page-locked RAM tier
+                        if (m.x3->vram && m.x3->vram(l, e) != nullptr) continue;
+                        const uint8_t* xb = m.x3->host ? m.x3->host(l, e) : nullptr;
+                        if (xb == nullptr) { err = "prefill: an EXL3 expert has no host blob"; return false; }
+                        seq.push_back({(int32_t) l, e, xb, -1});
+                        continue;
+                    }
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
@@ -2769,7 +2873,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const StreamEntry& en = seq[issued];
                 const int sl = (int) (issued % (size_t) m.ring);
                 const auto th = Clock::now();
-                const size_t bytes = (size_t) lay0.blob_bytes(en.l);
+                const size_t bytes = entry_bytes(en.l);
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                 if (en.job < 0) {
                     cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
@@ -2817,7 +2921,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const StreamEntry& en = seq[idx];
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
-                    const size_t bytes = (size_t) lay0.blob_bytes(en.l);
+                    const size_t bytes = entry_bytes(en.l);
                     if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                     if (en.job < 0) {
                         cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
@@ -3405,7 +3509,181 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     bool cpu_arm = true;                  // auto: this layer may share (false: the arm without)
                     int cpu_set = -1;                     // auto: the wall events' set, -1 when not measured
                     bool cpu_cold = false;                // auto: one-time costs in the window (no reading)
-                    if (fused_l) {
+                    if (m.x3 != nullptr) {
+                        // ---- --exl3 (set_exl3): the routed experts of an EXL3 model.  The routes are grouped by expert
+                        // on the host as the FP16 path groups them (Dm row p = one route, src_dev[p] its token), then each
+                        // routed expert in id order - its VRAM copy, or the ring slot the stream landed it in - is decoded
+                        // straight from its trellis (kernels/exl3_dev.hpp): one that few rows route to through the
+                        // tensor-core kernels (they decode the trellis once a 32-row block), the others decoded once to
+                        // FP16 W' and multiplied by cuBLAS with the rows rotated instead of the weights
+                        // (x W = H(H(x * suh) W') * svh).  Unweighted rows into Dm; the combine below weighs them.
+                        namespace x3 = strata::kernels::exl3;
+                        const int x3_err0 = x3::launch_errors();
+                        pt.mark(kPfHostGroup, cs);
+                        const bool grp_mapped = m.grp_host != nullptr;
+                        int32_t* ids_h = grp_mapped ? m.grp_host : m.ids_host.data();
+                        int32_t* slot_h = grp_mapped ? m.grp_host + m.grp_tk : m.slot_host.data();
+                        int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
+                        if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
+                        else if (m.up_ring.d2h_sync(m.ids_host.data(), m.ids, (size_t) T * K * 4, m.cs) != cudaSuccess) {
+                            err = "prefill: the routed ids' download failed";
+                            return false;
+                        }
+                        // (the sync also orders this layer's writes of the mapped tables after the last layer's reads)
+                        core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
+                                          l, p0);
+                        cudaStreamSynchronize(m.cs);
+                        core::progress_at("reading the prompt (batched): layer", l, p0);
+                        pt.fold();
+                        if (defer_shared) {
+                            pt.mark(kPfRouter, cs);
+                            if (!shared_expert()) return false;
+                            pt.mark(kPfHostGroup, cs);
+                        }
+                        const int32_t NX = (int32_t) m.g->n_expert;
+                        std::fill(m.cnt.begin(), m.cnt.end(), 0);
+                        for (int64_t i = 0; i < T * K; ++i) {
+                            const int32_t e = ids_h[(size_t) i];
+                            if (e < 0 || e >= NX) { err = "prefill: routed id out of range"; return false; }
+                            ++m.cnt[(size_t) e];
+                        }
+                        m.off[0] = 0;
+                        for (int32_t e = 0; e < NX; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
+                        {
+                            std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
+                            for (int64_t i = 0; i < T * K; ++i) {
+                                const int32_t p = fill[(size_t) ids_h[(size_t) i]]++;
+                                slot_h[(size_t) i] = p;
+                                src_h[(size_t) p] = (int32_t) (i / K);
+                            }
+                        }
+                        if (grp_mapped) {   // the offsets behind the three tables (init sized the buffer for them)
+                            std::memcpy(m.grp_host + 3 * m.grp_tk, m.off.data(), ((size_t) NX + 1) * sizeof(int32_t));
+                            copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
+                            copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
+                            copy_i32(m.x3_bounds, m.grp_dev + 3 * m.grp_tk, (int64_t) NX + 1, m.cs);
+                        } else if (m.up_ring.h2d(m.slot_dev, slot_h, (size_t) T * K * 4, m.cs) != cudaSuccess ||
+                                   m.up_ring.h2d(m.src_dev, src_h, (size_t) T * K * 4, m.cs) != cudaSuccess ||
+                                   m.up_ring.h2d(m.x3_bounds, m.off.data(), ((size_t) NX + 1) * 4, m.cs) != cudaSuccess) {
+                            err = "prefill: the routing tables' upload failed";
+                            return false;
+                        }
+                        // the layer's streamed entries [kq, kend) in id order; one the routing did not pick only gives
+                        // its slot back
+                        size_t kq = stream_all ? seq_start[(size_t) l] : 0;
+                        const size_t kend = stream_all ? seq_start[(size_t) l + 1] : 0;
+                        auto release_to = [&](int32_t e_stop) {
+                            while (kq < kend && seq[kq].e < e_stop) {
+                                const int sl = (int) (kq % (size_t) m.ring);
+                                cudaEventRecord(m.used[sl], m.cs);
+                                m.used_of[sl] = sl;
+                                consumed = ++kq;
+                                give_back(consumed);
+                            }
+                        };
+                        const bool x3_tc = x3::device_ok();
+                        const x3::ExpertLayout& XL = m.x3->lay[(size_t) l];
+                        // the experts go round the streams in id order (rows, weight buffer and slot are each expert's
+                        // own, so they never touch); the other streams start after the tables above, and the combine
+                        // below waits for all of them
+                        const int NS = std::max(1, m.x3_ns);
+                        for (int q = 1; q < NS; ++q) {
+                            if (q == 1) cudaEventRecord(m.x3_ev[0], m.cs);
+                            cudaStreamWaitEvent(m.x3_s[q], m.x3_ev[0], 0);
+                        }
+                        int q_next = 0;
+                        for (int32_t e = 0; e < NX; ++e) {
+                            const int32_t ne = m.cnt[(size_t) e], o0 = m.off[(size_t) e];
+                            if (ne == 0) continue;
+                            ++n_order;
+                            release_to(e);
+                            const int q = q_next;
+                            q_next = q_next + 1 == NS ? 0 : q_next + 1;
+                            const cudaStream_t sq = q == 0 ? m.cs : m.x3_s[q];
+                            Gemm& gq = q == 0 ? m.gemm : *m.x3_gemm[q];
+                            const uint8_t* blob = nullptr;
+                            int sl = -1;
+                            if (kq < kend && seq[kq].e == e) {
+                                sl = (int) (kq % (size_t) m.ring);
+                                wait_issued(kq);
+                                pt.mark(kPfWaitCopy, cs);
+                                cudaStreamWaitEvent(sq, m.copied[sl], 0);
+                                blob = m.stage_dev[sl];
+                            } else {
+                                blob = m.x3->vram ? m.x3->vram(l, e) : nullptr;
+                                if (blob == nullptr) {
+                                    err = "prefill: EXL3 expert " + std::to_string(e) + " of layer " + std::to_string(l) +
+                                          " is neither in VRAM nor streamed";
+                                    return false;
+                                }
+                                ++stats_.experts_resident;
+                            }
+                            pt.mark(kPfGemmGU, cs);
+                            if (x3_tc && ne <= m.x3->light_rows) {
+                                // few rows: gate/up + swiglu and down on the tensor cores, the trellis decoded once a block
+                                x3::SetArgs sa;
+                                sa.wbase = blob;
+                                sa.lay = XL;
+                                sa.n_exp = 1;
+                                sa.bounds = m.x3_bounds + e;   // [off[e], off[e + 1])
+                                sa.row0 = o0;
+                                sa.max_rows = ne;
+                                sa.n_embd = (int) N;
+                                sa.n_ff = 640;
+                                x3::set_gate_up(sa, m.mixed, (int) N, m.src_dev + o0, m.Hh + (size_t) o0 * 640, 640, sq);
+                                pt.mark(kPfGemmD, cs);
+                                x3::set_down(sa, m.Hh + (size_t) o0 * 640, 640, m.Dm + (size_t) o0 * N, (int) N, sq);
+                            } else {
+                                // many rows: W' decoded to FP16 once, the rows rotated by each matrix's suh, cuBLAS, the
+                                // outputs rotated by svh (gu_epilogue does gate and up's, the swiglu and down's input)
+                                auto mat = [&](int r) {
+                                    x3::Mat mm;
+                                    mm.trellis = (const uint32_t*) (blob + XL.trellis[r]);
+                                    mm.suh = (const uint16_t*) (blob + XL.suh[r]);
+                                    mm.svh = (const uint16_t*) (blob + XL.svh[r]);
+                                    mm.k = r < 2 ? (int) N : 640;
+                                    mm.n = r < 2 ? 640 : (int) N;
+                                    mm.K = XL.K[r];
+                                    mm.cb = XL.cb;
+                                    return mm;
+                                };
+                                const x3::Mat mg = mat(0), mu = mat(1), md = mat(2);
+                                uint16_t* wg = m.x3_dq[q];
+                                uint16_t* wu = wg + (size_t) 640 * N;
+                                uint16_t* wd = wg + (size_t) 1280 * N;
+                                uint16_t* X16 = m.Xs + (size_t) o0 * N;
+                                float* GUe = m.GU + (size_t) o0 * 1280;
+                                x3::reconstruct_inner_rows(mg, wg, sq);
+                                x3::reconstruct_inner_rows(mu, wu, sq);
+                                x3::rows_rot_f16(m.mixed, (int) N, m.src_dev + o0, ne, (int) N, mg.suh, X16, (int) N, sq);
+                                gq.f16(X16, wg, GUe, ne, 640, N, 1280);
+                                // (the same rows again with up's scale: the gate's product above has read them)
+                                x3::rows_rot_f16(m.mixed, (int) N, m.src_dev + o0, ne, (int) N, mu.suh, X16, (int) N, sq);
+                                gq.f16(X16, wu, GUe + 640, ne, 640, N, 1280);
+                                x3::gu_epilogue(GUe, 1280, ne, 640, mg.svh, mu.svh, md.suh, 0.0f, m.Hh + (size_t) o0 * 640,
+                                                640, sq);
+                                pt.mark(kPfGemmD, cs);
+                                x3::reconstruct_inner_rows(md, wd, sq);
+                                gq.f16(m.Hh + (size_t) o0 * 640, wd, m.Dm + (size_t) o0 * N, ne, N, 640, N);
+                                x3::rows_rot_out(m.Dm + (size_t) o0 * N, (int) N, ne, (int) N, md.svh, sq);
+                            }
+                            if (sl >= 0) {   // the slot is free once this expert's work has run
+                                cudaEventRecord(m.used[sl], sq);
+                                m.used_of[sl] = sl;
+                                consumed = ++kq;
+                                give_back(consumed);
+                            }
+                        }
+                        release_to(NX);
+                        for (int q = 1; q < NS; ++q) {   // the combine reads every stream's rows
+                            cudaEventRecord(m.x3_ev[q], m.x3_s[q]);
+                            cudaStreamWaitEvent(m.cs, m.x3_ev[q], 0);
+                        }
+                        if (x3::launch_errors() != x3_err0) {
+                            err = "prefill: an EXL3 expert kernel did not launch at layer " + std::to_string(l) + " (above)";
+                            return false;
+                        }
+                    } else if (fused_l) {
                         if (static bool said = false; !said) {
                             said = true;
                             std::fprintf(stderr, "strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, "

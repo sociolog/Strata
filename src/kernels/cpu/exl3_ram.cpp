@@ -227,6 +227,13 @@ Exl3Expert Exl3ExpertRam::expert(int layer, int e) const {
     return x;
 }
 
+const uint8_t* Exl3ExpertRam::blob(int layer, int e) const {
+    const LayerFmt& f = lay_[(size_t) layer];
+    return base_ + f.base + (uint64_t) e * f.blob;
+}
+
+uint64_t Exl3ExpertRam::blob_bytes(int layer) const { return lay_[(size_t) layer].blob; }
+
 std::string Exl3ExpertRam::describe() const {
     if (lay_.empty()) return "EXL3 RAM tier: empty";
     char buf[256];
