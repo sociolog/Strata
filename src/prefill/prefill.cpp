@@ -1449,7 +1449,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             return false;
         }
         for (int64_t l = 0; l < g.n_layers; ++l)
-            if (x.blob[(size_t) l] > x.max_blob || x.lay[(size_t) l].K[0] != x.lay[(size_t) l].K[1]) {
+            if (x.blob[(size_t) l] > x.max_blob || x.lay[(size_t) l].k2[0] != x.lay[(size_t) l].k2[1]) {
                 err = "prefill: EXL3 layer " + std::to_string(l) + ": an expert larger than the ring's slot, or gate and "
                       "up of different K";
                 return false;
@@ -3643,7 +3643,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     mm.svh = (const uint16_t*) (blob + XL.svh[r]);
                                     mm.k = r < 2 ? (int) N : 640;
                                     mm.n = r < 2 ? 640 : (int) N;
-                                    mm.K = XL.K[r];
+                                    mm.k2 = XL.k2[r];
                                     mm.cb = XL.cb;
                                     return mm;
                                 };

@@ -2,7 +2,8 @@
 // grouped experts and the prompt path's expert step) against references on the host:
 //
 //   1. the decoded W' (reconstruct_inner, reconstruct_inner_rows) against #1764's CPU decoder (exl3_decode_weight_hat,
-//      itself bit-exact against the format's numpy specification): every K 1..8, every codebook - 0 differences;
+//      itself bit-exact against the format's numpy specification and against exllamav3): every K 1..8, every codebook,
+//      and the half-integer K 1.5 / 2.5 / 3.5 (mul1) - 0 differences;
 //   2. the rotations (rows_rot_f16, rows_rot_out, gu_epilogue) against a host emulation of the same arithmetic in the
 //      same order - 0 differences;
 //   3. a whole expert, the three device routes - the window's grouped kernels, the tensor-core set kernels (the prompt
@@ -14,8 +15,10 @@
 //   5. the whole expert against the CPU lane (src/kernels/cpu/exl3_lane.cpp), which decodes in F32 without the FP16
 //      rounding of weights and activations: the size of that difference (~1e-3), for the record.
 //
-//   exl3_dev_parity                     synthetic matrices: the Flash's expert shapes (2560 -> 640 -> 2560)
-//   exl3_dev_parity --real <model dir>  plus routed experts of the model (layers 0, 23, 47; experts 0, 300, 511)
+//   exl3_dev_parity                     synthetic matrices: the Flash's expert shapes (2560 -> 640 -> 2560), integer K
+//                                       and an SC 4.05's 3.5 / 3.5 / 5 and 3 / 3 / 5 experts
+//   exl3_dev_parity --real <model dir>  plus routed experts of the model (layers 0, 1, 8, 23, 47; 12 experts each)
+// The bitrate is k2 = 2 K throughout.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -67,16 +70,16 @@ void report_exact(const std::string& what, long long diff, long long n) {
 struct HMat {
     std::vector<uint32_t> tr;
     std::vector<uint16_t> suh, svh;
-    int k = 0, n = 0, K = 0, cb = 2;
+    int k = 0, n = 0, k2 = 0, cb = 2;
 };
 
-HMat rand_mat(int k, int n, int K, int cb = 2) {
+HMat rand_mat(int k, int n, int k2, int cb = 2) {
     HMat m;
     m.k = k;
     m.n = n;
-    m.K = K;
+    m.k2 = k2;
     m.cb = cb;
-    m.tr.resize((size_t) (k / 16) * (n / 16) * 8 * K);
+    m.tr.resize((size_t) (k / 16) * (n / 16) * 4 * k2);
     for (auto& w : m.tr) w = (uint32_t) g_rng();
     // a real expert's channel scales (the 4.05 file: |suh| ~0.015, |svh| ~1.0), random signs
     std::uniform_real_distribution<float> us(0.010f, 0.025f), uv(0.8f, 1.2f);
@@ -93,13 +96,13 @@ bool load_real(const strata::Exl3Model& model, const std::string& base, HMat& m,
         return false;
     }
     const strata::Exl3Linear L = model.linear(base);
-    if (L.half() || L.in() % 128 != 0 || L.out() % 128 != 0) {
+    if (!x3::k2_supported(L.k2, L.cb) || L.in() % 128 != 0 || L.out() % 128 != 0) {
         err = base + ": not a matrix these kernels take (K " + strata::exl3_k_label(L.k2) + ")";
         return false;
     }
     m.k = L.in();
     m.n = L.out();
-    m.K = L.k2 / 2;
+    m.k2 = L.k2;
     m.cb = L.cb;
     m.tr.assign((size_t) L.ki * L.nj * L.tile_words() / 2, 0u);
     std::memcpy(m.tr.data(), L.trellis, m.tr.size() * 4);   // the file's words sit at offsets 2 mod 4
@@ -161,7 +164,8 @@ float swiglu(float g, float u) { return (g / (1.0f + std::exp(-g))) * u; }
 // the decoded W' [k][n] (FP16 bits) by #1764's CPU decoder
 std::vector<uint16_t> decode_hat(const HMat& m) {
     std::vector<uint16_t> w((size_t) m.k * m.n);
-    cpu::exl3_decode_weight_hat((const uint16_t*) m.tr.data(), m.k / 16, m.n / 16, m.K, (cpu::Exl3Codebook) m.cb, w.data());
+    cpu::exl3_decode_weight_hat_k2((const uint16_t*) m.tr.data(), m.k / 16, m.n / 16, m.k2, (cpu::Exl3Codebook) m.cb,
+                                   w.data());
     return w;
 }
 // sum_i x16[i] W'[i][j] in double, as F32 (the device sums in F32 in its own order: ulp-level differences)
@@ -207,7 +211,7 @@ std::vector<float> lane_mv(const HMat& m, const float* x) {
     p.svh = m.svh.data();
     p.k = m.k;
     p.n = m.n;
-    p.k2 = 2 * m.K;
+    p.k2 = m.k2;
     std::vector<float> xh((size_t) m.k), acc((size_t) m.n), y((size_t) m.n);
     const float xs = cpu::exl3_cpu_prepare(p, x, xh.data());
     cpu::exl3_cpu_rows_acc(p, xh.data(), 0, m.k / 16, acc.data());
@@ -280,7 +284,7 @@ Blobs make_blobs(const std::vector<HExpert>& xs) {
     for (int r = 0; r < 3; ++r) {
         b.lay.suh[r] = off; off = al(off + mats[r]->suh.size() * 2);
         b.lay.svh[r] = off; off = al(off + mats[r]->svh.size() * 2);
-        b.lay.K[r] = mats[r]->K;
+        b.lay.k2[r] = mats[r]->k2;
     }
     b.lay.cb = x0.g.cb;
     b.stride = off;
@@ -300,16 +304,17 @@ Blobs make_blobs(const std::vector<HExpert>& xs) {
 
 // ---------------------------------------------------------------- 1. the decode
 void test_decode() {
-    std::printf("the decoded W' against #1764's CPU decoder (256 x 384, every K and codebook)\n");
+    std::printf("the decoded W' against #1764's CPU decoder (256 x 384, every K and codebook; K 1.5 / 2.5 / 3.5 mul1)\n");
     for (int cb = 0; cb <= 2; ++cb)
-        for (int K = 1; K <= 8; ++K) {
-            const HMat m = rand_mat(256, 384, K, cb);
+        for (int k2 : {2, 4, 6, 8, 10, 12, 14, 16, 3, 5, 7}) {
+            if ((k2 & 1) && cb != 2) continue;   // a half-integer K is mul1 only
+            const HMat m = rand_mat(256, 384, k2, cb);
             const std::vector<uint16_t> want = decode_hat(m);
             uint32_t* d_tr = dev_copy(m.tr);
             uint16_t *d_suh = dev_copy(m.suh), *d_svh = dev_copy(m.svh), *d_out = nullptr;
             if (!d_tr || !d_suh || !d_svh || !ck(cudaMalloc(&d_out, want.size() * 2), "malloc")) return;
             x3::Mat dm;
-            dm.trellis = d_tr; dm.suh = d_suh; dm.svh = d_svh; dm.k = m.k; dm.n = m.n; dm.K = K; dm.cb = cb;
+            dm.trellis = d_tr; dm.suh = d_suh; dm.svh = d_svh; dm.k = m.k; dm.n = m.n; dm.k2 = k2; dm.cb = cb;
             x3::reconstruct_inner(dm, d_out, nullptr);
             const std::vector<uint16_t> got = host_copy(d_out, want.size());
             long long diff = 0;
@@ -319,11 +324,12 @@ void test_decode() {
             long long diff_t = 0;
             for (int r = 0; r < m.k; ++r)
                 for (int c = 0; c < m.n; ++c) diff_t += got_t[(size_t) c * m.k + r] != want[(size_t) r * m.n + c];
-            if (diff != 0 || diff_t != 0 || K == 4 || K == 8)
-                report_exact("cb " + std::to_string(cb) + " K" + std::to_string(K) + ": W' row-major, W' transposed",
-                             diff + diff_t, (long long) want.size() * 2);
+            const std::string lab = "K" + strata::exl3_k_label(k2);
+            if (diff != 0 || diff_t != 0 || k2 == 8 || k2 == 16 || (k2 & 1))   // K 4, 8 and the half K reported
+                report_exact("cb " + std::to_string(cb) + " " + lab + ": W' row-major, W' transposed", diff + diff_t,
+                             (long long) want.size() * 2);
             else
-                std::printf("  cb %d K%d: 0 of %zu differ, both layouts  ok\n", cb, K, want.size() * 2);
+                std::printf("  cb %d %s: 0 of %zu differ, both layouts  ok\n", cb, lab.c_str(), want.size() * 2);
             cudaFree(d_tr); cudaFree(d_suh); cudaFree(d_svh); cudaFree(d_out);
         }
 }
@@ -332,7 +338,7 @@ void test_decode() {
 void test_rotations() {
     std::printf("the rotations against the host emulation\n");
     const int rows = 37;
-    const HMat g = rand_mat(E, F, 4), u = rand_mat(E, F, 4), d = rand_mat(F, E, 4);
+    const HMat g = rand_mat(E, F, 8), u = rand_mat(E, F, 8), d = rand_mat(F, E, 8);
     const std::vector<float> x = randn((size_t) rows * E, 1.0f);
     std::vector<int32_t> idx((size_t) rows);
     for (int r = 0; r < rows; ++r) idx[(size_t) r] = (r * 17 + 5) % rows;   // a gather, as the prompt path's
@@ -595,7 +601,7 @@ void test_experts(const std::vector<HExpert>& xs, const std::string& tag) {
                     m.svh = (const uint16_t*) (blob + b.lay.svh[r]);
                     m.k = r < 2 ? E : F;
                     m.n = r < 2 ? F : E;
-                    m.K = b.lay.K[r];
+                    m.k2 = b.lay.k2[r];
                     m.cb = b.lay.cb;
                     return m;
                 };
@@ -648,21 +654,24 @@ int main(int argc, char** argv) {
     test_decode();
     test_rotations();
     std::printf("whole experts, synthetic (the Flash's shapes, 12 experts, a window of 8 tokens x top-10)\n");
-    for (int K : {2, 3, 4, 5, 6}) {
+    // gate/up and down as 2 K: K 2..6, then an SC 4.05's layers 1-7 (3.5 / 5) and 0 (3 / 5), and 1.5 / 2.5 gate/up
+    for (const auto& kk : {std::pair<int, int>(4, 4), {6, 6}, {8, 8}, {10, 10}, {12, 12}, {7, 10}, {6, 10}, {3, 6},
+                           {5, 8}}) {
         std::vector<HExpert> xs(12);
         for (auto& x : xs) {
-            x.g = rand_mat(E, F, K);
-            x.u = rand_mat(E, F, K);
-            x.d = rand_mat(F, E, K);
+            x.g = rand_mat(E, F, kk.first);
+            x.u = rand_mat(E, F, kk.first);
+            x.d = rand_mat(F, E, kk.second);
             x.decode();
         }
-        test_experts(xs, "K" + std::to_string(K));
+        test_experts(xs, "K" + strata::exl3_k_label(kk.first) +
+                             (kk.second != kk.first ? "/" + strata::exl3_k_label(kk.second) : std::string()));
     }
     if (!real.empty()) {
         std::printf("whole experts, real (%s)\n", real.c_str());
         try {
             const strata::Exl3Model model(real);
-            for (int layer : {0, 23, 47}) {
+            for (int layer : {0, 1, 8, 23, 47}) {
                 std::vector<HExpert> xs;
                 for (int e : {0, 300, 511, 17, 64, 128, 200, 256, 333, 400, 450, 500}) {
                     const std::string b = "model.language_model.layers." + std::to_string(layer) + ".mlp.experts." +

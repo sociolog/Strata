@@ -81,10 +81,12 @@ __device__ __forceinline__ uint32_t fsh(uint32_t lo, uint32_t hi, int s) {
     return (uint32_t) ((((uint64_t) hi << 32) | (uint64_t) lo) >> s);
 }
 
-// Step p's state is the 16-bit window ending at bit (p + 1) K of the tile's MSB-first bit stream (w: its 8 K words),
-// wrapping around the tile.  A lane decodes its 8 consecutive steps lane * 8 .. + 7 together, the windows of a group
-// of steps cut from one or two words with funnel shifts - exllamav3's grouping per K (exl3_dq.cuh: dq8_aligned_*bits,
-// dq8, dq4, dq2x2), which the steps' fixed offsets keep within two words.  f[i]: steps 2i, 2i + 1 as FP16 values.
+// Step p's state is the 16-bit window ending at bit S(p) of the tile's MSB-first bit stream (w: its 4 K2 words, K2 =
+// 2 K), wrapping around the tile: S(p) = (p + 1) K for an integer K, floor((p + 1) K2 / 2) for exllamav3 1.6's
+// half-integer K = KA + 0.5 (KA- and KA+1-bit steps alternating).  A lane decodes its 8 consecutive steps lane * 8 ..
+// + 7 together, the windows of a group of steps cut from one or two words with funnel shifts - exllamav3's grouping
+// per K (exl3_dq.cuh: dq8_aligned_*bits, dq8, dq4, dq2x2, dq8_half), which the steps' fixed offsets keep within two
+// words.  f[i]: steps 2i, 2i + 1 as FP16 values.
 // Step lane * 8 + j sits at tile row (lane & 3) * 2 + (j & 1) + 8 (j >> 1 & 1), column (lane >> 2) + 8 (j >> 2).
 template <int cb>
 __device__ __forceinline__ void decode_states(const uint32_t (&s)[8], uint32_t (&f)[4]) {
@@ -113,8 +115,9 @@ __device__ __forceinline__ void states_group(const uint32_t* w, int p, uint32_t*
 #pragma unroll
     for (int j = 0; j < G; ++j) s[G - 1 - j] = fsh(b, a, s2 + j * K);
 }
+// an integer K
 template <int K, int cb>
-__device__ __forceinline__ void frag8(const uint32_t* w, int lane, uint32_t (&f)[4]) {
+__device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     const int p = lane * 8;
     uint32_t s[8];
     if constexpr (K == 4) {
@@ -146,6 +149,35 @@ __device__ __forceinline__ void frag8(const uint32_t* w, int lane, uint32_t (&f)
         states_group<K, 4>(w, p + 4, s + 4);
     }
     decode_states<cb>(s, f);
+}
+// a half-integer K (K2 = 2 KA + 1, mul1): exllamav3's dq8_half.  The lane's steps start even, so their windows end at
+// S(p + 7) = (p / 2 + 4) K2 and then KA + 1, KA, KA + 1, ... bits earlier; four windows span 18 + 3 KA <= 27 bits, one
+// funnel shift of two words each (steps 4..7 from window 7's end, 0..3 from window 3's, 2 K2 bits earlier)
+template <int K2, int cb>
+__device__ __forceinline__ void frag8_half(const uint32_t* w, int lane, uint32_t (&f)[4]) {
+    constexpr int KA = K2 / 2, NW = 4 * K2, gspan = 18 + 3 * KA;
+    const int e7 = (lane * 4 + 4) * K2 + 128 * K2;   // one ring on: no negative bit index
+    uint32_t s[8];
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        const int e = e7 - (1 - g) * 2 * K2;
+        const int hi = (e - 1) >> 5, lo = (e - gspan) >> 5, sh = ((hi + 1) << 5) - e;
+        const uint32_t x = fsh(w[hi % NW], w[lo % NW], sh);   // (w[lo] : w[hi]) >> sh: the window ending at e lowest
+        s[4 * g + 3] = x;
+        s[4 * g + 2] = x >> (KA + 1);
+        s[4 * g + 1] = x >> (2 * KA + 1);
+        s[4 * g + 0] = x >> (3 * KA + 2);
+    }
+    decode_states<cb>(s, f);
+}
+template <int K2, int cb>
+__device__ __forceinline__ void frag8(const uint32_t* w, int lane, uint32_t (&f)[4]) {
+    if constexpr ((K2 & 1) != 0) {
+        static_assert(cb == 2 && K2 <= 7, "a half-integer K: 1.5 / 2.5 / 3.5, mul1 only");
+        frag8_half<K2, cb>(w, lane, f);
+    } else {
+        frag8_int<K2 / 2, cb>(w, lane, f);
+    }
 }
 
 // ---------------------------------------------------------------- the rotation
@@ -227,16 +259,16 @@ __device__ __forceinline__ void mma_f32(float (&c)[4], uint32_t a0, uint32_t a1,
 #endif
 
 // a tile's words, and a lane's share of them (word lane + 32 r)
-template <int K>
+template <int K2>
 struct Words {
-    static constexpr int W = 8 * K, R = (W + 31) / 32;
+    static constexpr int W = 4 * K2, R = (W + 31) / 32;
 };
 
 // the warp's tile of each of a chunk's 8 slices (slice s at tile0 + s sstride)
-template <int K>
+template <int K2>
 __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, size_t sstride, int lane,
-                                           uint32_t (&w)[8][Words<K>::R]) {
-    constexpr int W = Words<K>::W, R = Words<K>::R;
+                                           uint32_t (&w)[8][Words<K2>::R]) {
+    constexpr int W = Words<K2>::W, R = Words<K2>::R;
 #pragma unroll
     for (int s = 0; s < 8; ++s)
 #pragma unroll
@@ -247,21 +279,21 @@ __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, s
 }
 
 // one slice's fragment from the lane's words: K = 4 straight from the registers (the lane's steps end in its own word,
-// the first three reach into the previous lane's), other K through the warp's stage (8 K words)
-template <int K, int cb>
-__device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K>::R], uint32_t* st, int lane, uint32_t (&f)[4]) {
-    if constexpr (K == 4) {
+// the first three reach into the previous lane's), other K (a half-integer one too) through the warp's stage (16 K words)
+template <int K2, int cb>
+__device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], uint32_t* st, int lane, uint32_t (&f)[4]) {
+    if constexpr (K2 == 8) {
         uint32_t s[8];
         states4(__shfl_sync(0xffffffffu, w[0], (lane + 31) & 31), w[0], s);
         decode_states<cb>(s, f);
     } else {
-        constexpr int W = Words<K>::W, R = Words<K>::R;
+        constexpr int W = Words<K2>::W, R = Words<K2>::R;
         __syncwarp();
 #pragma unroll
         for (int r = 0; r < R; ++r)
             if (W % 32 == 0 || lane + 32 * r < W) st[lane + 32 * r] = w[r];
         __syncwarp();
-        frag8<K, cb>(st, lane, f);
+        frag8<K2, cb>(st, lane, f);
     }
 }
 
@@ -269,10 +301,10 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K>::R], ui
 // (Maya): the routed experts four at K <= 4, two at wider codes; before sm_80 (the CUDA cores' product) two; HIP reads
 // the second bound differently and keeps its default.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-template <int K>
-constexpr int kMinBlocksX = K <= 4 ? 4 : 2;
+template <int K2>
+constexpr int kMinBlocksX = K2 <= 8 ? 4 : 2;
 #else
-template <int K>
+template <int K2>
 constexpr int kMinBlocksX = 2;
 #endif
 #if defined(STRATA_USE_HIP)
@@ -282,19 +314,19 @@ constexpr int kMinBlocksX = 2;
 #endif
 
 // the shared memory of a block_gemv block
-template <int K>
+template <int K2>
 struct BlockSmem {
     __half xb[2 * kTok * kCols];       // two chunk buffers, kTok activations each
-    uint32_t stage[kWarps * 8 * K];    // a tile per warp (K != 4)
+    uint32_t stage[kWarps * 4 * K2];   // a tile per warp (K != 4)
     float out[kTok * kCols];
 };
 
-template <int K, int cb>
+template <int K2, int cb>
 __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Xin& x,
-                           const uint16_t* __restrict__ suh, int nc, BlockSmem<K>& sm) {
-    constexpr int R = Words<K>::R;
+                           const uint16_t* __restrict__ suh, int nc, BlockSmem<K2>& sm) {
+    constexpr int R = Words<K2>::R;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
-    constexpr int W = Words<K>::W;
+    constexpr int W = Words<K2>::W;
     const size_t sstride = (size_t) ld * W;
     const uint32_t* tile = tr + ((size_t) (k0 / 16) * ld + tc0 + warp) * W;
     uint32_t* st = sm.stage + warp * W;
@@ -302,7 +334,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
     float xv[4], xs4[4];
-    load_tiles<K>(tile, sstride, lane, wc);
+    load_tiles<K2>(tile, sstride, lane, wc);
     if (rot) chunk_load(x, suh, k0, lane, xv, xs4);
 #if defined(EXL3_TC)
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -316,13 +348,13 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
         if (rot) chunk_store(xv, xs4, lane, xq + warp * kCols);
         __syncthreads();
         if (q + 1 < nq) {
-            load_tiles<K>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
+            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
             if (rot) chunk_load(x, suh, k0 + (q + 1) * kCols, lane, xv, xs4);
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K, cb>(wc[s], st, lane, f);
+            slice_frags<K2, cb>(wc[s], st, lane, f);
 #if defined(EXL3_TC)
             uint32_t b0 = 0u, b1 = 0u;
             if (g < nc) {
@@ -437,9 +469,9 @@ struct KGroup {
 
 // grid (n_ff / 128, max groups, 2): group blockIdx.y's gate (z 0, into h) or up (z 1, into u) for 128 h values of
 // each of its entries, kTok entries a pass; the pair's second block to finish turns them into the swiglu, in h
-template <int K, int cb>
-__global__ void EXL3_BOUNDS(kMinBlocksX<K>) group_gu_kernel(const KGroup a) {
-    __shared__ __align__(16) BlockSmem<K> sm;
+template <int K2, int cb>
+__global__ void EXL3_BOUNDS(kMinBlocksX<K2>) group_gu_kernel(const KGroup a) {
+    __shared__ __align__(16) BlockSmem<K2> sm;
     __shared__ int last;
     const int grp = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
     if (grp >= *a.n_groups) return;
@@ -451,7 +483,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) group_gu_kernel(const KGroup a) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.x + (size_t) a.ent_tok[mm + warp] * a.x_stride;
-        block_gemv<K, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
                           (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (warp < nc)
             block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
@@ -467,9 +499,9 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) group_gu_kernel(const KGroup a) {
 }
 
 // grid (n_embd / 128, max groups): group blockIdx.y's down rows for 128 outputs of each entry, into the entry's row
-template <int K, int cb>
-__global__ void EXL3_BOUNDS(kMinBlocksX<K>) group_down_kernel(const KGroup a) {
-    __shared__ __align__(16) BlockSmem<K> sm;
+template <int K2, int cb>
+__global__ void EXL3_BOUNDS(kMinBlocksX<K2>) group_down_kernel(const KGroup a) {
+    __shared__ __align__(16) BlockSmem<K2> sm;
     const int grp = blockIdx.y, g = blockIdx.x;
     if (grp >= *a.n_groups) return;
     const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
@@ -479,7 +511,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) group_down_kernel(const KGroup a) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.h + (size_t) (mm + warp) * a.n_ff;
-        block_gemv<K, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
+        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
                           (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (warp < nc)
             block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
@@ -490,14 +522,14 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) group_down_kernel(const KGroup a) {
 
 // ---------------------------------------------------------------- the prompt path: decode and rotations
 // grid (n / 128, k / 16): W' row-major, one tile per warp (tests)
-template <int K, int cb>
+template <int K2, int cb>
 __global__ void __launch_bounds__(kThreads) recon_inner_kernel(const uint32_t* __restrict__ tr, int ld, int n,
                                                                uint16_t* dst) {
-    constexpr int W = 8 * K;
+    constexpr int W = 4 * K2;
     const int lane = threadIdx.x & 31, t = threadIdx.x >> 5;
     const int tc = blockIdx.x * 8 + t, ks = blockIdx.y;
     uint32_t f[4];
-    frag8<K, cb>(tr + ((size_t) ks * ld + tc) * W, lane, f);
+    frag8<K2, cb>(tr + ((size_t) ks * ld + tc) * W, lane, f);
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const __half2 h = u2h(f[j >> 1]);
@@ -510,10 +542,10 @@ __global__ void __launch_bounds__(kThreads) recon_inner_kernel(const uint32_t* _
 
 // grid (n / 128, k / 128): W' of the 128 x 128 block, transposed (dst[c][r]) - the decoded values alone.  Each warp
 // decodes its slice's 8 tiles into the block's tile (half2 pairs of rows, conflict-free), then writes 256-byte rows.
-template <int K, int cb>
+template <int K2, int cb>
 __global__ void __launch_bounds__(kThreads) inner_rows_kernel(const uint32_t* __restrict__ tr, int ld, int k,
                                                               uint16_t* __restrict__ dst) {
-    constexpr int W = 8 * K;
+    constexpr int W = 4 * K2;
     constexpr int P = kCols + 8;   // a column's 128 rows, padded (halves; 16-byte rows)
     __shared__ __align__(16) __half tile[kCols * P];   // tile[c * P + r]
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
@@ -524,7 +556,7 @@ __global__ void __launch_bounds__(kThreads) inner_rows_kernel(const uint32_t* __
 #pragma unroll
         for (int tc = 0; tc < 8; ++tc) {
             uint32_t f[4];
-            frag8<K, cb>(src + tc * W, lane, f);
+            frag8<K2, cb>(src + tc * W, lane, f);
             const int c = tc * 16 + g;
             *reinterpret_cast<uint32_t*>(&tile[c * P + r]) = f[0];
             *reinterpret_cast<uint32_t*>(&tile[c * P + r + 8]) = f[1];
@@ -619,10 +651,10 @@ __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b
 #endif
 }
 // the lane's 4 B registers of tile t (words staged in st): b[0..1] columns 0..7, b[2..3] columns 8..15
-template <int K, int cb>
+template <int K2, int cb>
 __device__ __forceinline__ void tile_frags(const uint32_t* st, int lane, uint32_t* b) {
     uint32_t f[4];
-    frag8<K, cb>(st, lane, f);
+    frag8<K2, cb>(st, lane, f);
 #pragma unroll
     for (int i = 0; i < 4; ++i) b[i] = f[i];
 }
@@ -701,9 +733,9 @@ struct GArgs {
 };
 
 // one matrix: y = H(H(x * suh) W') * svh.  grid (row blocks, n / 128, experts)
-template <int K, int cb>
+template <int K2, int cb>
 __global__ void __launch_bounds__(kThreads) gemm_kernel(const GArgs a) {
-    constexpr int W = 8 * K;
+    constexpr int W = 4 * K2;
     __shared__ __align__(16) unsigned char sm[BM * 128 * 4];   // A (BM x AP halves), then the F32 tile
     __shared__ uint32_t stage[kWarps][64];
     __half* A = reinterpret_cast<__half*>(sm);
@@ -730,7 +762,7 @@ __global__ void __launch_bounds__(kThreads) gemm_kernel(const GArgs a) {
             for (int i = lane; i < W; i += 32) stage[warp][i] = src[i];
             __syncwarp();
             uint32_t b[4];
-            tile_frags<K, cb>(stage[warp], lane, b);
+            tile_frags<K2, cb>(stage[warp], lane, b);
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
                 uint32_t af[4];
@@ -755,9 +787,9 @@ __global__ void __launch_bounds__(kThreads) gemm_kernel(const GArgs a) {
 }
 
 // gate and up (matrices 0 and 1) over the same rows, the swiglu, FP16 h.  grid (row blocks, n / 128, experts)
-template <int K, int cb>
+template <int K2, int cb>
 __global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
-    constexpr int W = 8 * K;
+    constexpr int W = 4 * K2;
     __shared__ __align__(16) unsigned char sm[2 * BM * 128 * 4];   // A_g, A_u, then the two F32 tiles
     __shared__ uint32_t stage[kWarps][64];
     __half* A[2] = {reinterpret_cast<__half*>(sm), reinterpret_cast<__half*>(sm) + BM * AP};
@@ -784,7 +816,7 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
                 for (int i = lane; i < W; i += 32) stage[warp][i] = src[i];
                 __syncwarp();
                 uint32_t b[4];
-                tile_frags<K, cb>(stage[warp], lane, b);
+                tile_frags<K2, cb>(stage[warp], lane, b);
 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
                     uint32_t af[4];
@@ -822,52 +854,60 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
 #endif
 
 // ---------------------------------------------------------------- dispatch
-// F(K, cb) for K 1..8 and the three codebooks
+// F(K2, cb) for K 1..8 (K2 = 2 K) and the three codebooks, and for the half-integer K 1.5 / 2.5 / 3.5 (K2 3, 5, 7) with
+// mul1 - exllamav3 1.6 has no other codebook for them; another pair is refused (false: nothing launched)
 template <template <int, int> class F, typename... A>
-bool dispatch(int K, int cb, A&&... args) {
+bool dispatch(int K2, int cb, A&&... args) {
 #define EXL3_CASE(KK)                                                    \
     case KK:                                                             \
         if (cb == 2) F<KK, 2>::run(std::forward<A>(args)...);            \
         else if (cb == 1) F<KK, 1>::run(std::forward<A>(args)...);       \
         else F<KK, 0>::run(std::forward<A>(args)...);                    \
         return true;
+#define EXL3_HALF(KK)                                                    \
+    case KK:                                                             \
+        if (cb != 2) return false;                                       \
+        F<KK, 2>::run(std::forward<A>(args)...);                         \
+        return true;
     if (cb < 0 || cb > 2) return false;
-    switch (K) {
-        EXL3_CASE(1) EXL3_CASE(2) EXL3_CASE(3) EXL3_CASE(4) EXL3_CASE(5) EXL3_CASE(6) EXL3_CASE(7) EXL3_CASE(8)
+    switch (K2) {
+        EXL3_CASE(2) EXL3_CASE(4) EXL3_CASE(6) EXL3_CASE(8) EXL3_CASE(10) EXL3_CASE(12) EXL3_CASE(14) EXL3_CASE(16)
+        EXL3_HALF(3) EXL3_HALF(5) EXL3_HALF(7)
         default: return false;
     }
+#undef EXL3_HALF
 #undef EXL3_CASE
 }
 
-template <int K, int cb> struct RunGroupGU {
+template <int K2, int cb> struct RunGroupGU {
     static void run(const KGroup& a, int groups, cudaStream_t s) {
-        group_gu_kernel<K, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(a);
+        group_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(a);
     }
 };
-template <int K, int cb> struct RunGroupDown {
+template <int K2, int cb> struct RunGroupDown {
     static void run(const KGroup& a, int groups, cudaStream_t s) {
-        group_down_kernel<K, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), kThreads, 0, s>>>(a);
+        group_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), kThreads, 0, s>>>(a);
     }
 };
 #if !defined(STRATA_USE_HIP)
-template <int K, int cb> struct RunGemm {
-    static void run(const tc::GArgs& a, dim3 grid, cudaStream_t s) { tc::gemm_kernel<K, cb><<<grid, kThreads, 0, s>>>(a); }
+template <int K2, int cb> struct RunGemm {
+    static void run(const tc::GArgs& a, dim3 grid, cudaStream_t s) { tc::gemm_kernel<K2, cb><<<grid, kThreads, 0, s>>>(a); }
 };
-template <int K, int cb> struct RunGateUp {
+template <int K2, int cb> struct RunGateUp {
     static void run(const tc::GArgs& a, dim3 grid, cudaStream_t s) {
-        tc::gate_up_kernel<K, cb><<<grid, kThreads, 0, s>>>(a);
+        tc::gate_up_kernel<K2, cb><<<grid, kThreads, 0, s>>>(a);
     }
 };
 #endif
-template <int K, int cb> struct RunInnerRows {
+template <int K2, int cb> struct RunInnerRows {
     static void run(const Mat& m, uint16_t* dst, cudaStream_t s) {
-        inner_rows_kernel<K, cb><<<dim3((unsigned) (m.n / kCols), (unsigned) (m.k / kCols)), kThreads, 0, s>>>(
+        inner_rows_kernel<K2, cb><<<dim3((unsigned) (m.n / kCols), (unsigned) (m.k / kCols)), kThreads, 0, s>>>(
             m.trellis, m.ld > 0 ? m.ld : m.n / 16, m.k, dst);
     }
 };
-template <int K, int cb> struct RunInner {
+template <int K2, int cb> struct RunInner {
     static void run(const Mat& m, uint16_t* dst, cudaStream_t s) {
-        recon_inner_kernel<K, cb><<<dim3((unsigned) (m.n / kCols), (unsigned) (m.k / 16)), kThreads, 0, s>>>(
+        recon_inner_kernel<K2, cb><<<dim3((unsigned) (m.n / kCols), (unsigned) (m.k / 16)), kThreads, 0, s>>>(
             m.trellis, m.ld > 0 ? m.ld : m.n / 16, m.n, dst);
     }
 };
@@ -879,9 +919,13 @@ void count_error(const char* what) {
 
 }  // namespace
 
+bool k2_supported(int k2, int cb) {
+    return ((k2 >= 2 && k2 <= 16 && (k2 & 1) == 0) && cb >= 0 && cb <= 2) || ((k2 == 3 || k2 == 5 || k2 == 7) && cb == 2);
+}
+
 bool supported(const Mat& m) {
     return m.trellis != nullptr && m.suh != nullptr && m.svh != nullptr && m.k > 0 && m.n > 0 && m.k % 128 == 0 &&
-           m.n % 128 == 0 && m.K >= 1 && m.K <= 8 && m.cb >= 0 && m.cb <= 2;
+           m.n % 128 == 0 && k2_supported(m.k2, m.cb);
 }
 
 bool device_ok() {
@@ -904,11 +948,11 @@ size_t group_counters(int max_groups, int n_ff) { return (size_t) std::max(0, ma
 
 bool grouped_experts(const GroupArgs& a, void* stream) {
     if (a.max_groups < 1 || a.max_entries < 1 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxKR ||
-        a.n_ff > kMaxKR || a.lay.K[0] != a.lay.K[1] || a.grp_ptr == nullptr || a.grp_start == nullptr ||
+        a.n_ff > kMaxKR || a.lay.k2[0] != a.lay.k2[1] || a.grp_ptr == nullptr || a.grp_start == nullptr ||
         a.n_groups == nullptr || a.ent_tok == nullptr || a.ent_dst == nullptr || a.x == nullptr || a.out == nullptr ||
         a.h == nullptr || a.u == nullptr || a.cnt == nullptr) {
-        std::fprintf(stderr, "exl3_dev grouped_experts: not covered (n_embd %d n_ff %d, gate K %d up K %d, %d groups, %d "
-                             "entries, or a buffer missing)\n", a.n_embd, a.n_ff, a.lay.K[0], a.lay.K[1], a.max_groups,
+        std::fprintf(stderr, "exl3_dev grouped_experts: not covered (n_embd %d n_ff %d, gate k2 %d up k2 %d, %d groups, "
+                             "%d entries, or a buffer missing)\n", a.n_embd, a.n_ff, a.lay.k2[0], a.lay.k2[1], a.max_groups,
                      a.max_entries);
         g_launch_errors.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -935,9 +979,14 @@ bool grouped_experts(const GroupArgs& a, void* stream) {
     k.n_ff = a.n_ff;
     k.limit = a.limit;
     const cudaStream_t s = (cudaStream_t) stream;
-    if (!dispatch<RunGroupGU>(a.lay.K[0], a.lay.cb, k, a.max_groups, s) ||
-        !dispatch<RunGroupDown>(a.lay.K[2], a.lay.cb, k, a.max_groups, s)) {
-        count_error("grouped_experts: a K or codebook outside 1..8 / 0..2");
+    if (!k2_supported(a.lay.k2[0], a.lay.cb) || !k2_supported(a.lay.k2[2], a.lay.cb)) {   // nothing launched
+        count_error("grouped_experts: a bitrate or codebook the kernels do not take (K 1..8 any codebook, 1.5 / 2.5 / 3.5 "
+                    "mul1)");
+        return false;
+    }
+    if (!dispatch<RunGroupGU>(a.lay.k2[0], a.lay.cb, k, a.max_groups, s) ||
+        !dispatch<RunGroupDown>(a.lay.k2[2], a.lay.cb, k, a.max_groups, s)) {
+        count_error("grouped_experts: dispatch");
         return false;
     }
     launch_check("grouped_experts");
@@ -947,7 +996,7 @@ bool grouped_experts(const GroupArgs& a, void* stream) {
 void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int32_t* row_idx, uint16_t* h16, int ldh,
                  void* stream) {
 #if !defined(STRATA_USE_HIP)
-    if (sa.lay.K[0] != sa.lay.K[1]) {
+    if (sa.lay.k2[0] != sa.lay.k2[1]) {
         count_error("set_gate_up: gate and up differ in K");
         return;
     }
@@ -972,7 +1021,7 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int32_t* row_
     a.ldh = ldh;
     a.limit = sa.limit;
     const dim3 grid((unsigned) ((sa.max_rows + tc::BM - 1) / tc::BM), (unsigned) (sa.n_ff / kCols), (unsigned) sa.n_exp);
-    if (!dispatch<RunGateUp>(sa.lay.K[0], sa.lay.cb, a, grid, (cudaStream_t) stream)) count_error("set_gate_up: K");
+    if (!dispatch<RunGateUp>(sa.lay.k2[0], sa.lay.cb, a, grid, (cudaStream_t) stream)) count_error("set_gate_up: K");
     launch_check("set_gate_up");
 #else
     (void) sa; (void) x; (void) ldx; (void) row_idx; (void) h16; (void) ldh; (void) stream;
@@ -999,7 +1048,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
     a.y = y;
     a.ldy = ldy;
     const dim3 grid((unsigned) ((sa.max_rows + tc::BM - 1) / tc::BM), (unsigned) (sa.n_embd / kCols), (unsigned) sa.n_exp);
-    if (!dispatch<RunGemm>(sa.lay.K[2], sa.lay.cb, a, grid, (cudaStream_t) stream)) count_error("set_down: K");
+    if (!dispatch<RunGemm>(sa.lay.k2[2], sa.lay.cb, a, grid, (cudaStream_t) stream)) count_error("set_down: K");
     launch_check("set_down");
 #else
     (void) sa; (void) h16; (void) ldh; (void) y; (void) ldy; (void) stream;
@@ -1008,7 +1057,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
 }
 
 void reconstruct_inner_rows(const Mat& m, uint16_t* dst, void* stream) {
-    if (!supported(m) || !dispatch<RunInnerRows>(m.K, m.cb, m, dst, (cudaStream_t) stream)) {
+    if (!supported(m) || !dispatch<RunInnerRows>(m.k2, m.cb, m, dst, (cudaStream_t) stream)) {
         count_error("reconstruct_inner_rows: unsupported matrix");
         return;
     }
@@ -1054,7 +1103,7 @@ void gu_epilogue(const float* gu, int ldgu, int nrows, int n_ff, const uint16_t*
 }
 
 void reconstruct_inner(const Mat& m, uint16_t* dst, void* stream) {
-    if (!supported(m) || !dispatch<RunInner>(m.K, m.cb, m, dst, (cudaStream_t) stream)) {
+    if (!supported(m) || !dispatch<RunInner>(m.k2, m.cb, m, dst, (cudaStream_t) stream)) {
         count_error("reconstruct_inner: unsupported matrix");
         return;
     }

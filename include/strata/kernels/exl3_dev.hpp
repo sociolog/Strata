@@ -7,6 +7,8 @@
 // whose codebook and trellis arithmetic follow exllamav3, MIT, turboderp).  The format (docs/EXL3.md): a weight with k
 // inputs and n outputs (y = x W) is stored as
 //   trellis  int16 [k/16][n/16][16 K]: each 16x16 tile a tail-biting trellis of 256 K-bit steps (8 K uint32 words);
+//            K 1..8, or exllamav3 1.6's half-integer 1.5 / 2.5 / 3.5 (KA- and KA+1-bit steps alternating, mul1 only),
+//            carried as k2 = 2 K;
 //   suh, svh FP16 [k], [n]: the input and output channel scales.
 // With H the 128-point Sylvester Hadamard over sqrt(128), applied to each 128 consecutive values:
 //   y = H(H(x * suh) W') * svh,   W' the decoded k x n matrix (FP16 values: exllamav3's own decode, one FP16 FMA).
@@ -29,20 +31,22 @@ struct Mat {
     const uint16_t* suh = nullptr;       // FP16 bits [k]
     const uint16_t* svh = nullptr;       // FP16 bits [n]
     int k = 0, n = 0;
-    int K = 0;                           // bits per weight, 1..8
+    int k2 = 0;                          // bits per weight times 2: 2..16 even (K 1..8), 3 / 5 / 7 (K 1.5 / 2.5 / 3.5)
     int cb = 2;                          // codebook: 0 3inst, 1 mcg, 2 mul1
     int ld = 0;                          // tiles per 16-row slice in memory; 0: n / 16
 };
-/// Whether the kernels take this matrix (k, n multiples of 128, K 1..8, cb 0..2).
+/// Whether the kernels take this matrix (k, n multiples of 128, k2 2..16 even with cb 0..2, or 3 / 5 / 7 with mul1).
 bool supported(const Mat& m);
-/// Trellis bytes of a k x n matrix at K bits.
-inline size_t trellis_bytes(int64_t k, int64_t n, int K) { return (size_t) (k / 16) * (size_t) (n / 16) * 32u * K; }
+/// Whether the kernels take this bitrate and codebook.
+bool k2_supported(int k2, int cb);
+/// Trellis bytes of a k x n matrix at k2 / 2 bits (16 k2 a tile).
+inline size_t trellis_bytes(int64_t k, int64_t n, int k2) { return (size_t) (k / 16) * (size_t) (n / 16) * 16u * k2; }
 
 /// One routed expert's blob: gate (0), up (1), down (2), each its trellis, suh and svh at byte offsets from the blob's
-/// base (the CPU lane's RAM tier keeps exactly such blobs, every part 64-byte aligned).
+/// base (the CPU lane's RAM tier keeps exactly such blobs, every part 64-byte aligned), and each matrix's bitrate.
 struct ExpertLayout {
     size_t suh[3] = {0, 0, 0}, svh[3] = {0, 0, 0}, trellis[3] = {0, 0, 0};
-    int K[3] = {0, 0, 0};
+    int k2[3] = {0, 0, 0};               // as Mat::k2
     int cb = 2;
 };
 
