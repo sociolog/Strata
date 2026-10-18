@@ -31,7 +31,7 @@ Every quantized `Linear` is stored as up to four tensors under its key `prefix`:
 
 | Tensor | dtype / shape | Meaning |
 | --- | --- | --- |
-| `prefix.trellis` | int16, `[in/16, out/16, 256*K/16]` | the packed trellis, 16×16 tiles |
+| `prefix.trellis` | int16, `[in/16, out/16, 16*K]` | the packed trellis, 16×16 tiles |
 | `prefix.suh` | fp16, `in` | per-input-row factor (sign × scale) |
 | `prefix.svh` | fp16, `out` | per-output-column factor (sign × scale) |
 | `prefix.mcg` / `prefix.mul1` | int32, scalar | present only to mark the codebook (`mcg` → 1, `mul1` → 2; neither → 0) |
@@ -43,13 +43,15 @@ scalar. `suh`/`svh` are continuous (e.g. `suh ≈ -0.0199`, `svh ∈ [-1.77, …
 store them as packed int16 sign bitfields instead, and a key may carry `su`/`sv` rather than
 `suh`/`svh`.
 
-`K = trellis.shape[-1] // 16` is the bitrate: an integer 1..8, or a half-integer 1.5 / 2.5 / 3.5
-(mul1 only). 3.05 bpw is achieved with a mix, e.g. 2/2.5/3/3.5 for different tensors. `head_bits`
-sets the `lm_head` bitrate separately.
+`K = trellis.shape[-1] / 16` is the bitrate: an integer 1..8, or (exllamav3 1.6) a half-integer 1.5 / 2.5 /
+3.5 - 24 / 40 / 56 words a tile, mul1 only. 3.05 bpw is achieved with a mix, e.g. 2/2.5/3/3.5 for different
+tensors. `head_bits` sets the `lm_head` bitrate separately. Strata carries the bitrate as `k2 = 2 K`
+(exllamav3's own half-bit unit, `bits_k.cuh`); `Exl3Model::linear` reads it from the tile width and refuses a
+width that is no bitrate (an integer division here once read K 3.5 as 3).
 
 ## Decoding a tile
 
-The trellis of one 16×16 tile (256 weights) is `256*K` bits, held as `256*K/16` little-endian
+The trellis of one 16×16 tile (256 weights) is `256*K` bits, held as `16*K` little-endian
 `uint16` words. The "trellis" is a set of **overlapping 16-bit windows**: weight `t` is the
 codebook lookup of the window that starts at bit
 
@@ -58,6 +60,16 @@ codebook lookup of the window that starts at bit
 read little-endian with wraparound (tail-biting). This is exactly `dq()` in
 `exl3_dq.cuh`; there is no Viterbi at decode time (the encoder runs the Viterbi search to choose
 the bits; the decoder is just the windowed lookup).
+
+**Half-integer K** (`quant/frac.cu`, `exl3_dq.cuh: dq8_half`): K = KA + 0.5, the steps alternate KA bits (even
+`t`) and KA + 1 bits (odd `t`) - exllamav3's `MASK 0xAAAA`, the one pattern it instantiates - so a tile is still a
+ring of `256*K` bits (whole 32-bit words: `8*k2`), bits MSB-first in 32-bit words as above. Window `t` ends at bit
+
+    S(t) = floor((t + 1) * k2 / 2)        (k2 = 2 K;  = (t + 1) K for an integer K)
+
+i.e. `start(t) = S(t) - 16`, mod `256*K`. The codebook step and the tile order are unchanged. A lane of the
+tensor-core layout (positions `8 l .. 8 l + 7`, an even start) has its windows end at `S(8 l + 7)` and then
+`KA + 1, KA, KA + 1, ...` bits earlier: four windows span `18 + 3 KA <= 27` bits, one funnel shift each.
 
 The 256 values come out in the **tensor-core-interleaved order** used by the packed tensor; the
 reconstruct kernel (`reconstruct.cu`) un-permutes them into a row-major 16×16 tile while writing.

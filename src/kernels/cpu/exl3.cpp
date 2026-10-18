@@ -4,8 +4,12 @@
 // dependency-free so it can run on any x86-64 and serve as the oracle for the AVX2 and HIP kernels.
 #include "strata/kernels/cpu/exl3.hpp"
 
+#include "strata/artifact/exl3_model.hpp"   // exl3_k2_valid, exl3_k_label: the bitrates the format has
+
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace strata::kernels::cpu {
@@ -97,19 +101,30 @@ uint16_t decode_window(Exl3Codebook cb, uint16_t window) {
 
 // ---- 16-bit sliding windows over one packed tile ----
 
-// The window for stored position `v`: the 16 bits ending at bit (v+1)*bits, read with ExLlamaV3's funnel
-// shift over the packed uint32 words (unpack_trellis / dq).  NOT a linear LSB bitstream read - the encoder
-// packs per 16-value span, MSB-first, then byte-swaps, so the linear read did not reproduce the weights.
-uint16_t window16(const uint16_t* words, int nwords, int bits, int v) {
+// The window for stored position `v`: the 16 bits ending at bit S(v) = floor((v + 1) k2 / 2) of the tile's ring
+// ((v + 1) K for an integer K), read with ExLlamaV3's funnel shift over the packed uint32 words (unpack_trellis / dq,
+// frac.cu's frac_window for a half-integer K).  NOT a linear LSB bitstream read - the encoder packs per 16-value span,
+// MSB-first, then byte-swaps, so the linear read did not reproduce the weights.  The ring (128 k2 bits) is added
+// once so the window's first bit is never negative.
+uint16_t window16(const uint16_t* words, int k2, int v) {
     const uint32_t* p32 = (const uint32_t*) words;
-    const int nw = nwords / 2;                          // == bits * 256 / 32
-    const int b0 = v * bits + bits - 16 + 256 * bits;
-    const int b2 = b0 + 16;
+    const int nw = 4 * k2;                              // uint32 words a tile
+    const int b2 = exl3_window_end(v, k2) + 128 * k2;
+    const int b0 = b2 - 16;
     const int i0r = b0 >> 5, i1r = (b2 - 1) >> 5;
     const int s1 = (i1r + 1) * 32 - b2;
     const uint32_t a = p32[i0r % nw], b = p32[i1r % nw];
     const uint64_t m = ((uint64_t) a << 32) | (uint64_t) b;
     return (uint16_t)((m >> s1) & 0xFFFF);
+}
+
+// k2 one of the bitrates these decode (as exl3_k2_valid), a half-integer K only with mul1 (exllamav3 refuses the others)
+void check_k2(int k2, const Exl3Codebook* cb, const char* who) {
+    if (!exl3_k2_valid(k2))
+        throw std::invalid_argument(std::string(who) + ": k2 " + std::to_string(k2) + " is not an EXL3 bitrate "
+                                    "(2..16 even, or 3 / 5 / 7 for K 1.5 / 2.5 / 3.5)");
+    if ((k2 & 1) && cb != nullptr && *cb != Exl3Codebook::Mul1)
+        throw std::invalid_argument(std::string(who) + ": K " + exl3_k_label(k2) + " needs the mul1 codebook");
 }
 
 // tensor_core_perm: tc[j] == row_major[perm[j]] (quantize.py).
@@ -206,37 +221,57 @@ void exl3_codebook_lut(Exl3Codebook cb, uint16_t* lut) {
     for (int w = 0; w < (1 << 16); ++w) lut[w] = decode_window(cb, (uint16_t)w);
 }
 
-void exl3_decode_tile(const uint16_t* trellis_words, int bits, const uint16_t* lut,
-                      uint16_t* out_row_major) {
+void exl3_tile_windows_k2(const uint16_t* trellis_words, int k2, uint16_t* windows) {
+    check_k2(k2, nullptr, "exl3_tile_windows_k2");
+    for (int t = 0; t < 256; ++t) windows[t] = window16(trellis_words, k2, t);
+}
+
+void exl3_decode_tile_k2(const uint16_t* trellis_words, int k2, const uint16_t* lut, uint16_t* out_row_major) {
+    check_k2(k2, nullptr, "exl3_decode_tile_k2");
     int perm[256];
     build_perm(perm);
     uint16_t tc[256];
     for (int t = 0; t < 256; ++t) {
-        tc[t] = lut[window16(trellis_words, 256 * bits / 16, bits, t)];
+        tc[t] = lut[window16(trellis_words, k2, t)];
     }
     for (int j = 0; j < 256; ++j) out_row_major[perm[j]] = tc[j];
 }
 
-void exl3_decode_weight_hat(const uint16_t* trellis, int ki, int nj, int bits, Exl3Codebook cb,
-                            uint16_t* out) {
+void exl3_decode_tile(const uint16_t* trellis_words, int bits, const uint16_t* lut,
+                      uint16_t* out_row_major) {
+    exl3_decode_tile_k2(trellis_words, 2 * bits, lut, out_row_major);
+}
+
+void exl3_decode_weight_hat_k2(const uint16_t* trellis, int ki, int nj, int k2, Exl3Codebook cb, uint16_t* out) {
+    check_k2(k2, &cb, "exl3_decode_weight_hat_k2");
     const uint16_t* lut = lut_for(cb);
-    int words = 256 * bits / 16;
+    int words = 8 * k2;                                 // uint16 words a tile
     int n = nj * 16;
     uint16_t tile[256];
     for (int i = 0; i < ki; ++i)
         for (int j = 0; j < nj; ++j) {
-            exl3_decode_tile(trellis + ((size_t)(i * nj + j)) * words, bits, lut, tile);
+            exl3_decode_tile_k2(trellis + ((size_t)(i * nj + j)) * words, k2, lut, tile);
             for (int r = 0; r < 16; ++r)
                 for (int c = 0; c < 16; ++c)
                     out[(size_t)(i * 16 + r) * n + j * 16 + c] = tile[r * 16 + c];
         }
 }
 
+void exl3_decode_weight_hat(const uint16_t* trellis, int ki, int nj, int bits, Exl3Codebook cb,
+                            uint16_t* out) {
+    exl3_decode_weight_hat_k2(trellis, ki, nj, 2 * bits, cb, out);
+}
+
 void exl3_reconstruct_weight(const uint16_t* trellis, int ki, int nj, int bits, Exl3Codebook cb,
                              const uint16_t* suh, const uint16_t* svh, uint16_t* out) {
+    exl3_reconstruct_weight_k2(trellis, ki, nj, 2 * bits, cb, suh, svh, out);
+}
+
+void exl3_reconstruct_weight_k2(const uint16_t* trellis, int ki, int nj, int k2, Exl3Codebook cb,
+                                const uint16_t* suh, const uint16_t* svh, uint16_t* out) {
     int k = ki * 16, n = nj * 16;
     std::vector<uint16_t> what((size_t)k * n);
-    exl3_decode_weight_hat(trellis, ki, nj, bits, cb, what.data());
+    exl3_decode_weight_hat_k2(trellis, ki, nj, k2, cb, what.data());
     std::vector<float> w((size_t)k * n);
     for (size_t i = 0; i < w.size(); ++i) w[i] = h2f(what[i]);
     had_rows(w, k, n);
@@ -250,9 +285,14 @@ void exl3_reconstruct_weight(const uint16_t* trellis, int ki, int nj, int bits, 
 void exl3_folded_gemv(const uint16_t* trellis, int ki, int nj, int bits, Exl3Codebook cb,
                       const uint16_t* suh, const uint16_t* svh, const uint16_t* x, int tokens,
                       float* y) {
+    exl3_folded_gemv_k2(trellis, ki, nj, 2 * bits, cb, suh, svh, x, tokens, y);
+}
+
+void exl3_folded_gemv_k2(const uint16_t* trellis, int ki, int nj, int k2, Exl3Codebook cb,
+                         const uint16_t* suh, const uint16_t* svh, const uint16_t* x, int tokens, float* y) {
     int k = ki * 16, n = nj * 16;
     std::vector<uint16_t> what((size_t)k * n);
-    exl3_decode_weight_hat(trellis, ki, nj, bits, cb, what.data());
+    exl3_decode_weight_hat_k2(trellis, ki, nj, k2, cb, what.data());
     std::vector<float> w((size_t)k * n);
     for (size_t i = 0; i < w.size(); ++i) w[i] = h2f(what[i]);
     std::vector<float> xh((size_t)tokens * k);

@@ -235,8 +235,8 @@ bool stage_role(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGeometry& g, c
         // (out = q(512) | k(128)) and split it into the two engine [in, out] matrices.
         Exl3Linear L = im.model.linear(hf_name);
         std::vector<uint16_t> w((size_t) L.in() * L.out());
-        strata::kernels::cpu::exl3_reconstruct_weight(L.trellis, L.ki, L.nj, L.int_bits("exl3 pack: " + hf_name),
-                                                      (strata::kernels::cpu::Exl3Codebook) L.cb, L.suh, L.svh, w.data());
+        strata::kernels::cpu::exl3_reconstruct_weight_k2(L.trellis, L.ki, L.nj, L.k2,
+                                                         (strata::kernels::cpu::Exl3Codebook) L.cb, L.suh, L.svh, w.data());
         const bool q = r.xf == Xf::SplitQ;
         const int oc = q ? L.out() * 4 / 5 : L.out() / 5;   // 512 / 128
         const int c0 = q ? 0 : oc * 4;
