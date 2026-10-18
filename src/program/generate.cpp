@@ -9245,6 +9245,13 @@ int main(int argc, char** argv) {
             strata::kernels::Exl3VramTier* xt = exl3_tier != nullptr && exl3_tier->slots() > 0 ? exl3_tier.get() : nullptr;
             const int64_t xt_slots = xt != nullptr ? xt->slots() : 0;
             const uint64_t xt_slot = xt != nullptr ? xt->slot_bytes() : 1;
+            // option (c) (below): with the tier read in place, the copy ring's slots are tier slots a part lends too, so a
+            // smaller ring leaves more experts in place and fewer to refill.  Measured (turboderp 4.05, the server's
+            // defaults, one text each), a ring of 512 / 384 / 256 / 128 slots: 21K 9.23 / 9.18 / 9.12 / 10.12 s, 7K 4.76 /
+            // 4.71 / 4.67 / 5.30, 4K 4.49 / 4.44 / 4.40 / 4.46, 512 tokens 4.07 / 4.02 / 3.97 / 3.93 - so 256 here
+            // (generate keeps its 512: no tier is read during its prompt; STRATA_EXL3_PF_RING still wins)
+            const bool exl3_inplace = xt != nullptr && exl3_pf_inplace();
+            if (exl3_inplace && std::getenv("STRATA_EXL3_PF_RING") == nullptr) exl3_pf.ring = 256;
             sp.set_exl3(&exl3_pf);   // before bytes_needed: the ring's slot is the model's expert
             auto lend_slots = [&](int64_t c) -> int64_t {   // the tier's slots a c-token chunk's buffers and ring take
                 return (int64_t) ((strata::prefill::Prefill::bytes_needed(g, ss, c, false) + xt_slot - 1) / xt_slot);
@@ -9313,7 +9320,7 @@ int main(int argc, char** argv) {
             // same bytes, from a tier slot instead of a ring slot.  The helper tier is the other card's, and the two cards
             // have no peer access here (nvidia-smi topo -p2p r: NS): a copy from it would cross this card's link like the
             // RAM tier's, so its experts still stream.
-            if (xt != nullptr && exl3_pf_inplace()) {
+            if (exl3_inplace) {
                 exl3_pf.vram = [xt](int64_t l, int64_t e) { return xt->blob(l, e); };
                 if (!o.short_read_given) exl3_short_read = 384;   // the crossover with the windows moved (above)
                 std::fprintf(stderr, "strata serve: EXL3 prompt path: the VRAM tier's experts below the loan are read in "
