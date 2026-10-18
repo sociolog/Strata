@@ -95,16 +95,20 @@ bool Exl3ExpertRam::open(const std::string& dir, int n_layers, int n_expert, int
                             std::to_string(g.in()) + "x" + std::to_string(g.out()) + ", up " + std::to_string(u.in()) +
                             "x" + std::to_string(u.out()) + ", down " + std::to_string(d.in()) + "x" +
                             std::to_string(d.out()));
+            for (const Exl3Linear* m : {&g, &u, &d})
+                if (!exl3_lane_k2_ok(m->k2))
+                    return fail("layer " + std::to_string(l) + " has K " + exl3_k_label(m->k2) + ", which the lane does "
+                                "not take");
             LayerFmt& f = lay[(size_t) l];
-            f.kg = g.int_bits(b + "gate_proj (the RAM tier)");
-            f.ku = u.int_bits(b + "up_proj (the RAM tier)");
-            f.kd = d.int_bits(b + "down_proj (the RAM tier)");
+            f.k2g = g.k2;
+            f.k2u = u.k2;
+            f.k2d = d.k2;
             f.h = g.in();
             f.ff = g.out();
-            const uint64_t tile_words = (uint64_t) f.h / 16 * (uint64_t) (f.ff / 16);   // 16x16 tiles a matrix
-            f.up = up64(tile_words * 32 * (uint64_t) f.kg);
-            f.down = f.up + up64(tile_words * 32 * (uint64_t) f.ku);
-            f.suh_g = f.down + up64(tile_words * 32 * (uint64_t) f.kd);
+            const uint64_t tiles = (uint64_t) f.h / 16 * (uint64_t) (f.ff / 16);   // 16x16 tiles a matrix, 16 k2 bytes each
+            f.up = up64(tiles * 16 * (uint64_t) f.k2g);
+            f.down = f.up + up64(tiles * 16 * (uint64_t) f.k2u);
+            f.suh_g = f.down + up64(tiles * 16 * (uint64_t) f.k2d);
             f.svh_g = f.suh_g + up64(2 * (uint64_t) f.h);
             f.suh_u = f.svh_g + up64(2 * (uint64_t) f.ff);
             f.svh_u = f.suh_u + up64(2 * (uint64_t) f.h);
@@ -126,14 +130,14 @@ bool Exl3ExpertRam::open(const std::string& dir, int n_layers, int n_expert, int
         reads.reserve((size_t) n_layers * (size_t) n_expert * 9);
         for (int l = 0; l < n_layers; ++l) {
             const LayerFmt& f = lay[(size_t) l];
-            const uint64_t tile_words = (uint64_t) f.h / 16 * (uint64_t) (f.ff / 16);
+            const uint64_t tiles = (uint64_t) f.h / 16 * (uint64_t) (f.ff / 16);
             const struct {
                 const char* name;
                 uint64_t at, bytes;
             } part[9] = {
-                {"gate_proj.trellis", 0, tile_words * 32 * (uint64_t) f.kg},
-                {"up_proj.trellis", f.up, tile_words * 32 * (uint64_t) f.ku},
-                {"down_proj.trellis", f.down, tile_words * 32 * (uint64_t) f.kd},
+                {"gate_proj.trellis", 0, tiles * 16 * (uint64_t) f.k2g},
+                {"up_proj.trellis", f.up, tiles * 16 * (uint64_t) f.k2u},
+                {"down_proj.trellis", f.down, tiles * 16 * (uint64_t) f.k2d},
                 {"gate_proj.suh", f.suh_g, 2 * (uint64_t) f.h},
                 {"gate_proj.svh", f.svh_g, 2 * (uint64_t) f.ff},
                 {"up_proj.suh", f.suh_u, 2 * (uint64_t) f.h},
@@ -218,11 +222,11 @@ Exl3Expert Exl3ExpertRam::expert(int layer, int e) const {
     const uint8_t* b = base_ + f.base + (uint64_t) e * f.blob;
     Exl3Expert x;
     x.gate = Exl3Part{(const uint32_t*) b, (const uint16_t*) (b + f.suh_g), (const uint16_t*) (b + f.svh_g), f.h, f.ff,
-                      2 * f.kg};
+                      f.k2g};
     x.up = Exl3Part{(const uint32_t*) (b + f.up), (const uint16_t*) (b + f.suh_u), (const uint16_t*) (b + f.svh_u), f.h,
-                    f.ff, 2 * f.ku};
+                    f.ff, f.k2u};
     x.down = Exl3Part{(const uint32_t*) (b + f.down), (const uint16_t*) (b + f.suh_d), (const uint16_t*) (b + f.svh_d),
-                      f.ff, f.h, 2 * f.kd};
+                      f.ff, f.h, f.k2d};
     return x;
 }
 
@@ -235,14 +239,23 @@ uint64_t Exl3ExpertRam::blob_bytes(int layer) const { return lay_[(size_t) layer
 
 std::string Exl3ExpertRam::describe() const {
     if (lay_.empty()) return "EXL3 RAM tier: empty";
-    char buf[256];
-    const LayerFmt& f = lay_[0];
-    bool uniform = true;
-    for (const LayerFmt& g : lay_) uniform &= g.kg == f.kg && g.ku == f.ku && g.kd == f.kd;
-    std::snprintf(buf, sizeof buf, "%d layers x %d experts, gate/up/down K %d/%d/%d%s (%.2f MB an expert), %.1f GiB, "
-                  "loaded in %.1f s", (int) lay_.size(), n_expert_, f.kg, f.ku, f.kd, uniform ? "" : " in layer 0 (mixed)",
-                  (double) f.blob / 1e6, gib(bytes_), load_s_);
-    return buf;
+    // the layers' bitrates in order of first appearance (an SC model's differ: 3/3/5 x1, 3.5/3.5/5 x8, 4/4/4 x39)
+    std::vector<std::pair<std::string, int>> kinds;
+    uint64_t max_blob = 0;
+    for (const LayerFmt& g : lay_) {
+        const std::string k = exl3_k_label(g.k2g) + "/" + exl3_k_label(g.k2u) + "/" + exl3_k_label(g.k2d);
+        auto it = std::find_if(kinds.begin(), kinds.end(), [&](const std::pair<std::string, int>& x) { return x.first == k; });
+        if (it == kinds.end()) kinds.emplace_back(k, 1);
+        else ++it->second;
+        max_blob = std::max(max_blob, g.blob);
+    }
+    std::string ks;
+    for (const auto& kd : kinds)
+        ks += (ks.empty() ? "" : ", ") + kd.first + (kinds.size() > 1 ? " x" + std::to_string(kd.second) : "");
+    char buf[96];
+    std::snprintf(buf, sizeof buf, " (%.2f MB an expert%s), %.1f GiB, loaded in %.1f s", (double) max_blob / 1e6,
+                  kinds.size() > 1 ? " at most" : "", gib(bytes_), load_s_);
+    return std::to_string(lay_.size()) + " layers x " + std::to_string(n_expert_) + " experts, gate/up/down K " + ks + buf;
 }
 
 }  // namespace strata::kernels::cpu

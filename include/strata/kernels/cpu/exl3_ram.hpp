@@ -26,8 +26,9 @@ public:
 
     /// Copies the routed experts of layers [0, n_layers) (`model.language_model.layers.L.mlp.experts.E.*`) into RAM on
     /// `threads` threads.  `budget` > 0 refuses a tier larger than that many bytes.  False and a message on a missing
-    /// tensor, a codebook other than mul1, an expert whose shape differs from its layer's, a short read or a failed
-    /// allocation; nothing is left half-loaded.
+    /// tensor, a codebook other than mul1, an expert whose shape or bitrate differs from its layer's, a short read or a
+    /// failed allocation; nothing is left half-loaded.  Any bitrate the lane takes: K 1..8 and the half-integer 1.5 /
+    /// 2.5 / 3.5 (an SC model's layers differ in K; each layer's own).
     bool open(const std::string& model_dir, int n_layers, int n_expert, int threads, uint64_t budget, std::string& err);
     bool loaded() const { return base_ != nullptr; }
     /// Pointers into the tier (valid while it lives); layer and expert must be in range.
@@ -43,12 +44,13 @@ public:
     double load_seconds() const { return load_s_; }
     int n_layers() const { return (int) lay_.size(); }
     int n_expert() const { return n_expert_; }
-    /// e.g. "48 layers x 512 experts, gate/up/down K 4/4/4 (2.48 MB an expert), 56.7 GiB"
+    /// e.g. "48 layers x 512 experts, gate/up/down K 4/4/4 (2.48 MB an expert), 56.7 GiB" (the K of each kind of layer
+    /// listed when they differ)
     std::string describe() const;
 
 private:
     struct LayerFmt {
-        int kg = 0, ku = 0, kd = 0;          // K of gate, up, down
+        int k2g = 0, k2u = 0, k2d = 0;       // the bitrates (2 K) of gate, up, down
         int h = 0, ff = 0;                   // n_embd, n_ff
         uint64_t blob = 0;                   // bytes an expert
         uint64_t up = 0, down = 0, suh_g = 0, svh_g = 0, suh_u = 0, svh_u = 0, suh_d = 0, svh_d = 0;   // offsets in the blob
