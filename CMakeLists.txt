@@ -1473,6 +1473,13 @@ if(STRATA_BUILD_TESTS)
   else()
     message(STATUS "STRATA tests: no python3 with numpy found - exl3_parity is not registered")
   endif()
+  # The same decoder against exllamav3 itself (1.6.2: its packer, unpacker and reconstruct), the half-integer bitrates
+  # K 1.5 / 2.5 / 3.5 (k2 3 / 5 / 7) and integer K 3 / 5 beside them.  The fixtures need exllamav3 and a CUDA device
+  # to make (tools/exl3/emit_exllamav3_fixture.py), so they are stored in tests/data/exl3_halfk.
+  foreach(_k2 3 5 7 6 10)
+    add_test(NAME exl3_parity_exllamav3_k2_${_k2}
+             COMMAND exl3_parity --exllamav3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/exl3_halfk/exl3_k2_${_k2}.bin)
+  endforeach()
 endif()
 
 # The EXL3 CPU lane (src/kernels/cpu/exl3_lane.cpp, ported from project-maya's CPU lane): every tier against the
