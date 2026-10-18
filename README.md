@@ -2,6 +2,11 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
+> **This is the `exl3-lane` branch of a fork, not upstream Strata.** It runs EXL3 models with a CPU expert lane,
+> VRAM and helper-GPU expert tiers, MTP and `--serve` on NVIDIA, built on the open EXL3 pull request
+> [#1764](https://github.com/Niko1221/Strata/pull/1764) (its head, merged with Strata 0.1.45). How to build and run
+> it, and what was measured: [docs/EXL3_LANE.md](docs/EXL3_LANE.md).
+
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 
