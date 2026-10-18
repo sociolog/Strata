@@ -105,7 +105,17 @@ public:
         L.svh = (const uint16_t*)data(*svh);
         L.ki = (int)tr->shape[0];
         L.nj = (int)tr->shape[1];
-        L.bits = (int)(tr->shape[2] * 16 / 256);
+        // The bitrate K is the tile width in words / 16: 16 K words for K 1..8.  exllamav3 1.6 also writes
+        // half-integer bitrates (K 1.5 / 2.5 / 3.5: 24 / 40 / 56 words, mul1 only), which these decoders do not take:
+        // 56 words would read as K 3 and decode wrong weights without an error, so they are refused by name.
+        const int64_t words = tr->shape.size() == 3 ? tr->shape[2] : 0;
+        if (words < 16 || words > 128 || words % 16 != 0)
+            throw std::runtime_error("exl3: " + base + ".trellis has " + std::to_string(words) + " words a tile: " +
+                                     (words >= 24 && words <= 56 && words % 16 == 8
+                                          ? "K " + std::to_string(words / 16) + ".5, a half-integer bitrate "
+                                            "(exllamav3 1.6), which this build does not decode"
+                                          : std::string("not an EXL3 bitrate (16 K words for K 1..8)")));
+        L.bits = (int)(words / 16);
         L.cb = weight_map_.count(base + ".mul1") ? 2 : weight_map_.count(base + ".mcg") ? 1 : 0;
         return L;
     }

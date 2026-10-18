@@ -6472,8 +6472,13 @@ int main(int argc, char** argv) {
             }
             exl3_ram = (size_t) std::max(0, mib) << 20;
         }
-        exl3_stream = std::make_unique<strata::kernels::Exl3ExpertStream>(o.exl3_dir, (int) g.n_embd, (int) g.n_layers,
-                                                                         exl3_slots, nullptr, exl3_ram);
+        try {
+            exl3_stream = std::make_unique<strata::kernels::Exl3ExpertStream>(o.exl3_dir, (int) g.n_embd,
+                                                                             (int) g.n_layers, exl3_slots, nullptr, exl3_ram);
+        } catch (const std::exception& e) {   // e.g. a half-integer bitrate, which the expert kernels do not decode
+            std::fprintf(stderr, "strata generate: EXL3 expert stream: %s\n", e.what());
+            return 1;
+        }
         exl3_drive.stream = exl3_stream.get();
         std::fprintf(stderr, "strata generate: EXL3 expert stream ready (%d slots/layer, %.2f GiB device; "
                              "%d host slots/layer, %.2f GiB RAM)\n",
