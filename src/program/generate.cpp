@@ -1196,6 +1196,21 @@ inline bool exl3_pf_inplace() {
     static const bool on = [] { const char* v = std::getenv("STRATA_EXL3_PF_INPLACE"); return v == nullptr || v[0] != '0'; }();
     return on;
 }
+// --serve with --exl3-helper-tier (Mile 10-18): while a batched prompt part is read, the helper card computes the rows of
+// the experts its tier holds (Prefill::init_exl3_help / bind_exl3_help) instead of the main card streaming them over its
+// link; the helper tier lends its last slots for the buffers per part and gets them back after, as the main tier does.
+// STRATA_EXL3_PF_HELP=0: they stream as before (b1d62699).  STRATA_EXL3_PF_HELP_MAX: the largest chunk it helps.
+inline bool exl3_pf_help() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_EXL3_PF_HELP"); return v == nullptr || v[0] != '0'; }();
+    return on;
+}
+inline int64_t exl3_pf_help_max() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_EXL3_PF_HELP_MAX");
+        return e != nullptr ? std::max<int64_t>(0, std::atoll(e)) : (int64_t) 8192;
+    }();
+    return v;
+}
 struct Exl3Adapt {
     struct Tier {
         strata::kernels::Exl3VramTier* tier = nullptr;
@@ -9218,6 +9233,12 @@ int main(int argc, char** argv) {
         int64_t exl3_lent_first = -1;   // its first slot (-1: no loan out)
         int64_t exl3_pf_streamed0 = 0, exl3_pf_resident0 = 0;   // the prompt path's counts when the loan began (the log)
         int64_t exl3_first_now = -1;    // where the prompt path's buffers are laid out (-1: buffers of its own)
+        // the helper card's share (exl3_pf_help): the largest chunk it helps (0: none), its tier's loan out now, and the
+        // prompt path's counts when that loan began (the log)
+        int64_t exl3_help_max = 0;
+        std::vector<strata::kernels::Exl3VramTier::Lent> exl3_hlent;
+        int64_t exl3_hlent_first = -1;
+        int64_t exl3_pf_help0 = 0, exl3_pf_hrows0 = 0;
         // --exl3-lane without --short-read: a prompt part of at most this many tokens goes through the verify windows.  The
         // batched path streams every expert once per chunk however short it is (the 57 GiB at 4.05 bpw), and refills the
         // slots it borrowed: 5.2-5.4 s for 59 to 2,048 tokens (3090 + 3060, 10-18); the windows read ~95 tok/s, 8 prompt
@@ -9326,6 +9347,42 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: EXL3 prompt path: the VRAM tier's experts below the loan are read in "
                                      "place, the rest streamed (STRATA_EXL3_PF_INPLACE=0: every expert streamed); prompt "
                                      "parts of up to %lld tokens through the windows\n", (long long) exl3_short_read);
+            }
+            // the helper card's share (Mile 10-18): the two cards have no peer access, so the helper tier's experts
+            // would cross this card's link like the RAM tier's - instead the helper computes their rows of each chunk of
+            // up to STRATA_EXL3_PF_HELP_MAX tokens itself, its MoE input and rows passed through pinned host memory
+            // (Prefill::init_exl3_help).  Its buffers lie over its tier's last slots, lent per part and refilled after
+            // (exl3_lend / exl3_refill); the experts in them stream with the rest meanwhile.
+            if (exl3_helper != nullptr && exl3_helper->slots() > 0 && exl3_first_now >= 0 && exl3_pf_help() &&
+                exl3_pf_help_max() > 0) {
+                strata::kernels::Exl3VramTier* ht = exl3_helper.get();
+                exl3_pf.help = [ht](int64_t l, int64_t e) { return ht->blob(l, e); };
+                exl3_pf.help_device = ht->device();
+                const int64_t hmax = std::min<int64_t>(exl3_pf_help_max(), o.prefill_chunk);
+                const auto th = Clock::now();
+                if (!sp.init_exl3_help(hmax, err)) {
+                    std::fprintf(stderr, "strata serve: %s - the helper tier's experts stream as before\n", err.c_str());
+                    exl3_pf.help = nullptr;
+                    exl3_pf.help_device = -1;
+                } else if ((int64_t) ((sp.exl3_help_bytes(hmax) + ht->slot_bytes() - 1) / ht->slot_bytes()) > ht->slots()) {
+                    std::fprintf(stderr, "strata serve: the helper tier (%lld slots) cannot lend a %lld-token chunk's helper "
+                                         "buffers - its experts stream as before\n", (long long) ht->slots(), (long long) hmax);
+                    exl3_pf.help = nullptr;
+                    exl3_pf.help_device = -1;
+                } else {
+                    exl3_help_max = hmax;
+                    size_t fb1 = 0, tb1 = 0;
+                    {
+                        const strata::core::OnDevice on(ht->device());
+                        cudaMemGetInfo(&fb1, &tb1);
+                    }
+                    std::fprintf(stderr, "strata serve: EXL3 prompt path: the helper card (device %d) computes its tier's "
+                                         "experts of prompt chunks of up to %lld tokens (its buffers over its tier's last "
+                                         "slots, lent per part: %.0f MiB at that size; STRATA_EXL3_PF_HELP=0: they stream); "
+                                         "%.2f GiB of its VRAM left (%.1f s)\n", ht->device(), (long long) hmax,
+                                 (double) sp.exl3_help_bytes(hmax) / (double) (1ull << 20), (double) fb1 / (double) (1ull << 30),
+                                 std::chrono::duration<double>(Clock::now() - th).count());
+                }
             }
             if (!exl3_start_adapt(exl3_adapt, "serve")) return 1;
         }
@@ -13782,27 +13839,83 @@ int main(int argc, char** argv) {
                     if (!sp.relayout(want, xt.slot_ptr(first), (uint64_t) (slots - first) * xt.slot_bytes(), e)) return false;
                     exl3_first_now = first;
                 }
+                // the helper card's buffers (exl3_help_max > 0): over its tier's last slots, for chunks of this part's
+                // size (a binding for larger chunks covers it); a part of larger chunks streams the helper's experts
+                size_t hlent_now = 0;
+                if (exl3_help_max > 0 && want <= exl3_help_max && want > sp.exl3_help_chunk()) {
+                    strata::kernels::Exl3VramTier& ht = *exl3_helper;
+                    const int64_t hneed = (int64_t) ((sp.exl3_help_bytes(want) + ht.slot_bytes() - 1) / ht.slot_bytes());
+                    const int64_t hfirst = ht.slots() - hneed;   // (init checked that the largest chunk's fit)
+                    if (exl3_hlent_first < 0 || hfirst < exl3_hlent_first) {
+                        if (exl3_drive.adapt != nullptr && !exl3_drive.adapt->settle(e)) return false;
+                        std::vector<strata::kernels::Exl3VramTier::Lent> more;
+                        if (!ht.lend(hfirst, more, e)) return false;
+                        hlent_now = more.size();
+                        if (exl3_hlent_first < 0) {
+                            exl3_pf_help0 = sp.stats().experts_help;
+                            exl3_pf_hrows0 = sp.stats().rows_help;
+                        }
+                        exl3_hlent.insert(exl3_hlent.end(), more.begin(), more.end());
+                        exl3_hlent_first = hfirst;
+                    }
+                    if (!sp.bind_exl3_help(ht.slot_ptr(exl3_hlent_first),
+                                           (uint64_t) (ht.slots() - exl3_hlent_first) * ht.slot_bytes(), want, e))
+                        return false;
+                }
                 if (trace) {
                     std::fprintf(stderr, "strata trace: lent %zu EXL3 tier slots (%zu out) for %lld tokens, %lld-token chunks, "
-                                         "in %.1f ms\n", lent_now, exl3_lent.size(), (long long) tokens, (long long) want,
+                                         "%zu helper tier slots (%zu out, helped chunks up to %lld tokens), in %.1f ms\n",
+                                 lent_now, exl3_lent.size(), (long long) tokens, (long long) want, hlent_now,
+                                 exl3_hlent.size(), (long long) sp.exl3_help_chunk(),
                                  std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
                     std::fflush(stderr);
                 }
                 return true;
             };
             auto exl3_refill = [&](std::string& e) -> bool {
-                if (exl3_lent_first < 0) return true;
+                if (exl3_lent_first < 0 && exl3_hlent_first < 0) return true;
                 // the prompt path's work in those slots (its streams, the copy ring's DMA) is over before they are refilled
                 if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess) {
                     e = std::string("the prompt path before the EXL3 tier's refill: ") + cudaGetErrorString(se);
                     return false;
                 }
-                if (!exl3_tier->restore(exl3_lent, *exl3_ram, e)) return false;
+                // the helper card's loan: its buffers unbound (its streams waited for), its slots refilled - on a thread,
+                // over its own link while the main tier's refill crosses this card's (two tiers, two devices, two streams)
+                std::string help_note, help_err;
+                std::future<bool> help_refill;
+                if (exl3_hlent_first >= 0) {
+                    if (!sp.bind_exl3_help(nullptr, 0, 0, e)) return false;
+                    help_refill = std::async(std::launch::async, [&] { return exl3_helper->restore(exl3_hlent, *exl3_ram, help_err); });
+                }
+                auto help_done = [&]() -> bool {
+                    if (!help_refill.valid()) return true;
+                    if (!help_refill.get()) {
+                        e = help_err;
+                        return false;
+                    }
+                    char b[192];
+                    std::snprintf(b, sizeof b, "; the helper card computed %lld experts (%lld rows), %zu of its tier's "
+                                               "refilled in %.2f s", (long long) (sp.stats().experts_help - exl3_pf_help0),
+                                  (long long) (sp.stats().rows_help - exl3_pf_hrows0), exl3_hlent.size(),
+                                  exl3_helper->restore_seconds());
+                    help_note = b;
+                    exl3_hlent.clear();
+                    exl3_hlent_first = -1;
+                    return true;
+                };
+                if (exl3_lent_first < 0) return help_done();
+                const bool main_ok = exl3_tier->restore(exl3_lent, *exl3_ram, e);
+                std::string main_err = e;
+                if (!help_done()) return false;   // (waited for either way: the thread reads exl3_hlent)
+                if (!main_ok) {
+                    e = main_err;
+                    return false;
+                }
                 // (the prompt part's experts: streamed through the ring, and the routed ones read in the tier's own slots)
                 std::fprintf(stderr, "strata serve: EXL3 tier: %zu experts refilled in %.2f s; the prompt part streamed %lld "
-                                     "experts, read %lld routed ones in place\n", exl3_lent.size(),
+                                     "experts, read %lld routed ones in place%s\n", exl3_lent.size(),
                              exl3_tier->restore_seconds(), (long long) (sp.stats().experts_streamed - exl3_pf_streamed0),
-                             (long long) (sp.stats().experts_resident - exl3_pf_resident0));
+                             (long long) (sp.stats().experts_resident - exl3_pf_resident0), help_note.c_str());
                 exl3_lent.clear();
                 exl3_lent_first = -1;
                 return true;
@@ -16174,6 +16287,10 @@ int main(int argc, char** argv) {
     // then starts at the last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
+    // STRATA_EXL3_PF_HELP_CLI (a test, below): the prompt's helper tier and the helper's region - declared before the
+    // prompt path, so an early return frees the prompt path (its helper streams waited for) before the tier
+    std::unique_ptr<strata::kernels::Exl3VramTier> pf_cli_tier;
+    void* pf_cli_region = nullptr;
     strata::prefill::Prefill prefill;
     // #1595: not by default when the cache holds every expert (nothing to take)
     strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool,
@@ -16272,6 +16389,54 @@ int main(int argc, char** argv) {
                                  "experts (%.1f s to set up; %.1f GiB of VRAM left)\n", (long long) o.prefill_chunk,
                          std::clamp(exl3_pf.ring, 16, 1024), (double) exl3_pf.max_blob / 1e6,
                          std::chrono::duration<double>(Clock::now() - i0).count(), (double) fb / (double) (1ull << 30));
+            // STRATA_EXL3_PF_HELP_CLI=MiB - a test, not a feature (the KL gate of the server's helper card, Mile 10-18):
+            // the helper card computes its experts of this prompt as `--serve` has it do (Prefill::init_exl3_help),
+            // from a helper tier of that many MiB made for the prompt only - the profile's experts after its first
+            // STRATA_EXL3_PF_HELP_CLI_SKIP (default 6440, the server's main tier) - and freed after it, before any tier
+            // of the run's own.  Needs --exl3-lane-profile (the ranking) and the helper card as the run's device 1.
+            if (const char* hv = std::getenv("STRATA_EXL3_PF_HELP_CLI"); hv != nullptr && std::atoll(hv) > 0) {
+                int ndev = 0, dev0 = 0;
+                (void) cudaGetDeviceCount(&ndev);
+                (void) cudaGetDevice(&dev0);
+                const int dev1 = dev0 == 0 ? 1 : 0;
+                if (ndev < 2 || exl3_ranked.empty() || exl3_ram == nullptr) {
+                    std::fprintf(stderr, "strata generate: STRATA_EXL3_PF_HELP_CLI needs --exl3-lane, --exl3-lane-profile and "
+                                         "a second GPU (CUDA_VISIBLE_DEVICES)\n");
+                    return 2;
+                }
+                const int64_t skip = [] {
+                    const char* v = std::getenv("STRATA_EXL3_PF_HELP_CLI_SKIP");
+                    return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : (int64_t) 6440;
+                }();
+                std::vector<int32_t> excl((size_t) (g.n_layers * g.n_expert), -1);
+                for (size_t i = 0; i < exl3_ranked.size() && (int64_t) i < skip; ++i)
+                    excl[(size_t) (exl3_ranked[i].first * g.n_expert + exl3_ranked[i].second)] = 0;
+                pf_cli_tier = std::make_unique<strata::kernels::Exl3VramTier>();
+                if (!pf_cli_tier->init(*exl3_ram, exl3_ranked, (uint64_t) std::atoll(hv) << 20, err, dev1, excl.data(), 0)) {
+                    std::fprintf(stderr, "strata generate: STRATA_EXL3_PF_HELP_CLI: %s\n", err.c_str());
+                    return 1;
+                }
+                exl3_pf.help = [t = pf_cli_tier.get()](int64_t l, int64_t e) { return t->blob(l, e); };
+                exl3_pf.help_device = dev1;
+                const uint64_t hb = [&] {
+                    std::string e2;
+                    return prefill.init_exl3_help(o.prefill_chunk, e2) ? prefill.exl3_help_bytes(o.prefill_chunk)
+                                                                       : (err = e2, (uint64_t) 0);
+                }();
+                bool bound = hb > 0;
+                if (bound) {
+                    const strata::core::OnDevice on(dev1);
+                    bound = cudaMalloc(&pf_cli_region, hb) == cudaSuccess;
+                    if (!bound) err = std::string("the helper's region: ") + cudaGetErrorString(cudaGetLastError());
+                }
+                if (!bound || !prefill.bind_exl3_help(pf_cli_region, hb, o.prefill_chunk, err)) {
+                    std::fprintf(stderr, "strata generate: STRATA_EXL3_PF_HELP_CLI: %s\n", err.c_str());
+                    return 1;
+                }
+                std::fprintf(stderr, "strata generate: STRATA_EXL3_PF_HELP_CLI (a test): the helper card (device %d) computes "
+                                     "the experts of a %lld-expert tier (the profile's after its first %lld) for this prompt\n",
+                             dev1, (long long) pf_cli_tier->filled(), (long long) skip);
+            }
         } else {
             if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
             if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
@@ -16348,8 +16513,21 @@ int main(int argc, char** argv) {
         if (ps.experts_direct > 0)
             std::fprintf(stderr, "strata generate: prompt MMQ read %lld of the %lld resident experts in their slots "
                                  "(STRATA_MMQ_DIRECT)\n", (long long) ps.experts_direct, (long long) ps.experts_resident);
+        if (ps.experts_help > 0)
+            std::fprintf(stderr, "strata generate: prefill: the helper card computed %lld experts (%lld rows)\n",
+                         (long long) ps.experts_help, (long long) ps.rows_help);
         // --exl3: this run reads no other prompt; the prompt path's buffers go back for the VRAM tier below
         if (exl3_batched) prefill.reset();
+        if (pf_cli_tier != nullptr) {   // STRATA_EXL3_PF_HELP_CLI: the test's helper tier and region go (the reset synced)
+            {
+                const strata::core::OnDevice on(pf_cli_tier->device());
+                if (pf_cli_region != nullptr) cudaFree(pf_cli_region);
+            }
+            pf_cli_region = nullptr;
+            pf_cli_tier.reset();
+            exl3_pf.help = nullptr;
+            exl3_pf.help_device = -1;
+        }
     }
 
     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches

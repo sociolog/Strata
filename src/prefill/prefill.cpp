@@ -60,6 +60,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -826,6 +827,175 @@ struct PeerPrefill {
     }
 };
 
+// --exl3 with a helper GPU (Exl3PromptExperts::help: --serve with --exl3-helper-tier; Mile 10-18): the experts the helper
+// tier holds are computed on that GPU for every chunk it is bound for (bind_exl3_help), with this path's own kernels and
+// launch for launch as this GPU would run them, and are never streamed over this GPU's link.  The two cards have no peer
+// access (the 3090 + 3060 here: nvidia-smi topo -p2p r says NS), so per MoE layer this GPU copies its MoE input (T x N
+// F32) to pinned host memory beside its compute stream, the helper copies it in with its routing table, computes the rows
+// of its routed experts in id order (over its streams, as this GPU's expert streams) and copies them back to pinned host
+// memory in batches of at most T rows; this GPU reads them into Dm's tail with a copy kernel (a copy-engine upload would
+// queue behind the expert stream's ring) on a stream of its own, beside its own experts, and the combine waits for that
+// copy.  The routes are laid out with the helper's experts last (this GPU's in id order, then the helper's), so its rows
+// are one block and every row is where the combine reads it.  The next layer's MoE input reaches the helper only after
+// this layer's combine, which waited for the copy, so each buffer below is reused only once its last reader is done.
+struct X3Help {
+    static constexpr int NS = 4;
+    static constexpr size_t WS = 32u << 20;   // a cuBLAS workspace: this GPU's expert streams' size
+    int dev = -1;                       // the helper GPU
+    int main_dev = -1;                  // this path's GPU
+    int ns = 4;                         // the helper's compute streams (STRATA_EXL3_PF_HELP_STREAMS, 1..4; 2: 7K +0.1 s)
+    int64_t T_max = 0;                  // init_exl3_help's chunk limit
+    int64_t T = 0;                      // the bound chunk size: chunks of at most T tokens are helped (0: unbound)
+    bool check = false;                 // STRATA_EXL3_PF_HELP_CHECK=1: this GPU computes the helper's experts too, compared
+    // SUMS (default; STRATA_EXL3_PF_HELP_SUMS=0: its rows): the helper adds its rows into one weighted sum per token
+    // (peer_scatter_add, expert by expert in id order on one stream, so the sums are repeatable) and sends T x N back
+    // instead of its rows (~30 % of a prompt's routes land on its experts: ~3 T rows); this GPU's combine adds the sum to
+    // its own experts' rows (moe_combine_peer, reading it from host memory).  Not the bits of the rows mode (another
+    // order of additions); the check runs in the rows mode.
+    bool sums = true;
+    bool sum_copy = false;              // STRATA_EXL3_PF_HELP_SUMCOPY=1: the sums copied into Dm's tail beside the experts
+    bool f16 = false;                   // STRATA_EXL3_PF_HELP_F16=1: the sums back in FP16 (half the bytes; rounded)
+    static constexpr int MAX_SLICES = 8;
+    int slices = 4;                     // the MoE input's copy in this many slices (STRATA_EXL3_PF_HELP_SLICES, 1..8)
+    cudaEvent_t ev_xs[MAX_SLICES] = {}; // on x_stream: slice j is in host memory
+    // the helper GPU
+    cudaStream_t s[NS] = {};
+    cudaStream_t s_out = nullptr;       // its copies back to host memory
+    cudaEvent_t ev_in = nullptr;        // the layer's inputs have landed (the other streams start after it)
+    cudaEvent_t ev_q[NS] = {};          // a stream's work up to a batch's end
+    cudaEvent_t ev_flush = nullptr;     // a batch's rows have left the row buffer
+    cudaEvent_t ev_done = nullptr;      // the layer's rows are in host memory
+    std::unique_ptr<Gemm> gemm[NS];
+    // its device buffers, laid out in the bound region for chunks of up to T tokens (null while unbound; layout())
+    struct Bufs {
+        float* x = nullptr;             // T x N: the layer's MoE input
+        int32_t* tab = nullptr;         // tab_ints(T): its rows' tokens, its experts' row bounds, (sums) its rows' pairs
+        float* rows = nullptr;          // T x N: a batch's rows (an expert has at most T)
+        uint16_t* hh = nullptr;         // T x 640: their swiglu (FP16), the down product's input
+        uint16_t* x16 = nullptr;        // T x N: the rotated rows of the batch's cuBLAS experts
+        float* gu = nullptr;            // T x 1280: their gate and up products
+        uint16_t* dq[NS] = {};          // per stream: an expert's decoded W' (gate, up, down)
+        void* ws[NS] = {};              // per stream: its cuBLAS workspace
+        float* wk = nullptr;            // sums: T x K routing weights
+        float* sum = nullptr;           // sums: T x N, its experts' weighted rows per token
+    } b;
+    // the table: [0, T*K) its rows' tokens, [T*K, T*K + NE + 1) its experts' row bounds, then (sums) each row's routed
+    // pair (t * K + k) at pair_at(T)
+    static int64_t pair_at(int64_t T) { return T * K + NE + 1; }
+    static size_t tab_ints(int64_t T, bool sums) { return (size_t) (pair_at(T) + (sums ? T * K : 0)); }
+    // `base` null: only counts.  The bytes of the layout for chunks of T tokens.
+    static uint64_t layout(Bufs& o, uint8_t* base, int64_t T, int ns, bool sums) {
+        uint64_t used = 0;
+        auto take = [&](auto*& p, size_t n) {
+            const uint64_t at = (used + 255) & ~(uint64_t) 255;
+            used = at + n * sizeof(*p);
+            p = base != nullptr ? reinterpret_cast<std::remove_reference_t<decltype(p)>>(base + at) : nullptr;
+        };
+        take(o.x, (size_t) T * N);
+        take(o.tab, tab_ints(T, sums));
+        if (sums) {
+            take(o.wk, (size_t) T * K);
+            take(o.sum, (size_t) T * N);
+        }
+        take(o.rows, (size_t) T * N);
+        take(o.hh, (size_t) T * 640);
+        take(o.x16, (size_t) T * N);
+        take(o.gu, (size_t) T * 1280);
+        for (int q = 0; q < ns; ++q) {
+            take(o.dq[q], (size_t) 1920 * N);
+            uint8_t* w = nullptr;
+            take(w, WS);
+            o.ws[q] = w;
+        }
+        return used;
+    }
+    // pinned host memory (portable, mapped)
+    float* h_x = nullptr;               // T_max x N
+    int32_t* h_tab = nullptr;           // tab_ints(T_max)
+    float* h_rows = nullptr;            // rows: T_max*K x N, a layer's rows (at most every route), read by this GPU's copy kernel
+    float* h_w = nullptr;               // sums: T_max x K routing weights
+    float* h_sum = nullptr;             // sums: T_max x N, read by this GPU's combine
+    uint16_t* h_sum16 = nullptr;        // sums in FP16: the same, half the bytes
+    // this GPU
+    cudaStream_t x_stream = nullptr;    // the MoE input's copy to host memory
+    cudaStream_t in_stream = nullptr;   // the rows' copy into Dm
+    cudaEvent_t ev_mix = nullptr;       // on the compute stream: the MoE input is final
+    cudaEvent_t ev_x = nullptr;         // on x_stream: it is in host memory
+    cudaEvent_t ev_back = nullptr;      // on in_stream: the rows are in Dm
+    int64_t batches = 0;                // stats: the row batches sent back
+    int64_t ck_rows[2] = {}, ck_same[2] = {};   // the check, per chunk: rows compared and equal (tensor-core kernels, cuBLAS)
+    double ck_max[2] = {};              // ...and their largest difference
+    // STRATA_EXL3_PF_HELP_PROFILE=1: per helped layer, the MoE input's copy to host memory, the helper's inputs, its
+    // experts and sums, the way back, its whole span, and this GPU's wait for it before the combine - two event sets by
+    // layer parity (a layer's are read after the next layer's routing sync), summed per chunk, printed with its last layer
+    bool prof = false;
+    int prof_set = 0;
+    cudaEvent_t pe_x[2][2] = {}, pe_h[2][4] = {}, pe_m[2][2] = {};
+    bool prof_live[2] = {};
+    double prof_ms[6] = {};
+    int64_t prof_layers = 0;
+    void prof_x(int i, cudaStream_t s) { if (prof) cudaEventRecord(pe_x[prof_set][i], s); }
+    void prof_h(int i, cudaStream_t s) { if (prof) cudaEventRecord(pe_h[prof_set][i], s); }
+    void prof_wait(cudaStream_t s, int i) {
+        if (!prof) return;
+        cudaEventRecord(pe_m[prof_set][i], s);
+        if (i == 1) prof_live[prof_set] = true;
+    }
+    void prof_read(int set) {
+        if (!prof || !prof_live[set]) return;
+        prof_live[set] = false;
+        cudaEventSynchronize(pe_m[set][1]);
+        auto el = [](cudaEvent_t a, cudaEvent_t b) {
+            float t = 0.0f;
+            return cudaEventElapsedTime(&t, a, b) == cudaSuccess ? (double) t : 0.0;
+        };
+        prof_ms[0] += el(pe_x[set][0], pe_x[set][1]);
+        prof_ms[1] += el(pe_h[set][0], pe_h[set][1]);
+        prof_ms[2] += el(pe_h[set][1], pe_h[set][2]);
+        prof_ms[3] += el(pe_h[set][2], pe_h[set][3]);
+        prof_ms[4] += el(pe_h[set][0], pe_h[set][3]);
+        prof_ms[5] += el(pe_m[set][0], pe_m[set][1]);
+        ++prof_layers;
+    }
+    ~X3Help() {
+        if (dev >= 0) {
+            const core::OnDevice od(dev);
+            for (int q = 0; q < NS; ++q)
+                if (s[q]) cudaStreamSynchronize(s[q]);
+            if (s_out) cudaStreamSynchronize(s_out);
+            for (int q = 0; q < NS; ++q) {
+                gemm[q].reset();
+                if (s[q]) cudaStreamDestroy(s[q]);
+                if (ev_q[q]) cudaEventDestroy(ev_q[q]);
+            }
+            if (s_out) cudaStreamDestroy(s_out);
+            for (cudaEvent_t e : {ev_in, ev_flush, ev_done})
+                if (e) cudaEventDestroy(e);
+            for (auto& set : pe_h)
+                for (cudaEvent_t e : set)
+                    if (e) cudaEventDestroy(e);
+        }
+        if (main_dev >= 0) {
+            const core::OnDevice od(main_dev);
+            for (cudaStream_t st : {x_stream, in_stream})
+                if (st) { cudaStreamSynchronize(st); cudaStreamDestroy(st); }
+            for (cudaEvent_t e : {ev_mix, ev_x, ev_back})
+                if (e) cudaEventDestroy(e);
+            for (cudaEvent_t e : ev_xs)
+                if (e) cudaEventDestroy(e);
+            for (int p = 0; p < 2; ++p)
+                for (cudaEvent_t e : {pe_x[p][0], pe_x[p][1], pe_m[p][0], pe_m[p][1]})
+                    if (e) cudaEventDestroy(e);
+        }
+        if (h_x) cudaFreeHost(h_x);
+        if (h_tab) cudaFreeHost(h_tab);
+        if (h_rows) cudaFreeHost(h_rows);
+        if (h_w) cudaFreeHost(h_w);
+        if (h_sum) cudaFreeHost(h_sum);
+        if (h_sum16) cudaFreeHost(h_sum16);
+    }
+};
+
 // #1712: a chunk's small int32 tables (the QSA step records, the token ids) go up from a pinned buffer.  A cudaMemcpyAsync
 // from pageable memory is staged by the runtime; on gfx1100 the first text prompt after a picture one was seen to read stale
 // step records that way.  The event holds the next upload back until the last one has left the buffer.  No pinned RAM:
@@ -965,6 +1135,12 @@ struct Prefill::Impl {
     // row offsets, which the tensor-core kernels read an expert's rows from
     const Exl3PromptExperts* x3 = nullptr;
     int32_t* x3_bounds = nullptr;
+    // a layer's grouping (host): the row bounds by place and each expert's place (id order, or with the helper bound its
+    // experts last), and the routed experts the helper GPU computes (X3Help)
+    std::vector<int32_t> x3_bnd, x3_pos, x3_help_e;
+    std::vector<uint8_t> x3_is_help;
+    const float* x3_sum_src = nullptr;   // the layer's helper sums the combine reads (Dm's tail or host memory)
+    bool x3_back = false;                // the layer's helper rows / sums are copied into Dm's tail (X3Help::ev_back)
     // ...and the streams a layer's EXL3 experts are spread over (STRATA_EXL3_PF_STREAMS, default 8; [0] is cs): one
     // expert's GEMMs are ~410 x 640 at 21K tokens, a quarter of the card's SMs, so several run side by side.  Each stream
     // has its own cuBLAS handle (x3_gemm[0] unused: cs has `gemm`), FP16 weight buffer (gate+up, then down) and event
@@ -1015,6 +1191,8 @@ struct Prefill::Impl {
     // layer split: the next stage's GPU as a stream-only peer (set_stage_helper); its buffers are that stage's own
     // prompt buffers, bound per prompt, and it takes the place of `pp` for a run it helps
     std::unique_ptr<PeerPrefill> help_pp;
+    // --exl3: the helper GPU's share (init_exl3_help, bind_exl3_help)
+    std::unique_ptr<X3Help> xh;
 };
 
 namespace {
@@ -1070,6 +1248,7 @@ void Prefill::reset() {
 void Prefill::release() {
     if (!impl_) return;
     impl_->hand_worker.reset();   // idle here (run drains the chain before it returns); joins its thread
+    impl_->xh.reset();   // --exl3: the helper GPU's share first (its streams synchronized: its copy may still write Dm)
     for (int q = 1; q < Impl::X3_STREAMS; ++q)   // --exl3: the expert streams (their weight buffers are in `owned`)
         if (impl_->x3_s[q]) {
             cudaStreamSynchronize(impl_->x3_s[q]);
@@ -2309,6 +2488,137 @@ void Prefill::set_exl3(const Exl3PromptExperts* x) {
     g_x3_blob = x != nullptr ? x->max_blob : 0;
     g_x3_ring = x != nullptr ? std::clamp(x->ring, STAGE + 8, RING_MAX) : 0;
 }
+bool Prefill::init_exl3_help(int64_t max_tokens, std::string& err) {
+    Impl& m = *impl_;
+    m.xh.reset();
+    if (m.x3 == nullptr || !m.x3->help || m.x3->help_device < 0 || m.T_max <= 0 || m.device < 0) {
+        err = "prefill: the EXL3 helper needs set_exl3 with a helper tier (help, help_device) and init first";
+        return false;
+    }
+    if (m.x3->help_device == m.device) {
+        err = "prefill: the EXL3 helper tier is on this path's own GPU";
+        return false;
+    }
+    if (max_tokens < 1) {
+        err = "prefill: the EXL3 helper's chunk limit must be at least one token";
+        return false;
+    }
+    auto h = std::make_unique<X3Help>();
+    h->T_max = std::min<int64_t>(max_tokens, m.T_max);
+    if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_STREAMS")) h->ns = std::clamp(std::atoi(v), 1, X3Help::NS);
+    if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_CHECK")) h->check = v[0] == '1';
+    if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_SUMS")) h->sums = v[0] != '0';
+    if (h->check) h->sums = false;   // the check compares rows
+    if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_PROFILE")) h->prof = v[0] == '1';
+    if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_SUMCOPY")) h->sum_copy = v[0] == '1';
+    if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_SLICES")) h->slices = std::clamp(std::atoi(v), 1, X3Help::MAX_SLICES);
+    if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_F16")) h->f16 = h->sums && v[0] == '1';
+    if (h->f16) h->sum_copy = false;
+    auto fail = [&](const char* what) {
+        err = std::string("prefill: the EXL3 helper's ") + what + ": " + cudaGetErrorString(cudaGetLastError());
+        return false;   // (h's destructor frees what was made)
+    };
+    {   // the helper GPU: streams, events and cuBLAS handles; their workspaces come with the bound region
+        const core::OnDevice od(m.x3->help_device);
+        h->dev = m.x3->help_device;
+        if (!strata::kernels::exl3::device_ok()) {
+            err = "prefill: the EXL3 helper GPU has no tensor-core kernels (sm_80 and later)";
+            return false;
+        }
+        for (int q = 0; q < h->ns; ++q) {
+            if (cudaStreamCreateWithFlags(&h->s[q], cudaStreamNonBlocking) != cudaSuccess) return fail("stream");
+            if (cudaEventCreateWithFlags(&h->ev_q[q], cudaEventDisableTiming) != cudaSuccess) return fail("event");
+            h->gemm[q] = std::make_unique<Gemm>();
+            if (!h->gemm[q]->init_external(h->s[q], nullptr, 0, nullptr, 0, err)) {
+                err = "prefill: the EXL3 helper's cuBLAS handle: " + err;
+                return false;
+            }
+        }
+        if (cudaStreamCreateWithFlags(&h->s_out, cudaStreamNonBlocking) != cudaSuccess) return fail("copy stream");
+        for (cudaEvent_t* e : {&h->ev_in, &h->ev_flush, &h->ev_done})
+            if (cudaEventCreateWithFlags(e, cudaEventDisableTiming) != cudaSuccess) return fail("event");
+        if (h->prof)
+            for (auto& set : h->pe_h)
+                for (cudaEvent_t& e : set)
+                    if (cudaEventCreate(&e) != cudaSuccess) return fail("profile event");
+    }
+    {   // this GPU: the copies beside its compute stream
+        const core::OnDevice od(m.device);
+        h->main_dev = m.device;
+        if (cudaStreamCreateWithFlags(&h->x_stream, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&h->in_stream, cudaStreamNonBlocking) != cudaSuccess)
+            return fail("streams on this GPU");
+        for (cudaEvent_t* e : {&h->ev_mix, &h->ev_x, &h->ev_back})
+            if (cudaEventCreateWithFlags(e, cudaEventDisableTiming) != cudaSuccess) return fail("events on this GPU");
+        for (int j = 0; j < h->slices; ++j)
+            if (cudaEventCreateWithFlags(&h->ev_xs[j], cudaEventDisableTiming) != cudaSuccess) return fail("events on this GPU");
+        if (h->prof)
+            for (int p = 0; p < 2; ++p)
+                for (cudaEvent_t* e : {&h->pe_x[p][0], &h->pe_x[p][1], &h->pe_m[p][0], &h->pe_m[p][1]})
+                    if (cudaEventCreate(e) != cudaSuccess) return fail("profile events on this GPU");
+    }
+    // pinned host memory both cards read and write (portable, mapped): the MoE input, the helper's table, and its sums
+    // with the routing weights - or its rows, a layer's at most every route of the chunk, so no layer can overrun them
+    const size_t nx = (size_t) h->T_max * N, ntab = X3Help::tab_ints(h->T_max, h->sums);
+    const size_t nrows = h->sums ? 0 : (size_t) h->T_max * K * N, nw = h->sums ? (size_t) h->T_max * K : 0,
+                 nsum = h->sums && !h->f16 ? (size_t) h->T_max * N : 0, nsum16 = h->f16 ? (size_t) h->T_max * N : 0;
+    auto pinned = [](auto*& p, size_t n) {
+        return n == 0 || cudaHostAlloc((void**) &p, n * sizeof(*p), cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess;
+    };
+    if (!pinned(h->h_x, nx) || !pinned(h->h_tab, ntab) || !pinned(h->h_rows, nrows) || !pinned(h->h_w, nw) ||
+        !pinned(h->h_sum, nsum) || !pinned(h->h_sum16, nsum16)) {
+        cudaGetLastError();
+        err = "prefill: the EXL3 helper's pinned host buffers (" + std::to_string((nx + ntab + nrows + nw + nsum) * 4 >> 20) +
+              " MiB) could not be had";
+        return false;
+    }
+    m.xh = std::move(h);
+    return true;
+}
+uint64_t Prefill::exl3_help_bytes(int64_t chunk) const {
+    const Impl& m = *impl_;
+    if (!m.xh || chunk < 1) return 0;
+    X3Help::Bufs b;
+    return X3Help::layout(b, nullptr, chunk, m.xh->ns, m.xh->sums);
+}
+bool Prefill::bind_exl3_help(void* region, uint64_t bytes, int64_t chunk, std::string& err) {
+    Impl& m = *impl_;
+    if (!m.xh) {
+        if (region == nullptr) return true;
+        err = "prefill: bind_exl3_help without init_exl3_help";
+        return false;
+    }
+    X3Help& h = *m.xh;
+    {   // nothing of the last binding may still run (between prompts this returns at once)
+        const core::OnDevice od(h.dev);
+        for (int q = 0; q < h.ns; ++q)
+            if (cudaStreamSynchronize(h.s[q]) != cudaSuccess) return err = "prefill: the EXL3 helper's stream failed", false;
+        if (cudaStreamSynchronize(h.s_out) != cudaSuccess) return err = "prefill: the EXL3 helper's copies failed", false;
+    }
+    h.b = X3Help::Bufs{};
+    h.T = 0;
+    if (region == nullptr) return true;
+    if (chunk < 1 || chunk > h.T_max) {
+        err = "prefill: the EXL3 helper is bound for " + std::to_string(chunk) + "-token chunks (1.." +
+              std::to_string(h.T_max) + ")";
+        return false;
+    }
+    X3Help::Bufs b;
+    const uint64_t need = X3Help::layout(b, nullptr, chunk, h.ns, h.sums);
+    if (need > bytes) {
+        err = "prefill: the EXL3 helper's buffers for " + std::to_string(chunk) + "-token chunks need " +
+              std::to_string(need >> 20) + " MiB, the region has " + std::to_string(bytes >> 20);
+        return false;
+    }
+    X3Help::layout(h.b, (uint8_t*) region, chunk, h.ns, h.sums);
+    {
+        const core::OnDevice od(h.dev);   // (each handle is the helper GPU's)
+        for (int q = 0; q < h.ns; ++q) h.gemm[q]->rebind(nullptr, 0, h.b.ws[q], X3Help::WS);
+    }
+    h.T = chunk;
+    return true;
+}
+int64_t Prefill::exl3_help_chunk() const { return impl_->xh ? impl_->xh->T : 0; }
 void Prefill::arm_cpu_share(bool applies, bool by_default) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     if (applies && by_default && cpu_share_explicit() == -2.0 && !g_share_default) {
@@ -2766,6 +3076,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // --exl3: every chunk streams (the EXL3 ring is sized for it; at a few hundred tokens nearly every expert is
         // routed already, and the engine reads shorter prompts through its verify windows instead)
         const bool stream_all = m.ring > STAGE && (m.x3 != nullptr || (T >= stream_all_min() && m.src != nullptr));
+        // --exl3 with the helper bound (bind_exl3_help) for chunks of this size: the experts the helper tier holds are
+        // computed on the helper GPU, not streamed (STRATA_EXL3_PF_HELP_CHECK=1: streamed and computed here too, compared)
+        const bool x3_help = m.x3 != nullptr && m.x3->help && m.xh && m.xh->T > 0 && T <= m.xh->T;
+        const bool x3_check = x3_help && m.xh->check;
         // a streamed entry's bytes: the EXL3 model's expert, or the pack's blob
         auto entry_bytes = [&](int64_t layer) -> size_t {
             return m.x3 != nullptr ? (size_t) m.x3->blob[(size_t) layer] : (size_t) lay0.blob_bytes(layer);
@@ -2826,6 +3140,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     if (m.x3 != nullptr) {   // --exl3: every expert not in VRAM, by DMA from the page-locked RAM tier
                         if (m.x3->vram && m.x3->vram(l, e) != nullptr) continue;
+                        if (x3_help && !x3_check && m.x3->help(l, e) != nullptr) continue;   // the helper GPU's
                         const uint8_t* xb = m.x3->host ? m.x3->host(l, e) : nullptr;
                         if (xb == nullptr) { err = "prefill: an EXL3 expert has no host blob"; return false; }
                         seq.push_back({(int32_t) l, e, xb, -1});
@@ -3463,6 +3778,32 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
                         return true;
                     };
+                    // --exl3 with the helper (x3_help): the MoE input to pinned host memory beside the compute stream, for
+                    // the helper GPU - started before the routing's sync, so it is on its way while the host groups the
+                    // routes.  The layer's combine waits for it (directly, or through the helper's rows) before the next
+                    // layer can write `mixed` again.
+                    if (x3_help) {
+                        X3Help& H = *m.xh;
+                        H.prof_set = (int) (l & 1);
+                        bool x_ok = cudaEventRecord(H.ev_mix, m.cs) == cudaSuccess &&
+                                    cudaStreamWaitEvent(H.x_stream, H.ev_mix, 0) == cudaSuccess;
+                        H.prof_x(0, H.x_stream);
+                        // in slices, each marked: the helper copies a slice in while the next one comes down
+                        x_ok = x_ok && (!H.sums || cudaMemcpyAsync(H.h_w, m.w, (size_t) T * K * 4, cudaMemcpyDeviceToHost,
+                                                                   H.x_stream) == cudaSuccess);
+                        for (int j = 0; j < H.slices && x_ok; ++j) {
+                            const int64_t t0 = T * j / H.slices, t1 = T * (j + 1) / H.slices;
+                            x_ok = (t1 == t0 || cudaMemcpyAsync(H.h_x + (size_t) t0 * N, m.mixed + (size_t) t0 * N,
+                                                                (size_t) (t1 - t0) * N * 4, cudaMemcpyDeviceToHost,
+                                                                H.x_stream) == cudaSuccess) &&
+                                   cudaEventRecord(H.ev_xs[j], H.x_stream) == cudaSuccess;
+                        }
+                        H.prof_x(1, H.x_stream);
+                        if (!x_ok || cudaEventRecord(H.ev_x, H.x_stream) != cudaSuccess) {
+                            err = std::string("prefill: the EXL3 helper's input copy: ") + cudaGetErrorString(cudaGetLastError());
+                            return false;
+                        }
+                    }
                     // Only the router needs to finish before readback. Queue the shared expert afterwards
                     // so it can overlap CPU grouping and the routed-only path's initial expert uploads.
                     const bool defer_shared = !stream_all && stream_ahead_enabled();
@@ -3499,6 +3840,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     size_t n_order = 0;                   // the routed experts (the debug report; unknown when fused)
                     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
+                    bool x3_sums_now = false;             // --exl3: the helper GPU's sums go into this layer's combine
+                    int64_t x3_rows_loc = 0;              // ...for the routes in Dm rows [x3_rows_loc, T * K)
                     // set_cpu_pool: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm), computed on a thread
                     // that reads on_cpu: declared first, so the future (which waits for the thread) goes first
                     std::vector<char> on_cpu;
@@ -3535,6 +3878,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         cudaStreamSynchronize(m.cs);
                         core::progress_at("reading the prompt (batched): layer", l, p0);
                         pt.fold();
+                        if (x3_help) m.xh->prof_read(((int) l + 1) & 1);   // the last layer's profile: its events are done
                         if (defer_shared) {
                             pt.mark(kPfRouter, cs);
                             if (!shared_expert()) return false;
@@ -3547,8 +3891,44 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (e < 0 || e >= NX) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
                         }
-                        m.off[0] = 0;
-                        for (int32_t e = 0; e < NX; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
+                        // with the helper (x3_help): the routed experts it holds (none the VRAM tier holds - `vram` wins)
+                        m.x3_help_e.clear();
+                        if (x3_help) {
+                            m.x3_is_help.assign((size_t) NX, 0);
+                            for (int32_t e = 0; e < NX; ++e)
+                                if (m.cnt[(size_t) e] > 0 && !(m.x3->vram && m.x3->vram(l, e) != nullptr) &&
+                                    m.x3->help(l, e) != nullptr) {
+                                    m.x3_is_help[(size_t) e] = 1;
+                                    m.x3_help_e.push_back(e);
+                                }
+                        }
+                        // the routes grouped by expert: off[e] its first row.  In id order - or, with helper experts, this
+                        // GPU's experts in id order and then the helper's, so the helper's rows are one block at Dm's end,
+                        // [rows_loc, T * K).  x3_bnd: the row bounds by place in that order (the tensor-core kernels read
+                        // an expert's [x3_bnd[place], x3_bnd[place + 1])); x3_pos[e]: expert e's place (e in id order).
+                        m.x3_bnd.resize((size_t) NX + 1);
+                        m.x3_pos.resize((size_t) NX);
+                        int64_t rows_loc = T * K;
+                        if (m.x3_help_e.empty()) {
+                            m.off[0] = 0;
+                            for (int32_t e = 0; e < NX; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
+                            std::copy(m.off.begin(), m.off.end(), m.x3_bnd.begin());
+                            for (int32_t e = 0; e < NX; ++e) m.x3_pos[(size_t) e] = e;
+                        } else {
+                            int32_t place = 0, row = 0;
+                            auto put = [&](int32_t e) {
+                                m.x3_pos[(size_t) e] = place;
+                                m.x3_bnd[(size_t) place++] = row;
+                                m.off[(size_t) e] = row;
+                                row += m.cnt[(size_t) e];
+                            };
+                            for (int32_t e = 0; e < NX; ++e)
+                                if (!m.x3_is_help[(size_t) e]) put(e);
+                            rows_loc = row;
+                            for (const int32_t e : m.x3_help_e) put(e);
+                            m.x3_bnd[(size_t) NX] = row;
+                            m.off[(size_t) NX] = row;
+                        }
                         {
                             std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
                             for (int64_t i = 0; i < T * K; ++i) {
@@ -3558,15 +3938,182 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                         if (grp_mapped) {   // the offsets behind the three tables (init sized the buffer for them)
-                            std::memcpy(m.grp_host + 3 * m.grp_tk, m.off.data(), ((size_t) NX + 1) * sizeof(int32_t));
+                            std::memcpy(m.grp_host + 3 * m.grp_tk, m.x3_bnd.data(), ((size_t) NX + 1) * sizeof(int32_t));
                             copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
                             copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
                             copy_i32(m.x3_bounds, m.grp_dev + 3 * m.grp_tk, (int64_t) NX + 1, m.cs);
                         } else if (m.up_ring.h2d(m.slot_dev, slot_h, (size_t) T * K * 4, m.cs) != cudaSuccess ||
                                    m.up_ring.h2d(m.src_dev, src_h, (size_t) T * K * 4, m.cs) != cudaSuccess ||
-                                   m.up_ring.h2d(m.x3_bounds, m.off.data(), ((size_t) NX + 1) * 4, m.cs) != cudaSuccess) {
+                                   m.up_ring.h2d(m.x3_bounds, m.x3_bnd.data(), ((size_t) NX + 1) * 4, m.cs) != cudaSuccess) {
                             err = "prefill: the routing tables' upload failed";
                             return false;
+                        }
+                        // ---- the helper GPU's share (x3_help): its table to host memory, then its work - the inputs, its
+                        // experts in id order over its streams (each expert's launches exactly as this GPU's loop below
+                        // would make them), the rows back to host memory in batches of at most its chunk's rows - and
+                        // this GPU's copy of them into Dm[rows_loc, T * K) on a stream of its own (the combine waits)
+                        const int64_t rows_help = T * K - rows_loc;
+                        if (!m.x3_help_e.empty()) {
+                            X3Help& H = *m.xh;
+                            const int32_t nh = (int32_t) m.x3_help_e.size();
+                            int32_t* const htok = H.h_tab;                          // its rows' tokens
+                            int32_t* const hbnd = H.h_tab + T * K;                  // its experts' row bounds, from 0
+                            int32_t* const hpair = H.h_tab + X3Help::pair_at(T);    // sums: its rows' routed pairs
+                            std::memcpy(htok, src_h + rows_loc, (size_t) rows_help * sizeof(int32_t));
+                            for (int32_t i = 0; i < nh; ++i) hbnd[i] = m.off[(size_t) m.x3_help_e[(size_t) i]] - (int32_t) rows_loc;
+                            hbnd[nh] = (int32_t) rows_help;
+                            if (H.sums)
+                                for (int64_t i = 0; i < T * K; ++i)
+                                    if (const int32_t p = slot_h[(size_t) i]; p >= rows_loc) hpair[p - rows_loc] = (int32_t) i;
+                            const x3::ExpertLayout& HL = m.x3->lay[(size_t) l];
+                            {
+                                const core::OnDevice od(H.dev);
+                                const bool h_tc = x3::device_ok();
+                                int32_t* const dtok = H.b.tab;
+                                int32_t* const dbnd = H.b.tab + T * K;
+                                int32_t* const dpair = H.b.tab + X3Help::pair_at(T);
+                                // the MoE input slice by slice as each lands in host memory, then the rest (ev_x: all of it)
+                                bool in_ok = true;
+                                for (int j = 0; j < H.slices && in_ok; ++j) {
+                                    const int64_t t0 = T * j / H.slices, t1 = T * (j + 1) / H.slices;
+                                    in_ok = cudaStreamWaitEvent(H.s[0], H.ev_xs[j], 0) == cudaSuccess;
+                                    if (j == 0) H.prof_h(0, H.s[0]);
+                                    in_ok = in_ok && (t1 == t0 || cudaMemcpyAsync(H.b.x + (size_t) t0 * N, H.h_x + (size_t) t0 * N,
+                                                                                  (size_t) (t1 - t0) * N * 4, cudaMemcpyHostToDevice,
+                                                                                  H.s[0]) == cudaSuccess);
+                                }
+                                in_ok = in_ok && cudaStreamWaitEvent(H.s[0], H.ev_x, 0) == cudaSuccess &&
+                                    cudaMemcpyAsync(dtok, htok, (size_t) rows_help * 4, cudaMemcpyHostToDevice, H.s[0]) == cudaSuccess &&
+                                    cudaMemcpyAsync(dbnd, hbnd, ((size_t) nh + 1) * 4, cudaMemcpyHostToDevice, H.s[0]) == cudaSuccess &&
+                                    (!H.sums || (cudaMemcpyAsync(dpair, hpair, (size_t) rows_help * 4, cudaMemcpyHostToDevice, H.s[0]) == cudaSuccess &&
+                                                 cudaMemcpyAsync(H.b.wk, H.h_w, (size_t) T * K * 4, cudaMemcpyHostToDevice, H.s[0]) == cudaSuccess &&
+                                                 cudaMemsetAsync(H.b.sum, 0, (size_t) T * N * 4, H.s[0]) == cudaSuccess));
+                                H.prof_h(1, H.s[0]);
+                                if (!in_ok || cudaEventRecord(H.ev_in, H.s[0]) != cudaSuccess) {
+                                    err = std::string("prefill: the EXL3 helper's inputs: ") + cudaGetErrorString(cudaGetLastError());
+                                    return false;
+                                }
+                                for (int q = 1; q < H.ns; ++q) cudaStreamWaitEvent(H.s[q], H.ev_in, 0);
+                                // a batch of its rows - experts [i0, i1), rows [base, end) - is in its row buffer: sent back
+                                // (rows), or added into the per-token sums expert by expert in id order (sums), both on
+                                // s_out; then the buffers are free again
+                                auto flush = [&](int32_t i0, int32_t i1, int64_t base, int64_t end) {
+                                    for (int q = 0; q < H.ns; ++q) {
+                                        cudaEventRecord(H.ev_q[q], H.s[q]);
+                                        cudaStreamWaitEvent(H.s_out, H.ev_q[q], 0);
+                                    }
+                                    if (H.sums) {
+                                        for (int32_t i = i0; i < i1; ++i) {
+                                            const int64_t r0 = hbnd[i], ne = hbnd[i + 1] - hbnd[i];
+                                            peer_scatter_add(H.b.sum, H.b.rows + (size_t) (r0 - base) * N, H.b.wk, dpair + r0, ne,
+                                                             H.s_out);
+                                        }
+                                    } else {
+                                        cudaMemcpyAsync(H.h_rows + (size_t) base * N, H.b.rows, (size_t) (end - base) * N * 4,
+                                                        cudaMemcpyDeviceToHost, H.s_out);
+                                    }
+                                    cudaEventRecord(H.ev_flush, H.s_out);
+                                    for (int q = 0; q < H.ns; ++q) cudaStreamWaitEvent(H.s[q], H.ev_flush, 0);
+                                    ++H.batches;
+                                };
+                                int64_t base = 0;
+                                int32_t batch_i0 = 0;
+                                int q_next_h = 0;
+                                for (int32_t i = 0; i < nh; ++i) {
+                                    const int32_t e = m.x3_help_e[(size_t) i];
+                                    const int32_t ne = m.cnt[(size_t) e];
+                                    const int64_t r0 = (int64_t) m.off[(size_t) e] - rows_loc;   // its first row of the helper's
+                                    if (r0 + ne - base > H.T) {   // (an expert has at most T rows: it fits an empty batch)
+                                        flush(batch_i0, i, base, r0);
+                                        base = r0;
+                                        batch_i0 = i;
+                                    }
+                                    const int q = q_next_h;
+                                    q_next_h = q_next_h + 1 == H.ns ? 0 : q_next_h + 1;
+                                    const cudaStream_t sq = H.s[q];
+                                    const uint8_t* blob = m.x3->help(l, e);
+                                    const int64_t lr = r0 - base;   // its first row in the batch's buffers
+                                    if (h_tc && ne <= m.x3->light_rows) {
+                                        x3::SetArgs sa;
+                                        sa.wbase = blob;
+                                        sa.lay = HL;
+                                        sa.n_exp = 1;
+                                        sa.bounds = dbnd + i;   // [r0, r0 + ne)
+                                        sa.row0 = (int) r0;
+                                        sa.max_rows = ne;
+                                        sa.n_embd = (int) N;
+                                        sa.n_ff = 640;
+                                        x3::set_gate_up(sa, H.b.x, (int) N, dtok + r0, H.b.hh + (size_t) lr * 640, 640, sq);
+                                        x3::set_down(sa, H.b.hh + (size_t) lr * 640, 640, H.b.rows + (size_t) lr * N, (int) N, sq);
+                                    } else {
+                                        auto mat = [&](int r) {
+                                            x3::Mat mm;
+                                            mm.trellis = (const uint32_t*) (blob + HL.trellis[r]);
+                                            mm.suh = (const uint16_t*) (blob + HL.suh[r]);
+                                            mm.svh = (const uint16_t*) (blob + HL.svh[r]);
+                                            mm.k = r < 2 ? (int) N : 640;
+                                            mm.n = r < 2 ? 640 : (int) N;
+                                            mm.k2 = HL.k2[r];
+                                            mm.cb = HL.cb;
+                                            return mm;
+                                        };
+                                        const x3::Mat mg = mat(0), mu = mat(1), md = mat(2);
+                                        uint16_t* wg = H.b.dq[q];
+                                        uint16_t* wu = wg + (size_t) 640 * N;
+                                        uint16_t* wd = wg + (size_t) 1280 * N;
+                                        uint16_t* X16 = H.b.x16 + (size_t) lr * N;
+                                        float* GUe = H.b.gu + (size_t) lr * 1280;
+                                        uint16_t* Hh = H.b.hh + (size_t) lr * 640;
+                                        float* Y = H.b.rows + (size_t) lr * N;
+                                        x3::reconstruct_inner_rows(mg, wg, sq);
+                                        x3::reconstruct_inner_rows(mu, wu, sq);
+                                        x3::rows_rot_f16(H.b.x, (int) N, dtok + r0, ne, (int) N, mg.suh, X16, (int) N, sq);
+                                        H.gemm[q]->f16(X16, wg, GUe, ne, 640, N, 1280);
+                                        x3::rows_rot_f16(H.b.x, (int) N, dtok + r0, ne, (int) N, mu.suh, X16, (int) N, sq);
+                                        H.gemm[q]->f16(X16, wu, GUe + 640, ne, 640, N, 1280);
+                                        x3::gu_epilogue(GUe, 1280, ne, 640, mg.svh, mu.svh, md.suh, 0.0f, Hh, 640, sq);
+                                        x3::reconstruct_inner_rows(md, wd, sq);
+                                        H.gemm[q]->f16(Hh, wd, Y, ne, N, 640, N);
+                                        x3::rows_rot_out(Y, (int) N, ne, (int) N, md.svh, sq);
+                                    }
+                                }
+                                flush(batch_i0, nh, base, rows_help);
+                                H.prof_h(2, H.s_out);
+                                bool back_ok = true;
+                                if (H.f16) {   // (the row buffer is free now: the sums' FP16 image goes there)
+                                    uint16_t* s16 = reinterpret_cast<uint16_t*>(H.b.rows);
+                                    sums_to_f16(H.b.sum, s16, T * N, H.s_out);
+                                    back_ok = cudaMemcpyAsync(H.h_sum16, s16, (size_t) T * N * 2, cudaMemcpyDeviceToHost,
+                                                              H.s_out) == cudaSuccess;
+                                } else if (H.sums) {
+                                    back_ok = cudaMemcpyAsync(H.h_sum, H.b.sum, (size_t) T * N * 4, cudaMemcpyDeviceToHost,
+                                                              H.s_out) == cudaSuccess;
+                                }
+                                H.prof_h(3, H.s_out);
+                                if (!back_ok || cudaEventRecord(H.ev_done, H.s_out) != cudaSuccess) {
+                                    err = std::string("prefill: the EXL3 helper's experts: ") + cudaGetErrorString(cudaGetLastError());
+                                    return false;
+                                }
+                            }
+                            // this GPU copies them into Dm's tail beside its own experts (the combine reads Dm rows below
+                            // rows_loc only): the rows - or, with STRATA_EXL3_PF_HELP_SUMCOPY=1, the sums where the tail
+                            // holds T rows.  By default its combine reads the sums from host memory itself: measured, the
+                            // copy beside this GPU's experts made a 7K part 0.4-0.5 s slower (4K 0.15 s).
+                            m.x3_sum_src = nullptr;
+                            m.x3_back = !x3_check && (!H.sums || (H.sum_copy && rows_help >= T));
+                            if (m.x3_back) {
+                                cudaStreamWaitEvent(H.in_stream, H.ev_done, 0);
+                                copy_f32_wide(m.Dm + (size_t) rows_loc * N, H.sums ? H.h_sum : H.h_rows,
+                                              (H.sums ? T : rows_help) * N, H.in_stream);
+                                cudaEventRecord(H.ev_back, H.in_stream);
+                                if (H.sums) m.x3_sum_src = m.Dm + (size_t) rows_loc * N;
+                            } else if (H.sums && !H.f16) {
+                                m.x3_sum_src = H.h_sum;
+                            }
+                            x3_sums_now = H.sums && !x3_check;
+                            x3_rows_loc = rows_loc;
+                            stats_.experts_help += nh;
+                            stats_.rows_help += rows_help;
                         }
                         // the layer's streamed entries [kq, kend) in id order; one the routing did not pick only gives
                         // its slot back
@@ -3596,6 +4143,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t ne = m.cnt[(size_t) e], o0 = m.off[(size_t) e];
                             if (ne == 0) continue;
                             ++n_order;
+                            // the helper GPU's (above; STRATA_EXL3_PF_HELP_CHECK: streamed and computed here as well)
+                            if (!m.x3_help_e.empty() && m.x3_is_help[(size_t) e] && !x3_check) continue;
                             release_to(e);
                             const int q = q_next;
                             q_next = q_next + 1 == NS ? 0 : q_next + 1;
@@ -3625,7 +4174,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 sa.wbase = blob;
                                 sa.lay = XL;
                                 sa.n_exp = 1;
-                                sa.bounds = m.x3_bounds + e;   // [off[e], off[e + 1])
+                                sa.bounds = m.x3_bounds + m.x3_pos[(size_t) e];   // [off[e], off[e] + ne)
                                 sa.row0 = o0;
                                 sa.max_rows = ne;
                                 sa.n_embd = (int) N;
@@ -3682,6 +4231,66 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (x3::launch_errors() != x3_err0) {
                             err = "prefill: an EXL3 expert kernel did not launch at layer " + std::to_string(l) + " (above)";
                             return false;
+                        }
+                        // the helper's rows are in Dm before the combine (without helper experts this layer: its input
+                        // copy is done before the next layer writes `mixed`)
+                        if (x3_help) {
+                            X3Help& H = *m.xh;
+                            if (m.x3_help_e.empty()) {
+                                cudaStreamWaitEvent(m.cs, H.ev_x, 0);
+                            } else if (!x3_check) {
+                                H.prof_wait(m.cs, 0);
+                                cudaStreamWaitEvent(m.cs, m.x3_back ? H.ev_back : H.ev_done, 0);
+                                H.prof_wait(m.cs, 1);
+                            } else {
+                                // STRATA_EXL3_PF_HELP_CHECK=1: the helper's rows against this GPU's own, bit for bit, per
+                                // kernel kind (the tensor-core kernels up to light_rows rows an expert, cuBLAS above);
+                                // the combine reads this GPU's
+                                if (cudaEventSynchronize(H.ev_done) != cudaSuccess || cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                                    err = std::string("prefill: the EXL3 helper check: ") + cudaGetErrorString(cudaGetLastError());
+                                    return false;
+                                }
+                                std::vector<float> mine((size_t) rows_help * N);
+                                if (cudaMemcpy(mine.data(), m.Dm + (size_t) rows_loc * N, mine.size() * 4, cudaMemcpyDeviceToHost) !=
+                                    cudaSuccess) {
+                                    err = "prefill: the EXL3 helper check's copy failed";
+                                    return false;
+                                }
+                                const int32_t* hbnd = H.h_tab + T * K;
+                                for (size_t i = 0; i < m.x3_help_e.size(); ++i) {
+                                    const int64_t r0 = hbnd[i], r1 = hbnd[i + 1];
+                                    const int kind = r1 - r0 <= m.x3->light_rows ? 0 : 1;
+                                    for (int64_t r = r0; r < r1; ++r) {
+                                        const float* a = mine.data() + (size_t) r * N;
+                                        const float* b = H.h_rows + (size_t) r * N;
+                                        ++H.ck_rows[kind];
+                                        if (std::memcmp(a, b, (size_t) N * 4) == 0) { ++H.ck_same[kind]; continue; }
+                                        for (int64_t c = 0; c < N; ++c)
+                                            H.ck_max[kind] = std::max(H.ck_max[kind], (double) std::fabs(a[c] - b[c]));
+                                    }
+                                }
+                                if (l == LE - 1) {
+                                    std::fprintf(stderr, "strata prefill: EXL3 helper check, chunk at %lld (%lld tokens): rows bit "
+                                                         "for bit the same - tensor-core kernels %lld of %lld, cuBLAS %lld of %lld; "
+                                                         "largest difference %.3g / %.3g\n", (long long) p0, (long long) T,
+                                                 (long long) H.ck_same[0], (long long) H.ck_rows[0], (long long) H.ck_same[1],
+                                                 (long long) H.ck_rows[1], H.ck_max[0], H.ck_max[1]);
+                                    H.ck_rows[0] = H.ck_rows[1] = H.ck_same[0] = H.ck_same[1] = 0;
+                                    H.ck_max[0] = H.ck_max[1] = 0.0;
+                                }
+                            }
+                            if (H.prof && l == LE - 1) {   // STRATA_EXL3_PF_HELP_PROFILE: the chunk's sums, per layer
+                                H.prof_read((int) (l & 1));
+                                const double nl = (double) std::max<int64_t>(1, H.prof_layers);
+                                std::fprintf(stderr, "strata prefill: EXL3 helper profile, chunk at %lld (%lld tokens), %lld "
+                                                     "layers, ms a layer: input copy %.2f; helper inputs %.2f, experts %.2f, "
+                                                     "back %.2f, span %.2f; this GPU's wait for it %.2f (%.0f ms in all)\n",
+                                             (long long) p0, (long long) T, (long long) H.prof_layers, H.prof_ms[0] / nl,
+                                             H.prof_ms[1] / nl, H.prof_ms[2] / nl, H.prof_ms[3] / nl, H.prof_ms[4] / nl,
+                                             H.prof_ms[5] / nl, H.prof_ms[5]);
+                                std::fill(std::begin(H.prof_ms), std::end(H.prof_ms), 0.0);
+                                H.prof_layers = 0;
+                            }
                         }
                     } else if (fused_l) {
                         if (static bool said = false; !said) {
@@ -4752,6 +5361,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum16, m.pp->back_at, m.bo, T, m.cs);
                     else if (peer_now && m.pp->sums)
                         moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum, m.pp->back_at, m.bo, T, m.cs);
+                    else if (x3_sums_now && m.xh->f16)   // --exl3: the helper GPU's per-token sums in FP16 (host memory)
+                        moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.xh->h_sum16, x3_rows_loc, m.bo, T, m.cs);
+                    else if (x3_sums_now)   // --exl3: the helper GPU's per-token sums (copied into Dm's tail, or host memory)
+                        moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.x3_sum_src, x3_rows_loc, m.bo, T, m.cs);
                     else
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs,
                                     use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);

@@ -41,6 +41,8 @@ struct PrefillStats {
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
     double ms_ple = 0;
+    int64_t experts_help = 0;       ///< --exl3: expert-layer groups the helper GPU computed (Prefill::bind_exl3_help)
+    int64_t rows_help = 0;          ///< ...their routed rows
 };
 
 /// An --exl3 model's routed experts for the prompt path (docs/EXL3.md): every expert of every layer is one blob in host
@@ -49,6 +51,12 @@ struct PrefillStats {
 struct Exl3PromptExperts {
     std::function<const uint8_t*(int64_t layer, int64_t e)> host;   ///< the expert's blob in host memory
     std::function<const uint8_t*(int64_t layer, int64_t e)> vram;   ///< its VRAM copy, or null (may be left empty)
+    /// --serve with --exl3-helper-tier: its copy in the helper tier on another GPU (`help_device`, which this one has no
+    /// peer access to), or null (may be left empty).  While Prefill::bind_exl3_help has the helper bound, a chunk of at
+    /// most the bound size computes those experts' rows there instead of streaming them (`vram` wins for an expert both
+    /// name).
+    std::function<const uint8_t*(int64_t layer, int64_t e)> help;
+    int help_device = -1;
     std::vector<kernels::exl3::ExpertLayout> lay;                    ///< per layer: the blob's parts
     std::vector<uint64_t> blob;                                      ///< per layer: an expert's bytes
     uint64_t max_blob = 0;
@@ -255,6 +263,20 @@ public:
     /// `init` and before any `bytes_needed` (the ring's slot is the model's expert, not a pack's blob): one EXL3 model a
     /// process.  The GGUF experts' code paths are not changed.
     void set_exl3(const Exl3PromptExperts* x);
+    /// --exl3 with Exl3PromptExperts::help (--serve, the helper card): the helper GPU's streams, cuBLAS handles and the
+    /// pinned host buffers the two cards pass the layers' inputs and rows through, for chunks of up to `max_tokens`
+    /// tokens - made once, after `init` (no graph runs then).  Their device buffers come per prompt (bind_exl3_help).
+    /// false and `err` when something cannot be had; the path then runs without the helper, as before.
+    bool init_exl3_help(int64_t max_tokens, std::string& err);
+    /// The helper GPU's device bytes bind_exl3_help needs for chunks of up to `chunk` tokens (0 before init_exl3_help).
+    uint64_t exl3_help_bytes(int64_t chunk) const;
+    /// Lays the helper's device buffers out in `region` (`bytes` on the helper GPU: the helper tier's lent slots) for
+    /// chunks of up to `chunk` tokens (at most init_exl3_help's).  Until it is unbound (region null), every chunk of at
+    /// most that many tokens has the experts Exl3PromptExperts::help names computed on the helper GPU (their rows passed
+    /// back through host memory) and streams the rest.  Between prompts only (both GPUs' prompt streams idle).
+    bool bind_exl3_help(void* region, uint64_t bytes, int64_t chunk, std::string& err);
+    /// The chunk size the helper is bound for (0: unbound, or no helper).
+    int64_t exl3_help_chunk() const;
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
     /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.
