@@ -4,19 +4,21 @@
 //
 //   exl3_lane_test       run everything; exit 0 when every case passes
 //
+// The bitrate is k2 = 2 K throughout: K 1..8 and exllamav3 1.6's half-integer K 1.5 / 2.5 / 3.5 (k2 3 / 5 / 7).
 // 1. Layout: the oracle's tile order and windows (exl3_decode_tile through an identity table gives the raw states)
-//    against the lane's bit model (the window ending at bit (p + 1 + 256) K of the tile's MSB-first word ring, p the
-//    tensor-core step at (row, column)), K 1..8, every position of 64 random tiles each.
+//    against the lane's bit model (the window ending at bit floor((p + 1) k2 / 2) + 256 K of the tile's MSB-first
+//    word ring, read bit by bit, p the tensor-core step at (row, column)), every bitrate, every position of 64 random
+//    tiles each.
 // 2. Tile by tile: one-hot activations through every tier's band kernel (1, 2, 3 and 8 at once) and split-K pieces
 //    read each weight's byte sum s alone; fp16(fma(1024 + s, k_inv, k_bias)) must be the oracle's decoded weight and s
-//    the byte sum of the oracle's state, for every weight of every tile, K 1..8.
+//    the byte sum of the oracle's state, for every weight of every tile, every bitrate.
 // 3. Exactness (ported from project-maya's tests/exl3_test.cu): every tier against the exact model (the vector tiers
 //    bit for bit, the scalar tier - no FMA - within rounding), several activations at once against one call each,
 //    split-K pieces against bands, the 128-point transform, the prompt GEMM.
 // 4. The whole product against the oracle's folded GEMV (fp16 weights there, so equal up to the fp16 rounding of each
 //    weight), on the Flash's expert shapes: gate/up 2560 -> 640, down 640 -> 2560.
-// 5. With --real <EXL3 model dir> (instead of 1-4): 33 routed-expert matrices of the model (layers 0, 23, 47 and the
-//    MTP layer) through the checks above.
+// 5. With --real <EXL3 model dir> (instead of 1-4): 51 routed-expert matrices of the model (layers 0, 1, 8, 23, 47 and
+//    the MTP layer - an SC 4.05's K 3 / 3.5 / 5 layers among them) through the checks above.
 #include "strata/artifact/exl3_model.hpp"
 #include "strata/kernels/cpu/exl3.hpp"
 #include "strata/kernels/cpu/exl3_lane.hpp"
@@ -74,21 +76,22 @@ struct HostMat {
         m.svh = svh.data();
         m.k = k;
         m.n = n;
-        m.K = K;
+        m.k2 = k2;
         return m;
     }
-    int k = 0, n = 0, K = 0;
+    int k = 0, n = 0, k2 = 0;
 };
-HostMat make_mat(int k, int n, int K) {
+HostMat make_mat(int k, int n, int k2) {
     HostMat h;
-    h.tr = rand_words((size_t) (k / 16) * (n / 16) * 8 * K);
+    h.tr = rand_words((size_t) (k / 16) * (n / 16) * 4 * k2);
     h.suh = rand_scales(k);
     h.svh = rand_scales(n);
     h.k = k;
     h.n = n;
-    h.K = K;
+    h.k2 = k2;
     return h;
 }
+std::string klab(int k2) { return "K" + strata::exl3_k_label(k2); }
 
 const char* tier_name(int tier) { return tier == 2 ? "avx512" : tier == 1 ? "avx2" : "scalar"; }
 
@@ -104,9 +107,10 @@ const StepMap& step_map() {
     static const StepMap s;
     return s;
 }
-// the state at (r, c): the 16-bit window that ends at bit (p + 1 + 256) K of the tile's MSB-first bit ring, bit by bit
-uint32_t model_state(const uint32_t* tile, int K, int r, int c) {
-    const int bits = 256 * K, end = (step_map().step[r][c] + 1 + 256) * K;
+// the state at (r, c): the 16-bit window that ends at bit floor((p + 1) k2 / 2) + 256 K of the tile's MSB-first bit
+// ring ((p + 1 + 256) K for an integer K; KA- and (KA + 1)-bit steps alternating for a half-integer one), bit by bit
+uint32_t model_state(const uint32_t* tile, int k2, int r, int c) {
+    const int bits = 128 * k2, end = ((step_map().step[r][c] + 1) * k2) / 2 + bits;
     uint32_t st = 0;
     for (int q = end - 16; q < end; ++q) {
         const int b = q % bits;
@@ -123,27 +127,27 @@ float exact_band_col(const cpu::Exl3Part& m, const float* xh, int col, int ks0, 
     const int t = col / 16, c = col % 16;
     float a = 0.0f;
     for (int ks = ks0; ks < ks1; ++ks) {
-        const uint32_t* tile = m.trellis + ((size_t) ks * (m.n / 16) + t) * 8 * m.K;
-        for (int r = 0; r < 16; ++r) a = std::fma((float) byte_sum(model_state(tile, m.K, r, c)), xh[ks * 16 + r], a);
+        const uint32_t* tile = m.trellis + ((size_t) ks * (m.n / 16) + t) * 4 * m.k2;
+        for (int r = 0; r < 16; ++r) a = std::fma((float) byte_sum(model_state(tile, m.k2, r, c)), xh[ks * 16 + r], a);
     }
     return a;
 }
 
 // ---------------------------------------------------------------- 1. the layout against the oracle
 // exl3_decode_tile with the identity table returns each position's raw 16-bit window, in row-major tile order
-void test_layout(int K) {
+void test_layout(int k2) {
     std::vector<uint16_t> ident(1u << 16);
     for (uint32_t w = 0; w < (1u << 16); ++w) ident[w] = (uint16_t) w;
     constexpr int kTiles = 64;
     size_t diff = 0;
     for (int it = 0; it < kTiles; ++it) {
-        const std::vector<uint32_t> tile = rand_words((size_t) 8 * K);
+        const std::vector<uint32_t> tile = rand_words((size_t) 4 * k2);
         uint16_t got[256];
-        cpu::exl3_decode_tile((const uint16_t*) tile.data(), K, ident.data(), got);
+        cpu::exl3_decode_tile_k2((const uint16_t*) tile.data(), k2, ident.data(), got);
         for (int r = 0; r < 16; ++r)
-            for (int c = 0; c < 16; ++c) diff += got[r * 16 + c] != (uint16_t) model_state(tile.data(), K, r, c);
+            for (int c = 0; c < 16; ++c) diff += got[r * 16 + c] != (uint16_t) model_state(tile.data(), k2, r, c);
     }
-    report("layout K" + std::to_string(K) + ": oracle windows vs the lane's model", diff == 0,
+    report("layout " + klab(k2) + ": oracle windows vs the lane's model", diff == 0,
            std::to_string(diff) + " of " + std::to_string(kTiles * 256) + " states differ");
 }
 
@@ -154,9 +158,9 @@ uint16_t oracle_weight_from_sum(int s) {
     return f16_from_f32(std::fma(h, f32_from_f16(0x1EEEu), f32_from_f16(0xC931u)));
 }
 
-void test_tiles_vs_oracle(int K) {
+void test_tiles_vs_oracle(int k2) {
     constexpr int k = 256, n = 256;   // 16 slices, 16 tile columns (2 bands)
-    const HostMat h = make_mat(k, n, K);
+    const HostMat h = make_mat(k, n, k2);
     const cpu::Exl3Part m = h.part();
     std::vector<uint16_t> lut(1u << 16), ident(1u << 16);
     cpu::exl3_codebook_lut(cpu::Exl3Codebook::Mul1, lut.data());
@@ -165,10 +169,10 @@ void test_tiles_vs_oracle(int K) {
     std::vector<uint16_t> ow((size_t) k * n), os((size_t) k * n);
     for (int i = 0; i < k / 16; ++i)
         for (int j = 0; j < n / 16; ++j) {
-            const uint16_t* tw = (const uint16_t*) (h.tr.data() + ((size_t) i * (n / 16) + j) * 8 * K);
+            const uint16_t* tw = (const uint16_t*) (h.tr.data() + ((size_t) i * (n / 16) + j) * 4 * k2);
             uint16_t tw_out[256], ts_out[256];
-            cpu::exl3_decode_tile(tw, K, lut.data(), tw_out);
-            cpu::exl3_decode_tile(tw, K, ident.data(), ts_out);
+            cpu::exl3_decode_tile_k2(tw, k2, lut.data(), tw_out);
+            cpu::exl3_decode_tile_k2(tw, k2, ident.data(), ts_out);
             for (int r = 0; r < 16; ++r)
                 for (int c = 0; c < 16; ++c) {
                     ow[(size_t) (i * 16 + r) * n + j * 16 + c] = tw_out[r * 16 + c];
@@ -225,7 +229,7 @@ void test_tiles_vs_oracle(int K) {
                     for (int i = 0; i < cnt; ++i)
                         for (int j = 0; j < n; ++j) check(ks * 16 + r0 + i, j, ap[i][j]);
                 }
-        report(std::string("tiles K") + std::to_string(K) + " " + tier_name(tier) + ": weights vs exl3_decode_tile",
+        report("tiles " + klab(k2) + " " + tier_name(tier) + ": weights vs exl3_decode_tile",
                wdiff == 0 && sdiff == 0 && cmp > 0,
                std::to_string(wdiff) + " weights, " + std::to_string(sdiff) + " sums of " + std::to_string(cmp) +
                    " differ");
@@ -235,8 +239,8 @@ void test_tiles_vs_oracle(int K) {
 // ---------------------------------------------------------------- 3. exactness (project-maya's CPU lane tests)
 // every tier this CPU runs against the exact model: the vector tiers bit for bit, the scalar tier within rounding;
 // every band, the whole slice range and partial ones, 1..11 activations at once (past kExl3CpuMaxN)
-void test_cpu_exact(int k, int n, int K, int max_nt = 11) {
-    const HostMat h = make_mat(k, n, K);
+void test_cpu_exact(int k, int n, int k2, int max_nt = 11) {
+    const HostMat h = make_mat(k, n, k2);
     const cpu::Exl3Part m = h.part();
     const int NT = max_nt;
     std::vector<std::vector<float>> xh;
@@ -269,7 +273,7 @@ void test_cpu_exact(int k, int n, int K, int max_nt = 11) {
                     }
                 }
         }
-    const std::string shape = " k" + std::to_string(k) + " n" + std::to_string(n) + " K" + std::to_string(K);
+    const std::string shape = " k" + std::to_string(k) + " n" + std::to_string(n) + " " + klab(k2);
     for (int tier = 1; tier <= 2; ++tier) {
         if (cmp[tier] == 0) continue;
         report(std::string("exact ") + tier_name(tier) + shape, diff[tier] == 0,
@@ -282,8 +286,8 @@ void test_cpu_exact(int k, int n, int K, int max_nt = 11) {
 }
 
 // several activations at once against one call each: the same bits
-void test_cpu_n(int k, int n, int K) {
-    const HostMat h = make_mat(k, n, K);
+void test_cpu_n(int k, int n, int k2) {
+    const HostMat h = make_mat(k, n, k2);
     const cpu::Exl3Part m = h.part();
     constexpr int NT = 11;   // past kExl3CpuMaxN: two runs
     std::vector<std::vector<float>> xh;
@@ -301,14 +305,14 @@ void test_cpu_n(int k, int n, int K) {
             cpu::exl3_cpu_band_acc_n(m, xp, nt, c0, ks0, ks1, ap);
             for (size_t i = 0; i < (size_t) nt * 128; ++i) diff += std::memcmp(&one[i], &all[i], sizeof(float)) != 0;
         }
-    report("x2..11 at once k" + std::to_string(k) + " n" + std::to_string(n) + " K" + std::to_string(K), diff == 0,
+    report("x2..11 at once k" + std::to_string(k) + " n" + std::to_string(n) + " " + klab(k2), diff == 0,
            std::to_string(diff) + " differ from one call each");
 }
 
 // the split-K pieces (every column, slices [ks0, ks1)) against the bands over the same slices, and several
 // activations at once against one call each: the same bits
-void test_cpu_rows(int k, int n, int K) {
-    const HostMat h = make_mat(k, n, K);
+void test_cpu_rows(int k, int n, int k2) {
+    const HostMat h = make_mat(k, n, k2);
     const cpu::Exl3Part m = h.part();
     constexpr int NT = 11;
     std::vector<std::vector<float>> xh;
@@ -334,7 +338,7 @@ void test_cpu_rows(int k, int n, int K) {
             for (size_t i = 0; i < (size_t) nt * n; ++i) diff += std::memcmp(&one[i], &all[i], sizeof(float)) != 0;
         }
     }
-    report("split-K x1..11 k" + std::to_string(k) + " n" + std::to_string(n) + " K" + std::to_string(K), diff == 0,
+    report("split-K x1..11 k" + std::to_string(k) + " n" + std::to_string(n) + " " + klab(k2), diff == 0,
            std::to_string(diff) + " differ from the bands / one call each");
 }
 
@@ -362,8 +366,8 @@ void test_cpu_had() {
 
 // the prompt path's GEMM (a band decoded once for many activations) against the band kernel: the same sums up to
 // F32 rounding (another order)
-void test_cpu_gemm(int k, int n, int K) {
-    const HostMat h = make_mat(k, n, K);
+void test_cpu_gemm(int k, int n, int k2) {
+    const HostMat h = make_mat(k, n, k2);
     const cpu::Exl3Part m = h.part();
     constexpr int NT = 21;   // 3 tiles of 6 and 3 left over
     std::vector<std::vector<float>> xh;
@@ -393,21 +397,21 @@ void test_cpu_gemm(int k, int n, int K) {
     }
     char buf[64];
     std::snprintf(buf, sizeof buf, "worst %.2e of the band's largest", worst);
-    report("prompt GEMM x21 nb1,2 k" + std::to_string(k) + " n" + std::to_string(n) + " K" + std::to_string(K),
+    report("prompt GEMM x21 nb1,2 k" + std::to_string(k) + " n" + std::to_string(n) + " " + klab(k2),
            worst < 1e-5, buf);
 }
 
 // ---------------------------------------------------------------- 4. the whole product against the oracle
 // y = H(x * suh) W_hat H * svh: the lane (bands, and split-K pieces + band_out) against exl3_folded_gemv, whose weights
 // are rounded to fp16 (the lane keeps them exact in F32): relative RMS error a few 1e-4, as project-maya measured
-void test_product(int k, int n, int K, int tokens) {
-    const HostMat h = make_mat(k, n, K);
+void test_product(int k, int n, int k2, int tokens) {
+    const HostMat h = make_mat(k, n, k2);
     const cpu::Exl3Part m = h.part();
     std::vector<uint16_t> x16((size_t) tokens * k);
     for (auto& v : x16) v = f16_from_f32(std::normal_distribution<float>(0.0f, 1.0f)(g_rng));
     std::vector<float> ref((size_t) tokens * n);
-    cpu::exl3_folded_gemv((const uint16_t*) h.tr.data(), k / 16, n / 16, K, cpu::Exl3Codebook::Mul1, h.suh.data(),
-                          h.svh.data(), x16.data(), tokens, ref.data());
+    cpu::exl3_folded_gemv_k2((const uint16_t*) h.tr.data(), k / 16, n / 16, k2, cpu::Exl3Codebook::Mul1, h.suh.data(),
+                             h.svh.data(), x16.data(), tokens, ref.data());
     std::vector<float> x((size_t) k), xh((size_t) k), band((size_t) n), rows((size_t) n), acc((size_t) n);
     double se = 0.0, sr = 0.0;
     size_t rdiff = 0;
@@ -430,7 +434,7 @@ void test_product(int k, int n, int K, int tokens) {
     char buf[96];
     std::snprintf(buf, sizeof buf, "rel %.2e to the oracle, split-K %zu differ", rel, rdiff);
     report("product " + std::string(tier_name(cpu::exl3_cpu_tier())) + " k" + std::to_string(k) + " n" +
-               std::to_string(n) + " K" + std::to_string(K) + " x" + std::to_string(tokens),
+               std::to_string(n) + " " + klab(k2) + " x" + std::to_string(tokens),
            finite && rel <= 2e-3 && rdiff == 0, buf);
 }
 
@@ -449,14 +453,14 @@ bool load_real(const strata::Exl3Model& model, const std::string& base, HostMat&
         err = base + ": codebook " + std::to_string(L.cb) + ", the lane runs mul1 (2) only";
         return false;
     }
-    if (L.half() || L.ki <= 0 || L.nj <= 0 || L.in() % 128 != 0 || L.out() % 128 != 0) {
+    if (L.ki <= 0 || L.nj <= 0 || L.in() % 128 != 0 || L.out() % 128 != 0) {
         err = base + ": unexpected shape ki " + std::to_string(L.ki) + " nj " + std::to_string(L.nj) + " K " +
               strata::exl3_k_label(L.k2);
         return false;
     }
     h.k = L.in();
     h.n = L.out();
-    h.K = L.k2 / 2;
+    h.k2 = L.k2;
     h.tr.assign((size_t) L.ki * L.nj * L.tile_words() / 2, 0u);
     std::memcpy(h.tr.data(), L.trellis, h.tr.size() * sizeof(uint32_t));
     h.suh.assign(L.suh, L.suh + h.k);
@@ -467,7 +471,7 @@ bool load_real(const strata::Exl3Model& model, const std::string& base, HostMat&
 void test_real_matrix(const std::string& name, const HostMat& h, size_t& n_ok, size_t& n_bad) {
     const int fails0 = g_fail;
     const cpu::Exl3Part m = h.part();
-    const int k = h.k, n = h.n, K = h.K, S = k / 16;
+    const int k = h.k, n = h.n, k2 = h.k2, S = k / 16;
     // windows of every tile against the oracle's
     std::vector<uint16_t> ident(1u << 16), lut(1u << 16);
     for (uint32_t w = 0; w < (1u << 16); ++w) ident[w] = (uint16_t) w;
@@ -475,18 +479,19 @@ void test_real_matrix(const std::string& name, const HostMat& h, size_t& n_ok, s
     size_t sdiff = 0;
     for (int i = 0; i < S; ++i)
         for (int j = 0; j < n / 16; ++j) {
-            const uint32_t* tile = h.tr.data() + ((size_t) i * (n / 16) + j) * 8 * K;
+            const uint32_t* tile = h.tr.data() + ((size_t) i * (n / 16) + j) * 4 * k2;
             uint16_t st[256];
-            cpu::exl3_decode_tile((const uint16_t*) tile, K, ident.data(), st);
+            cpu::exl3_decode_tile_k2((const uint16_t*) tile, k2, ident.data(), st);
             for (int r = 0; r < 16; ++r)
-                for (int c = 0; c < 16; ++c) sdiff += st[r * 16 + c] != (uint16_t) model_state(tile, K, r, c);
+                for (int c = 0; c < 16; ++c) sdiff += st[r * 16 + c] != (uint16_t) model_state(tile, k2, r, c);
         }
     // band 0 weight by weight on every tier: one-hot rows, 3 at a time
     std::vector<uint16_t> ow((size_t) k * 128);
     for (int i = 0; i < S; ++i)
         for (int j = 0; j < 8; ++j) {
             uint16_t tw[256];
-            cpu::exl3_decode_tile((const uint16_t*) (h.tr.data() + ((size_t) i * (n / 16) + j) * 8 * K), K, lut.data(), tw);
+            cpu::exl3_decode_tile_k2((const uint16_t*) (h.tr.data() + ((size_t) i * (n / 16) + j) * 4 * k2), k2, lut.data(),
+                                     tw);
             for (int r = 0; r < 16; ++r)
                 for (int c = 0; c < 16; ++c) ow[(size_t) (i * 16 + r) * 128 + j * 16 + c] = tw[r * 16 + c];
         }
@@ -562,8 +567,8 @@ void test_real_matrix(const std::string& name, const HostMat& h, size_t& n_ok, s
     std::vector<uint16_t> x16((size_t) 2 * k);
     for (auto& v : x16) v = f16_from_f32(std::normal_distribution<float>(0.0f, 1.0f)(g_rng));
     std::vector<float> ref((size_t) 2 * n), y((size_t) n), xf((size_t) k), xhh((size_t) k);
-    cpu::exl3_folded_gemv((const uint16_t*) h.tr.data(), k / 16, n / 16, K, cpu::Exl3Codebook::Mul1, h.suh.data(),
-                          h.svh.data(), x16.data(), 2, ref.data());
+    cpu::exl3_folded_gemv_k2((const uint16_t*) h.tr.data(), k / 16, n / 16, k2, cpu::Exl3Codebook::Mul1, h.suh.data(),
+                             h.svh.data(), x16.data(), 2, ref.data());
     double pse = 0.0, psr = 0.0;
     for (int t = 0; t < 2; ++t) {
         for (int i = 0; i < k; ++i) xf[(size_t) i] = f32_from_f16(x16[(size_t) t * k + i]);
@@ -580,8 +585,9 @@ void test_real_matrix(const std::string& name, const HostMat& h, size_t& n_ok, s
     const bool ok = sdiff == 0 && wdiff == 0 && wcmp > 0 && vec_ok && erel <= 1e-5 && rdiff == 0 && prel <= 2e-3 &&
                     std::isfinite(prel);
     char buf[200];
-    std::snprintf(buf, sizeof buf, "K%d %dx%d: states %zu, weights %zu/%zu, exact %zu/%zu, scalar %.1e, split-K %zu, "
-                  "product %.2e", K, k, n, sdiff, wdiff, wcmp, ediff[1] + ediff[2], ecmp[1] + ecmp[2], erel, rdiff, prel);
+    std::snprintf(buf, sizeof buf, "%s %dx%d: states %zu, weights %zu/%zu, exact %zu/%zu, scalar %.1e, split-K %zu, "
+                  "product %.2e", klab(k2).c_str(), k, n, sdiff, wdiff, wcmp, ediff[1] + ediff[2], ecmp[1] + ecmp[2], erel,
+                  rdiff, prel);
     report(name, ok, buf);
     if (g_fail == fails0) ++n_ok;
     else ++n_bad;
@@ -593,7 +599,7 @@ int test_real(const std::string& dir) {
         const strata::Exl3Model model(dir);
         size_t n_ok = 0, n_bad = 0;
         std::vector<std::string> bases;
-        for (int layer : {0, 23, 47})
+        for (int layer : {0, 1, 8, 23, 47})
             for (int e : {0, 300, 511})
                 for (const char* role : {"gate_proj", "up_proj", "down_proj"})
                     bases.push_back("model.language_model.layers." + std::to_string(layer) + ".mlp.experts." +
@@ -637,26 +643,31 @@ int main(int argc, char** argv) {
         std::printf("exl3_lane_test: %s (%d failures)\n", g_fail ? "FAIL" : "ok", g_fail);
         return g_fail ? 1 : 0;
     }
+    // every bitrate as k2 = 2 K: K 1..8 and the half-integer K 1.5 / 2.5 / 3.5 (k2 3 / 5 / 7)
+    const int all_k2[] = {2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16};
     std::printf("1. layout: #1764's windows and tile order against the lane's bit model\n");
-    for (int K = 1; K <= 8; ++K) test_layout(K);
+    for (int k2 : all_k2) test_layout(k2);
     std::printf("2. every tier against exl3_decode_tile, weight by weight\n");
-    for (int K = 1; K <= 8; ++K) test_tiles_vs_oracle(K);
+    for (int k2 : all_k2) test_tiles_vs_oracle(k2);
     std::printf("3. exactness\n");
-    for (int K = 1; K <= 8; ++K) test_cpu_exact(512, 256, K);
-    test_cpu_exact(592, 384, 3);   // 37 slices
-    test_cpu_exact(592, 256, 4);
-    test_cpu_exact(2560, 640, 4, 3);   // the Flash's gate/up
-    test_cpu_exact(640, 256, 5, 3);    // the Flash's down (two of its 20 bands)
-    for (int K : {1, 3, 4, 5, 6, 8}) test_cpu_n(512, 256, K);
-    for (int K : {2, 3, 4, 5, 8}) test_cpu_rows(512, 384, K);
-    test_cpu_rows(2560, 640, 4);
-    test_cpu_rows(640, 2560, 5);
-    for (int K : {3, 4, 6}) test_cpu_gemm(768, 256, K);
+    for (int k2 : all_k2) test_cpu_exact(512, 256, k2);
+    test_cpu_exact(592, 384, 6);   // 37 slices
+    test_cpu_exact(592, 384, 7);
+    test_cpu_exact(592, 256, 8);
+    test_cpu_exact(2560, 640, 8, 3);   // the Flash's gate/up
+    test_cpu_exact(2560, 640, 7, 3);   // an SC 4.05's gate/up in layers 1-7
+    test_cpu_exact(640, 256, 10, 3);   // the Flash's down (two of its 20 bands)
+    for (int k2 : {2, 3, 5, 6, 7, 8, 10, 12, 16}) test_cpu_n(512, 256, k2);
+    for (int k2 : {3, 4, 5, 6, 7, 8, 10, 16}) test_cpu_rows(512, 384, k2);
+    test_cpu_rows(2560, 640, 8);
+    test_cpu_rows(2560, 640, 7);
+    test_cpu_rows(640, 2560, 10);
+    for (int k2 : {3, 5, 6, 7, 8, 12}) test_cpu_gemm(768, 256, k2);
     test_cpu_had();
     std::printf("4. the whole product against exl3_folded_gemv (Flash shapes)\n");
-    for (int K = 2; K <= 6; ++K) {
-        test_product(2560, 640, K, 2);
-        test_product(640, 2560, K, 2);
+    for (int k2 : {3, 4, 5, 6, 7, 8, 10, 12}) {
+        test_product(2560, 640, k2, 2);
+        test_product(640, 2560, k2, 2);
     }
     std::printf("exl3_lane_test: %s (%d failures)\n", g_fail ? "FAIL" : "ok", g_fail);
     return g_fail ? 1 : 0;

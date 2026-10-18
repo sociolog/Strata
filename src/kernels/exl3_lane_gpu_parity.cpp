@@ -50,7 +50,7 @@ struct Mat {
         m.svh = svh.data();
         m.k = k;
         m.n = n;
-        m.K = K;
+        m.k2 = 2 * K;   // #1764's kernels beside it take integer K only
         return m;
     }
     strata::kernels::Exl3Mat dev() const {

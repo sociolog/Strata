@@ -7066,7 +7066,12 @@ int main(int argc, char** argv) {
                     L.trellis[r] = (size_t) ((const uint8_t*) p3[r]->trellis - b);
                     L.suh[r] = (size_t) ((const uint8_t*) p3[r]->suh - b);
                     L.svh[r] = (size_t) ((const uint8_t*) p3[r]->svh - b);
-                    L.K[r] = p3[r]->K;
+                    if (p3[r]->k2 & 1) {   // the device kernels' layout carries an integer K (until they take a half)
+                        std::fprintf(stderr, "strata generate: EXL3 layer %lld: K %d.5 on the GPU paths is not supported\n",
+                                     (long long) l, p3[r]->k2 / 2);
+                        return 1;
+                    }
+                    L.K[r] = p3[r]->k2 / 2;
                 }
                 L.cb = 2;   // the tier takes mul1 experts only (checked at its load)
             }

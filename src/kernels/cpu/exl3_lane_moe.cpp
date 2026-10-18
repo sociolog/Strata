@@ -58,11 +58,11 @@ bool Exl3LaneMoe::init(int n_embd, int n_ff, std::string& err) {
 
 bool Exl3LaneMoe::check(const Exl3ExpertJob& j, std::string& err) const {
     auto mat = [&](const Exl3Part& m, int k, int n, const char* what) {
-        if (m.trellis != nullptr && m.suh != nullptr && m.svh != nullptr && m.k == k && m.n == n && m.K >= 1 && m.K <= 8)
+        if (m.trellis != nullptr && m.suh != nullptr && m.svh != nullptr && m.k == k && m.n == n && exl3_lane_k2_ok(m.k2))
             return true;
         err = std::string("EXL3 CPU lane: an expert's ") + what + " matrix is " + std::to_string(m.k) + "x" +
-              std::to_string(m.n) + " K" + std::to_string(m.K) + (m.trellis == nullptr ? " (no data)" : "") +
-              ", expected " + std::to_string(k) + "x" + std::to_string(n) + " K 1..8";
+              std::to_string(m.n) + " k2 " + std::to_string(m.k2) + (m.trellis == nullptr ? " (no data)" : "") +
+              ", expected " + std::to_string(k) + "x" + std::to_string(n) + " K 1..8, 1.5, 2.5 or 3.5 (k2 2..16, 3, 5, 7)";
         return false;
     };
     if (j.nt < 1 || j.nt > MAXT) {
@@ -131,7 +131,7 @@ void Exl3LaneMoe::batch(ExpertPool* pool, const Exl3ExpertJob* jobs, int n) {
         expert_tokens += jobs[i].nt;
         const Exl3Expert& e = jobs[i].e;
         for (const Exl3Part* m : {&e.gate, &e.up, &e.down})
-            bytes += (int64_t) m->k / 16 * (m->n / 16) * 32 * m->K + 2 * (m->k + m->n);
+            bytes += (int64_t) exl3_part_trellis_bytes(*m) + 2 * (m->k + m->n);
     }
     jobs_ = nullptr;
 }

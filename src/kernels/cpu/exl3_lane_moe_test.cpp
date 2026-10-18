@@ -41,15 +41,15 @@ void report(const std::string& what, bool ok, const std::string& detail) {
 struct HostMat {
     std::vector<uint32_t> tr;
     std::vector<uint16_t> suh, svh;
-    int k = 0, n = 0, K = 0;
-    cpu::Exl3Part part() const { return cpu::Exl3Part{tr.data(), suh.data(), svh.data(), k, n, K}; }
+    int k = 0, n = 0, k2 = 0;   // the bitrate as 2 K (odd: K 1.5 / 2.5 / 3.5)
+    cpu::Exl3Part part() const { return cpu::Exl3Part{tr.data(), suh.data(), svh.data(), k, n, k2}; }
 };
-HostMat rand_mat(int k, int n, int K) {
+HostMat rand_mat(int k, int n, int k2) {
     HostMat m;
     m.k = k;
     m.n = n;
-    m.K = K;
-    m.tr.resize((size_t) (k / 16) * (n / 16) * 8 * K);
+    m.k2 = k2;
+    m.tr.resize((size_t) (k / 16) * (n / 16) * 4 * k2);
     for (auto& w : m.tr) w = (uint32_t) g_rng();
     std::uniform_real_distribution<float> u(0.25f, 2.0f);
     m.suh.resize((size_t) k);
@@ -189,13 +189,13 @@ void test_real(const std::string& dir) {
                     HostMat& m = *hm[r];
                     m.k = L.in();
                     m.n = L.out();
-                    m.K = L.int_bits(b + roles[r]);
+                    m.k2 = L.k2;
                     m.tr.resize((size_t) L.ki * L.nj * L.tile_words() / 2);
                     std::memcpy(m.tr.data(), L.trellis, m.tr.size() * 4);
                     m.suh.assign(L.suh, L.suh + m.k);
                     m.svh.assign(L.svh, L.svh + m.n);
                     const cpu::Exl3Part& t = *tp[r];
-                    if (t.k != m.k || t.n != m.n || t.K != m.K) ++diff;
+                    if (t.k != m.k || t.n != m.n || t.k2 != m.k2) ++diff;
                     diff += std::memcmp(t.trellis, m.tr.data(), m.tr.size() * 4) != 0;
                     diff += std::memcmp(t.suh, m.suh.data(), m.suh.size() * 2) != 0;
                     diff += std::memcmp(t.svh, m.svh.data(), m.svh.size() * 2) != 0;
@@ -246,18 +246,20 @@ int main(int argc, char** argv) {
         }
     }
     std::printf("exl3_lane_moe_test: lane tier %d\n", cpu::exl3_cpu_tier());
-    for (int K : {4, 5}) {
+    // gate/up and down bitrates as 2 K: K 4 and 5 (turboderp's 4.05 / 5.05), 3.5 / 5 and 3 / 5 (an SC 4.05's layers
+    // 1-7 and 0)
+    for (const auto& kk : {std::pair<int, int>(8, 8), {10, 10}, {7, 10}, {6, 10}}) {
         std::vector<std::unique_ptr<HostExpert>> keep;
         std::vector<cpu::Exl3Expert> experts;
         for (int i = 0; i < 37; ++i) {   // past kMaxBatch: two batches
             auto h = std::make_unique<HostExpert>();
-            h->g = rand_mat(kH, kFF, K);
-            h->u = rand_mat(kH, kFF, K);
-            h->d = rand_mat(kFF, kH, K);
+            h->g = rand_mat(kH, kFF, kk.first);
+            h->u = rand_mat(kH, kFF, kk.first);
+            h->d = rand_mat(kFF, kH, kk.second);
             experts.push_back(h->view());
             keep.push_back(std::move(h));
         }
-        test_moe(experts, "K" + std::to_string(K) + " x37 experts");
+        test_moe(experts, "K" + strata::exl3_k_label(kk.first) + "/" + strata::exl3_k_label(kk.second) + " x37 experts");
     }
     if (!real.empty()) test_real(real);
     std::printf("exl3_lane_moe_test: %s (%d failures)\n", g_fail ? "FAIL" : "ok", g_fail);

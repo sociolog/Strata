@@ -15,8 +15,9 @@
 // Layout: the trellis is #1764's [k/16][n/16][16 K] int16 array (Exl3Linear::trellis), read as 8 K little-endian
 // uint32 words a tile - the same bytes.  Tile (i, j) holds W_hat rows 16 i.. and columns 16 j..; the stored position
 // t of (row, column) is the tensor-core order of build_perm (src/kernels/cpu/exl3.cpp), the window of t the 16 bits
-// ending at bit (t + 1 + 256) K of the tile's word ring (window16 there).  exl3_lane_test proves both against the
-// oracle tile by tile.  See docs/EXL3.md for the format.
+// ending at bit S(t) + 256 K of the tile's word ring, S(t) = floor((t + 1) k2 / 2) with k2 = 2 K ((t + 1) K for an
+// integer K; exllamav3 1.6's half-integer K 1.5 / 2.5 / 3.5 too - window16 there).  exl3_lane_test proves both
+// against the oracle tile by tile.  See docs/EXL3.md for the format.
 #pragma once
 
 #include <cstddef>
@@ -24,13 +25,18 @@
 
 namespace strata::kernels::cpu {
 
-/// One EXL3 matrix (mul1 codebook): k inputs, n outputs (both multiples of 128), K bits (1..8).
+/// One EXL3 matrix (mul1 codebook): k inputs, n outputs (both multiples of 128), the bitrate as k2 = 2 K: 2..16 even
+/// (K 1..8) or 3 / 5 / 7 (K 1.5 / 2.5 / 3.5).
 struct Exl3Part {
-    const uint32_t* trellis = nullptr;   // [k/16][n/16][8 K] words
+    const uint32_t* trellis = nullptr;   // [k/16][n/16][4 k2] words
     const uint16_t* suh = nullptr;       // FP16 bits [k]
     const uint16_t* svh = nullptr;       // FP16 bits [n]
-    int k = 0, n = 0, K = 0;
+    int k = 0, n = 0, k2 = 0;
 };
+/// Whether the lane takes this bitrate (k2 2..16 even, or 3 / 5 / 7).
+inline bool exl3_lane_k2_ok(int k2) { return (k2 >= 2 && k2 <= 16 && (k2 & 1) == 0) || k2 == 3 || k2 == 5 || k2 == 7; }
+/// Trellis bytes of a matrix: 16 k2 a 16x16 tile.
+inline size_t exl3_part_trellis_bytes(const Exl3Part& m) { return (size_t) (m.k / 16) * (size_t) (m.n / 16) * 16u * (size_t) m.k2; }
 /// Whether a vector kernel runs here (AVX-512F/BW or AVX2 + FMA); the scalar one otherwise.
 bool exl3_cpu_vector();
 /// The kernel the functions below run here: 2 AVX-512 (F, BW), 1 AVX2 + FMA (+ F16C), 0 scalar.  STRATA_FORCE_AVX2=1

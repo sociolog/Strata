@@ -207,7 +207,7 @@ std::vector<float> lane_mv(const HMat& m, const float* x) {
     p.svh = m.svh.data();
     p.k = m.k;
     p.n = m.n;
-    p.K = m.K;
+    p.k2 = 2 * m.K;
     std::vector<float> xh((size_t) m.k), acc((size_t) m.n), y((size_t) m.n);
     const float xs = cpu::exl3_cpu_prepare(p, x, xh.data());
     cpu::exl3_cpu_rows_acc(p, xh.data(), 0, m.k / 16, acc.data());

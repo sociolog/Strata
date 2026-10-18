@@ -217,11 +217,12 @@ Exl3Expert Exl3ExpertRam::expert(int layer, int e) const {
     const LayerFmt& f = lay_[(size_t) layer];
     const uint8_t* b = base_ + f.base + (uint64_t) e * f.blob;
     Exl3Expert x;
-    x.gate = Exl3Part{(const uint32_t*) b, (const uint16_t*) (b + f.suh_g), (const uint16_t*) (b + f.svh_g), f.h, f.ff, f.kg};
+    x.gate = Exl3Part{(const uint32_t*) b, (const uint16_t*) (b + f.suh_g), (const uint16_t*) (b + f.svh_g), f.h, f.ff,
+                      2 * f.kg};
     x.up = Exl3Part{(const uint32_t*) (b + f.up), (const uint16_t*) (b + f.suh_u), (const uint16_t*) (b + f.svh_u), f.h,
-                    f.ff, f.ku};
+                    f.ff, 2 * f.ku};
     x.down = Exl3Part{(const uint32_t*) (b + f.down), (const uint16_t*) (b + f.suh_d), (const uint16_t*) (b + f.svh_d),
-                      f.ff, f.h, f.kd};
+                      f.ff, f.h, 2 * f.kd};
     return x;
 }
 

@@ -19,6 +19,9 @@
 //
 //     exl3_lane_bench [--K 4,5] [--threads 9,10] [--nt 1,2,3,4,8] [--mb 4096] [--reps 5] [--mode own,split,engine,fused]
 //                     [--batch 4] [--kernel rows|bands] [--ram-gbs N]
+//
+// --K: each entry the bitrate of all three matrices (4, or a half-integer 3.5) or gate/up : down (3.5:5 - an SC 4.05's
+// layers 1-7).
 #include "strata/kernels/cpu/exl3_lane.hpp"
 #include "strata/kernels/cpu/exl3_lane_moe.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -74,15 +77,15 @@ std::vector<int> ints(const std::string& s) {
 
 // one expert blob: the three trellises, then the six scale vectors (every part a multiple of 64 bytes)
 struct Layout {
-    int K = 0;
+    int k2gu = 0, k2d = 0;   // the bitrates as 2 K: gate and up, down
     size_t tr_bytes = 0, gate = 0, up = 0, down = 0, suh_g = 0, svh_g = 0, suh_u = 0, svh_u = 0, suh_d = 0, svh_d = 0,
            bytes = 0;
-    explicit Layout(int k) : K(k) {
-        tr_bytes = (size_t) (kH / 16) * (kFF / 16) * 8 * K * 4;   // 204,800 K
+    Layout(int gu, int d) : k2gu(gu), k2d(d) {
+        tr_bytes = (size_t) (kH / 16) * (kFF / 16) * 16 * k2gu;   // 102,400 k2 (gate and up)
         gate = 0;
         up = gate + tr_bytes;
         down = up + tr_bytes;
-        suh_g = down + tr_bytes;
+        suh_g = down + (size_t) (kFF / 16) * (kH / 16) * 16 * k2d;
         svh_g = suh_g + 2 * kH;
         suh_u = svh_g + 2 * kFF;
         svh_u = suh_u + 2 * kH;
@@ -92,7 +95,7 @@ struct Layout {
     }
     cpu::Exl3Part part(const uint8_t* blob, int which) const {   // 0 gate, 1 up, 2 down
         cpu::Exl3Part m;
-        m.K = K;
+        m.k2 = which < 2 ? k2gu : k2d;
         if (which == 0) {
             m.trellis = (const uint32_t*) (blob + gate);
             m.suh = (const uint16_t*) (blob + suh_g);
@@ -394,7 +397,8 @@ bool check_split(const Layout& L, const uint8_t* blobs, int batch, const float* 
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    std::vector<int> Ks = {4, 5}, threads = {9, 10}, nts = {1, 2, 3, 4, 8};
+    std::vector<std::string> Ks = {"4", "5"};
+    std::vector<int> threads = {9, 10}, nts = {1, 2, 3, 4, 8};
     std::vector<std::string> modes = {"own", "split"};
     int mb = 4096, reps = 5, batch = 4;
     bool bands = false;
@@ -402,7 +406,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const bool more = i + 1 < argc;
-        if (a == "--K" && more) Ks = ints(argv[++i]);
+        if (a == "--K" && more) Ks = split(argv[++i]);
         else if (a == "--threads" && more) threads = ints(argv[++i]);
         else if (a == "--nt" && more) nts = ints(argv[++i]);
         else if (a == "--mb" && more) mb = std::atoi(argv[++i]);
@@ -418,11 +422,17 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    for (int K : Ks)
-        if (K < 1 || K > 8) {
-            std::fprintf(stderr, "exl3_lane_bench: K %d is out of range (1..8)\n", K);
+    std::vector<std::pair<int, int>> k2s;   // gate/up, down as 2 K
+    for (const std::string& k : Ks) {
+        const size_t c = k.find(':');
+        const double a = std::atof(k.c_str()), b = c == std::string::npos ? a : std::atof(k.c_str() + c + 1);
+        const int ga = (int) std::lround(2 * a), gd = (int) std::lround(2 * b);
+        if (2 * a != ga || 2 * b != gd || !cpu::exl3_lane_k2_ok(ga) || !cpu::exl3_lane_k2_ok(gd)) {
+            std::fprintf(stderr, "exl3_lane_bench: K %s: 1..8, 1.5, 2.5 or 3.5 (gate/up:down)\n", k.c_str());
             return 2;
         }
+        k2s.emplace_back(ga, gd);
+    }
     for (int nt : nts)
         if (nt < 1 || nt > kMaxT) {
             std::fprintf(stderr, "exl3_lane_bench: nt %d is out of range (1..%d)\n", nt, kMaxT);
@@ -440,8 +450,9 @@ int main(int argc, char** argv) {
         for (auto& v : xs[(size_t) t]) v = nd(arng);
         x[t] = xs[(size_t) t].data();
     }
-    for (int K : Ks) {
-        const Layout L(K);
+    for (const auto& kk : k2s) {
+        const Layout L(kk.first, kk.second);
+        const int K = 100 * kk.first + kk.second;   // a seed
         const size_t E = std::max<size_t>(64, ((size_t) mb << 20) / L.bytes);
         std::unique_ptr<uint8_t[]> mem(new uint8_t[E * L.bytes + 4096]);
         uint8_t* blobs = (uint8_t*) (((uintptr_t) mem.get() + 4095) & ~(uintptr_t) 4095);
@@ -451,7 +462,8 @@ int main(int argc, char** argv) {
             for (size_t e = 0; e < U; ++e) make_blob(L, blobs + e * L.bytes, rng);
             for (size_t e = U; e < E; ++e) std::memcpy(blobs + e * L.bytes, blobs + (e % U) * L.bytes, L.bytes);
         }
-        std::printf("\nEXL3 K%d: %zu experts of %.3f MB (%.0f MB)\n", K, E, L.bytes / 1e6, E * (double) L.bytes / 1e6);
+        std::printf("\nEXL3 K%g/%g: %zu experts of %.3f MB (%.0f MB)\n", kk.first / 2.0, kk.second / 2.0, E, L.bytes / 1e6,
+                    E * (double) L.bytes / 1e6);
         if (std::find(modes.begin(), modes.end(), "split") != modes.end() &&
             !check_split(L, blobs, std::min<int>(batch, (int) E), x, std::min(3, kMaxT), std::max(1, threads[0])))
             return 1;
