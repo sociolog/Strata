@@ -25,8 +25,9 @@ static uint64_t fnv1a(uint64_t h, const void* p, size_t n) {
 static uint64_t check_one(const Exl3Model& m, const std::string& base) {
     Exl3Linear L = m.linear(base);
     std::vector<uint16_t> w((size_t)L.in() * L.out());
-    exl3_reconstruct_weight(L.trellis, L.ki, L.nj, L.bits, (Exl3Codebook)L.cb, L.suh, L.svh, w.data());
-    std::printf("  %s: trellis[%d,%d] K=%d cb=%d -> %dx%d\n", base.c_str(), L.ki, L.nj, L.bits, L.cb,
+    const int bits = L.int_bits(base);
+    exl3_reconstruct_weight(L.trellis, L.ki, L.nj, bits, (Exl3Codebook)L.cb, L.suh, L.svh, w.data());
+    std::printf("  %s: trellis[%d,%d] K=%d cb=%d -> %dx%d\n", base.c_str(), L.ki, L.nj, bits, L.cb,
                 L.in(), L.out());
     return fnv1a(1469598103934665603ull, w.data(), w.size() * 2);
 }
@@ -46,7 +47,8 @@ int main(int argc, char** argv) {
                                    ".mlp.experts." + std::to_string(e) + "." + role;
                 Exl3Linear L = m.linear(base);
                 std::vector<uint16_t> w((size_t)L.in() * L.out());
-                exl3_reconstruct_weight(L.trellis, L.ki, L.nj, L.bits, (Exl3Codebook)L.cb, L.suh, L.svh, w.data());
+                exl3_reconstruct_weight(L.trellis, L.ki, L.nj, L.int_bits(base), (Exl3Codebook)L.cb, L.suh, L.svh,
+                                        w.data());
                 h = fnv1a(h, w.data(), w.size() * 2);
             }
             std::printf("layer %d %s x%d combined fnv1a=%016llx\n", layer, role.c_str(), count,

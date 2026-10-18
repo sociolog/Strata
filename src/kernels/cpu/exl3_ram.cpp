@@ -95,12 +95,10 @@ bool Exl3ExpertRam::open(const std::string& dir, int n_layers, int n_expert, int
                             std::to_string(g.in()) + "x" + std::to_string(g.out()) + ", up " + std::to_string(u.in()) +
                             "x" + std::to_string(u.out()) + ", down " + std::to_string(d.in()) + "x" +
                             std::to_string(d.out()));
-            for (const int k : {g.bits, u.bits, d.bits})
-                if (k < 1 || k > 8) return fail("layer " + std::to_string(l) + " has K " + std::to_string(k));
             LayerFmt& f = lay[(size_t) l];
-            f.kg = g.bits;
-            f.ku = u.bits;
-            f.kd = d.bits;
+            f.kg = g.int_bits(b + "gate_proj (the RAM tier)");
+            f.ku = u.int_bits(b + "up_proj (the RAM tier)");
+            f.kd = d.int_bits(b + "down_proj (the RAM tier)");
             f.h = g.in();
             f.ff = g.out();
             const uint64_t tile_words = (uint64_t) f.h / 16 * (uint64_t) (f.ff / 16);   // 16x16 tiles a matrix

@@ -89,10 +89,13 @@ int main(int argc, char** argv) {
             for (int i = 0; i < k; ++i) {
                 std::string b = prefix + std::to_string(ids[i]);
                 Exl3Linear G = m.linear(b + ".gate_proj"), U = m.linear(b + ".up_proj"), D = m.linear(b + ".down_proj");
-                cpu::exl3_folded_gemv(G.trellis, G.ki, G.nj, G.bits, (cpu::Exl3Codebook) G.cb, G.suh, G.svh, x.data(), 1, g.data());
-                cpu::exl3_folded_gemv(U.trellis, U.ki, U.nj, U.bits, (cpu::Exl3Codebook) U.cb, U.suh, U.svh, x.data(), 1, u.data());
+                cpu::exl3_folded_gemv(G.trellis, G.ki, G.nj, G.int_bits(b + ".gate_proj"), (cpu::Exl3Codebook) G.cb, G.suh,
+                                      G.svh, x.data(), 1, g.data());
+                cpu::exl3_folded_gemv(U.trellis, U.ki, U.nj, U.int_bits(b + ".up_proj"), (cpu::Exl3Codebook) U.cb, U.suh,
+                                      U.svh, x.data(), 1, u.data());
                 for (int j = 0; j < 640; ++j) { float gv = g[j]; h[j] = to_h((gv / (1.0f + std::exp(-gv))) * u[j]); }
-                cpu::exl3_folded_gemv(D.trellis, D.ki, D.nj, D.bits, (cpu::Exl3Codebook) D.cb, D.suh, D.svh, h.data(), 1, d.data());
+                cpu::exl3_folded_gemv(D.trellis, D.ki, D.nj, D.int_bits(b + ".down_proj"), (cpu::Exl3Codebook) D.cb, D.suh,
+                                      D.svh, h.data(), 1, d.data());
                 for (int j = 0; j < 2560; ++j) acc_out[j] += w[i] * d[j];
             }
         };

@@ -27,14 +27,15 @@ int main(int argc, char** argv) {
     try {
         Exl3Model m(argv[1]);
         Exl3Linear L = m.linear(argv[2]);
+        const int bits = L.int_bits(std::string(argv[2]) + " (#1764's GPU reconstruct)");
         const std::string kind = argc > 3 ? argv[3] : "q5k";
         const ggml_type type = kind == "q4k" ? GGML_TYPE_Q4_K : kind == "q8" ? GGML_TYPE_Q8_0 : GGML_TYPE_Q5_K;
         const int ki = L.ki, nj = L.nj;
         const int n_in = ki * 16, n_out = nj * 16;
-        std::printf("%s: in=%d out=%d bits=%d cb=%d\n", argv[2], n_in, n_out, L.bits, L.cb);
+        std::printf("%s: in=%d out=%d bits=%d cb=%d\n", argv[2], n_in, n_out, bits, L.cb);
 
         // ---- 1. reconstruct to fp16 on the GPU (the reconstruct takes DEVICE pointers: upload first)
-        const int words = 256 * L.bits / 16;
+        const int words = 256 * bits / 16;
         uint16_t *d_tr = nullptr, *d_suh = nullptr, *d_svh = nullptr, *d_w = nullptr;
         if (cudaMalloc(&d_tr, (size_t) ki * nj * words * 2) != cudaSuccess ||
             cudaMalloc(&d_suh, (size_t) n_in * 2) != cudaSuccess ||
@@ -43,7 +44,7 @@ int main(int argc, char** argv) {
         (void) cudaMemcpy(d_tr, L.trellis, (size_t) ki * nj * words * 2, cudaMemcpyHostToDevice);
         (void) cudaMemcpy(d_suh, L.suh, (size_t) n_in * 2, cudaMemcpyHostToDevice);
         (void) cudaMemcpy(d_svh, L.svh, (size_t) n_out * 2, cudaMemcpyHostToDevice);
-        exl3_reconstruct_weight(d_tr, ki, nj, L.bits, L.cb, d_suh, d_svh, d_w, nullptr);
+        exl3_reconstruct_weight(d_tr, ki, nj, bits, L.cb, d_suh, d_svh, d_w, nullptr);
         const cudaError_t re = cudaDeviceSynchronize();
         if (re != cudaSuccess) { std::fprintf(stderr, "reconstruct failed: %s\n", cudaGetErrorString(re)); return 1; }
         // the reconstruct is [in][out]; a block quant stores a row of n_in per output
@@ -55,7 +56,7 @@ int main(int argc, char** argv) {
         // ---- 1b. orientation check against the CPU reconstruct
         {
             std::vector<uint16_t> cpu_w((size_t) n_in * n_out);
-            strata::kernels::cpu::exl3_reconstruct_weight(L.trellis, L.ki, L.nj, L.bits,
+            strata::kernels::cpu::exl3_reconstruct_weight(L.trellis, L.ki, L.nj, bits,
                                                           (strata::kernels::cpu::Exl3Codebook) L.cb, L.suh, L.svh,
                                                           cpu_w.data());
             auto h2f = [](uint16_t h) {
@@ -99,7 +100,7 @@ int main(int argc, char** argv) {
         }
         const auto tq1 = std::chrono::high_resolution_clock::now();
         std::printf("requantize to %s: %.1f MiB (trellis %.1f MiB), %.1f s on one thread\n", kind.c_str(),
-                    (double) q.size() / (1 << 20), (double) (L.ki * L.nj * (256 * L.bits / 16) * 2) / (1 << 20),
+                    (double) q.size() / (1 << 20), (double) (L.ki * L.nj * (256 * bits / 16) * 2) / (1 << 20),
                     std::chrono::duration<double>(tq1 - tq0).count());
         (void) cudaFree(d_w);
 
@@ -132,7 +133,7 @@ int main(int argc, char** argv) {
 
         auto t2 = std::chrono::high_resolution_clock::now();
         for (int it = 0; it < iters; ++it)
-            exl3_gemv_f32(d_x, d_suh, d_svh, d_tr, ki, nj, L.bits, L.cb, d_y, st);
+            exl3_gemv_f32(d_x, d_suh, d_svh, d_tr, ki, nj, bits, L.cb, d_y, st);
         (void) cudaDeviceSynchronize();
         auto t3 = std::chrono::high_resolution_clock::now();
         const double exl3_ms = std::chrono::duration<double, std::milli>(t3 - t2).count() / iters;

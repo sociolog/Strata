@@ -189,8 +189,8 @@ void test_real(const std::string& dir) {
                     HostMat& m = *hm[r];
                     m.k = L.in();
                     m.n = L.out();
-                    m.K = L.bits;
-                    m.tr.resize((size_t) L.ki * L.nj * 8 * L.bits);
+                    m.K = L.int_bits(b + roles[r]);
+                    m.tr.resize((size_t) L.ki * L.nj * L.tile_words() / 2);
                     std::memcpy(m.tr.data(), L.trellis, m.tr.size() * 4);
                     m.suh.assign(L.suh, L.suh + m.k);
                     m.svh.assign(L.svh, L.svh + m.n);

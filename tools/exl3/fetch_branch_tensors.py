@@ -73,7 +73,7 @@ def main() -> int:
         ks = []
         for base in BASES:
             t = tensors.get(base + ".trellis")
-            ks.append("%s K=%d cb=%d" % (base.rsplit(".", 1)[-1], t[1][2] * 16 // 256 if t else -1,
+            ks.append("%s K=%g cb=%d" % (base.rsplit(".", 1)[-1], t[1][2] / 16 if t else -1,   # 56 words: K 3.5
                                          2 if base + ".mul1" in tensors else 1))
         print("%-16s %6.1f KiB  %s" % (branch, at / 1024, "; ".join(ks)))
     return 0

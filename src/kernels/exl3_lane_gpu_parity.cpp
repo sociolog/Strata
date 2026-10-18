@@ -103,14 +103,14 @@ bool load_real(const strata::Exl3Model& model, const std::string& base, Mat& m, 
         return false;
     }
     const strata::Exl3Linear L = model.linear(base);
-    if (L.cb != 2 || L.bits < 1 || L.bits > 8 || L.in() % 128 != 0 || L.out() % 128 != 0) {
-        err = base + ": not a mul1 matrix the lane runs";
+    if (L.cb != 2 || L.half() || L.in() % 128 != 0 || L.out() % 128 != 0) {
+        err = base + ": not a mul1 matrix of integer K the lane and #1764's kernels run (K " + strata::exl3_k_label(L.k2) + ")";
         return false;
     }
     m.k = L.in();
     m.n = L.out();
-    m.K = L.bits;
-    m.tr.assign((size_t) L.ki * L.nj * 8 * L.bits, 0u);
+    m.K = L.k2 / 2;
+    m.tr.assign((size_t) L.ki * L.nj * L.tile_words() / 2, 0u);
     std::memcpy(m.tr.data(), L.trellis, m.tr.size() * 4);   // the file's words sit at offsets 2 mod 4
     m.suh.assign(L.suh, L.suh + m.k);
     m.svh.assign(L.svh, L.svh + m.n);

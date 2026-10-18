@@ -449,15 +449,15 @@ bool load_real(const strata::Exl3Model& model, const std::string& base, HostMat&
         err = base + ": codebook " + std::to_string(L.cb) + ", the lane runs mul1 (2) only";
         return false;
     }
-    if (L.bits < 1 || L.bits > 8 || L.ki <= 0 || L.nj <= 0 || L.in() % 128 != 0 || L.out() % 128 != 0) {
+    if (L.half() || L.ki <= 0 || L.nj <= 0 || L.in() % 128 != 0 || L.out() % 128 != 0) {
         err = base + ": unexpected shape ki " + std::to_string(L.ki) + " nj " + std::to_string(L.nj) + " K " +
-              std::to_string(L.bits);
+              strata::exl3_k_label(L.k2);
         return false;
     }
     h.k = L.in();
     h.n = L.out();
-    h.K = L.bits;
-    h.tr.assign((size_t) L.ki * L.nj * 8 * L.bits, 0u);
+    h.K = L.k2 / 2;
+    h.tr.assign((size_t) L.ki * L.nj * L.tile_words() / 2, 0u);
     std::memcpy(h.tr.data(), L.trellis, h.tr.size() * sizeof(uint32_t));
     h.suh.assign(L.suh, L.suh + h.k);
     h.svh.assign(L.svh, L.svh + h.n);

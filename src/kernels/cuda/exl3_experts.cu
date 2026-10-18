@@ -38,7 +38,8 @@ struct Exl3ExpertStore::Impl {
 
 namespace {
 
-Exl3Mat upload(const Exl3Linear& L, std::vector<void*>& allocs, cudaStream_t st, size_t& bytes) {
+Exl3Mat upload(const Exl3Model& m, const std::string& name, std::vector<void*>& allocs, cudaStream_t st, size_t& bytes) {
+    const Exl3Linear L = m.linear(name);
     auto alloc = [&](size_t n, const void* src) -> void* {
         void* p = nullptr;
         if (cudaMalloc(&p, n) != cudaSuccess) { std::fprintf(stderr, "exl3 store: cudaMalloc failed\n"); std::abort(); }
@@ -48,13 +49,14 @@ Exl3Mat upload(const Exl3Linear& L, std::vector<void*>& allocs, cudaStream_t st,
         bytes += n;
         return p;
     };
-    int words = 256 * L.bits / 16;
+    const int bits = L.int_bits(name + " (#1764's EXL3 expert store decodes integer K only; --exl3-lane runs a half-integer K)");
+    int words = 256 * bits / 16;
     size_t tr_bytes = (size_t) L.ki * L.nj * words * 2;
     Exl3Mat M;
     M.trellis = (const uint16_t*) alloc(tr_bytes, L.trellis);
     M.suh = (const uint16_t*) alloc((size_t) L.in() * 2, L.suh);
     M.svh = (const uint16_t*) alloc((size_t) L.out() * 2, L.svh);
-    M.ki = L.ki; M.nj = L.nj; M.bits = L.bits; M.cb = L.cb;
+    M.ki = L.ki; M.nj = L.nj; M.bits = bits; M.cb = L.cb;
     return M;
 }
 
@@ -68,9 +70,9 @@ Exl3ExpertStore::Exl3ExpertStore(const std::string& model_dir, int layer, int n_
     const std::string prefix = "model.language_model.layers." + std::to_string(layer) + ".mlp.experts.";
     for (int e = 0; e < n_experts; ++e) {
         const std::string b = prefix + std::to_string(e);
-        impl_->gate.push_back(upload(m.linear(b + ".gate_proj"), impl_->allocs, st, bytes_));
-        impl_->up.push_back(upload(m.linear(b + ".up_proj"), impl_->allocs, st, bytes_));
-        impl_->down.push_back(upload(m.linear(b + ".down_proj"), impl_->allocs, st, bytes_));
+        impl_->gate.push_back(upload(m, b + ".gate_proj", impl_->allocs, st, bytes_));
+        impl_->up.push_back(upload(m, b + ".up_proj", impl_->allocs, st, bytes_));
+        impl_->down.push_back(upload(m, b + ".down_proj", impl_->allocs, st, bytes_));
     }
 }
 
@@ -435,7 +437,7 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
         int piece = 0;
         for (const char* p : {"gate_proj", "up_proj", "down_proj"}) {
             Exl3Linear L = impl_->model->linear(b + p);
-            const size_t trb = (size_t) L.ki * L.nj * (256 * L.bits / 16) * 2;
+            const size_t trb = (size_t) L.ki * L.nj * (256 * L.int_bits(b + p + " (#1764's EXL3 expert stream decodes integer K only; --exl3-lane runs a half-integer K)") / 16) * 2;
             impl_->stage_bytes = std::max(impl_->stage_bytes, std::max(trb, (size_t) (L.in() + L.out()) * 2));
             for (const size_t n : {trb, (size_t) L.in() * 2, (size_t) L.out() * 2}) {
                 impl_->ram_off[(size_t) l][(size_t) piece++] = off;
@@ -488,7 +490,8 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
     const std::string b0 = "model.language_model.layers.0.mlp.experts.0.";
     auto setup_scratch = [&](std::vector<Impl::Slot>& slots, std::vector<Exl3Mat>& mats, const char* proj) {
         Exl3Linear L = impl_->model->linear(b0 + proj);
-        const size_t trb = (size_t) L.ki * L.nj * (256 * L.bits / 16) * 2;
+        const int bits = L.int_bits(b0 + proj + " (#1764's EXL3 expert stream decodes integer K only; --exl3-lane runs a half-integer K)");
+        const size_t trb = (size_t) L.ki * L.nj * (256 * bits / 16) * 2;
         const size_t suhb = (size_t) L.in() * 2, svhb = (size_t) L.out() * 2;
         slots.resize((size_t) mk); mats.resize((size_t) mk);
         for (int i = 0; i < mk; ++i) {
@@ -499,7 +502,7 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
             mats[(size_t) i].trellis = slots[(size_t) i].tr;
             mats[(size_t) i].suh = slots[(size_t) i].suh;
             mats[(size_t) i].svh = slots[(size_t) i].svh;
-            mats[(size_t) i].ki = L.ki; mats[(size_t) i].nj = L.nj; mats[(size_t) i].bits = L.bits; mats[(size_t) i].cb = L.cb;
+            mats[(size_t) i].ki = L.ki; mats[(size_t) i].nj = L.nj; mats[(size_t) i].bits = bits; mats[(size_t) i].cb = L.cb;
         }
     };
     setup_scratch(impl_->scratch.g, impl_->scratch.gm, "gate_proj");
@@ -518,7 +521,8 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
             const std::string b = "model.language_model.layers." + std::to_string(l) + ".mlp.experts.0.";
             for (const char* p : {"gate_proj", "up_proj", "down_proj"}) {
                 Exl3Linear L = impl_->model->linear(b + p);
-                per_slot += (size_t) L.ki * L.nj * (256 * L.bits / 16) * 2 + (size_t) (L.in() + L.out()) * 2;
+                per_slot += (size_t) L.ki * L.nj * (256 * L.int_bits(b + p + " (#1764's EXL3 expert stream decodes integer K only; --exl3-lane runs a half-integer K)") / 16) * 2 +
+                            (size_t) (L.in() + L.out()) * 2;
             }
         }
         size_t free_b = 0, total_b = 0;
@@ -540,7 +544,8 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
             const char* projs[3] = { "gate_proj", "up_proj", "down_proj" };
             for (int i = 0; i < 3; ++i) {
                 Exl3Linear S = impl_->model->linear(b + projs[i]);
-                const size_t trb = (size_t) S.ki * S.nj * (256 * S.bits / 16) * 2;
+                const int bits = S.int_bits(b + projs[i] + " (#1764's EXL3 expert stream decodes integer K only; --exl3-lane runs a half-integer K)");
+                const size_t trb = (size_t) S.ki * S.nj * (256 * bits / 16) * 2;
                 const size_t suhb = (size_t) S.in() * 2, svhb = (size_t) S.out() * 2;
                 uint16_t *tr = nullptr, *suh = nullptr, *svh = nullptr;
                 alloc(&tr, trb * (size_t) impl_->cache);
@@ -557,7 +562,7 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
                     sl.trb = trb; sl.suhb = suhb; sl.svhb = svhb;
                     Exl3Mat& M = (*ms[i])[(size_t) s];
                     M.trellis = sl.tr; M.suh = sl.suh; M.svh = sl.svh;
-                    M.ki = S.ki; M.nj = S.nj; M.bits = S.bits; M.cb = S.cb;
+                    M.ki = S.ki; M.nj = S.nj; M.bits = bits; M.cb = S.cb;
                 }
             }
         }

@@ -7090,8 +7090,13 @@ int main(int argc, char** argv) {
             // hottest experts by the profile; never evicted, nothing read from the file
             const std::vector<std::pair<int32_t, int32_t>>& ranked = exl3_ranked;
             const Clock::time_point s0 = Clock::now();
-            exl3_stream = std::make_unique<strata::kernels::Exl3ExpertStream>(
-                o.exl3_dir, (int) g.n_embd, (int) g.n_layers, o.expert_cache_given ? o.expert_cache : -1, nullptr, 0);
+            try {
+                exl3_stream = std::make_unique<strata::kernels::Exl3ExpertStream>(
+                    o.exl3_dir, (int) g.n_embd, (int) g.n_layers, o.expert_cache_given ? o.expert_cache : -1, nullptr, 0);
+            } catch (const std::exception& e) {   // e.g. a half-integer K, which #1764's kernels do not decode
+                std::fprintf(stderr, "strata generate: EXL3 GPU share (STRATA_EXL3_OLD_SHARE=1): %s\n", e.what());
+                return 1;
+            }
             const int slots = exl3_stream->slots_per_layer();
             if (slots <= 0) {
                 std::fprintf(stderr, "strata generate: EXL3 GPU share: no VRAM for expert slots - every routed expert "
@@ -7187,7 +7192,7 @@ int main(int argc, char** argv) {
         try {
             exl3_stream = std::make_unique<strata::kernels::Exl3ExpertStream>(o.exl3_dir, (int) g.n_embd,
                                                                              (int) g.n_layers, exl3_slots, nullptr, exl3_ram);
-        } catch (const std::exception& e) {   // e.g. a half-integer bitrate, which the expert kernels do not decode
+        } catch (const std::exception& e) {   // e.g. a half-integer K, which #1764's kernels do not decode
             std::fprintf(stderr, "strata generate: EXL3 expert stream: %s\n", e.what());
             return 1;
         }
