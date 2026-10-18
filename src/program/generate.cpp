@@ -926,7 +926,8 @@ void usage() {
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64; with --exl3-lane 512, or 384 when the\n"
-                 "                       batched path reads the VRAM tier in place; 0 = off)\n"
+                 "                       batched path reads the VRAM tier in place, 320 when the helper card computes\n"
+                 "                       its tier's experts too; 0 = off)\n"
                  "  --prefill-head-alias --serve: unload the native output head while each fresh prompt is read,\n"
                  "                       then release prompt buffers and reload it before decode\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
@@ -9371,6 +9372,10 @@ int main(int argc, char** argv) {
                     exl3_pf.help_device = -1;
                 } else {
                     exl3_help_max = hmax;
+                    // the windows-vs-batched crossover moved again: with the helper a batched part of 256-512 tokens takes
+                    // 2.96-3.02 s (turboderp 4.05, 3090 + 3060, 10-18), the windows 2.3-2.5 s at 256, 3.0-3.2 s at 320,
+                    // 3.8 s at 384 - so parts of up to 320 tokens through the windows (an explicit --short-read stays)
+                    if (exl3_inplace && !o.short_read_given) exl3_short_read = 320;
                     size_t fb1 = 0, tb1 = 0;
                     {
                         const strata::core::OnDevice on(ht->device());
@@ -9379,9 +9384,10 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: EXL3 prompt path: the helper card (device %d) computes its tier's "
                                          "experts of prompt chunks of up to %lld tokens (its buffers over its tier's last "
                                          "slots, lent per part: %.0f MiB at that size; STRATA_EXL3_PF_HELP=0: they stream); "
-                                         "%.2f GiB of its VRAM left (%.1f s)\n", ht->device(), (long long) hmax,
+                                         "%.2f GiB of its VRAM left (%.1f s); prompt parts of up to %lld tokens through the "
+                                         "windows\n", ht->device(), (long long) hmax,
                                  (double) sp.exl3_help_bytes(hmax) / (double) (1ull << 20), (double) fb1 / (double) (1ull << 30),
-                                 std::chrono::duration<double>(Clock::now() - th).count());
+                                 std::chrono::duration<double>(Clock::now() - th).count(), (long long) exl3_short_read);
                 }
             }
             if (!exl3_start_adapt(exl3_adapt, "serve")) return 1;
