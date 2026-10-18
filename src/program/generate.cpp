@@ -925,7 +925,8 @@ void usage() {
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
-                 "                       of the batched prompt path (default 64, with --exl3-lane 512; 0 = off)\n"
+                 "                       of the batched prompt path (default 64; with --exl3-lane 512, or 384 when the\n"
+                 "                       batched path reads the VRAM tier in place; 0 = off)\n"
                  "  --prefill-head-alias --serve: unload the native output head while each fresh prompt is read,\n"
                  "                       then release prompt buffers and reload it before decode\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
@@ -1007,7 +1008,9 @@ void usage() {
                  "                       --exl3-tier-adapt 0 give two runs the same experts on the GPU (an oracle\n"
                  "                       comparison of --spec against single-token).  --serve makes the tiers at start\n"
                  "                       (the reserve's default 1664: the prompt path's own buffers too) and lends the\n"
-                 "                       tier's last slots to each batched prompt part, refilled before the next window\n"
+                 "                       tier's last slots to each batched prompt part, refilled before the next window;\n"
+                 "                       the part reads the experts in the tier's other slots in place instead of\n"
+                 "                       streaming them (STRATA_EXL3_PF_INPLACE=0: every expert streamed)\n"
                  "  --exl3-helper-tier MIB|auto  the profile's next-hottest experts in a second tier on the run's\n"
                  "                       device 1 (CUDA_VISIBLE_DEVICES=1,2: the helper card), run there beside the lane\n"
                  "                       (auto: its free VRAM minus STRATA_EXL3_HELPER_RESERVE_MIB, default 512; default 0)\n"
@@ -1184,6 +1187,13 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
 // link with the windows' activations and rows
 inline bool exl3_adapt_helper() {
     static const bool on = [] { const char* v = std::getenv("STRATA_EXL3_ADAPT_HELPER"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+// --serve, option (c) (Mile 10-18): the batched prompt path reads the main VRAM tier's experts in place - every one in a
+// slot the prompt part does not borrow - instead of streaming them with the rest.  STRATA_EXL3_PF_INPLACE=0: every expert
+// streams, as the 10-18 morning's server did (an A/B; the same kernels on the same bytes either way).
+inline bool exl3_pf_inplace() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_EXL3_PF_INPLACE"); return v == nullptr || v[0] != '0'; }();
     return on;
 }
 struct Exl3Adapt {
@@ -9206,13 +9216,16 @@ int main(int argc, char** argv) {
         Exl3Adapt exl3_adapt;
         std::vector<strata::kernels::Exl3VramTier::Lent> exl3_lent;   // the loan out now (exl3_lend / exl3_refill)
         int64_t exl3_lent_first = -1;   // its first slot (-1: no loan out)
+        int64_t exl3_pf_streamed0 = 0, exl3_pf_resident0 = 0;   // the prompt path's counts when the loan began (the log)
         int64_t exl3_first_now = -1;    // where the prompt path's buffers are laid out (-1: buffers of its own)
         // --exl3-lane without --short-read: a prompt part of at most this many tokens goes through the verify windows.  The
         // batched path streams every expert once per chunk however short it is (the 57 GiB at 4.05 bpw), and refills the
         // slots it borrowed: 5.2-5.4 s for 59 to 2,048 tokens (3090 + 3060, 10-18); the windows read ~95 tok/s, 8 prompt
         // tokens routing to ~20 experts a layer the tiers do not hold (the lane's): 512 tokens 5.26 s either way, 1,024
-        // 10.8 s against 5.3, 59 tokens 0.46 s against 5.2
-        const int64_t exl3_short_read = o.short_read_given ? o.short_read : 512;
+        // 10.8 s against 5.3, 59 tokens 0.46 s against 5.2.  With option (c) (the main tier read in place, set below) a
+        // chunk streams ~18,700 of the 24,576 experts: 4.0-4.1 s for 59 to 1,024 tokens, against the windows' 2.5 s at
+        // 256, 3.9 s at 384 and 5.1 s at 512 (~100 tok/s) - the crossover ~400 tokens, so 384 there.
+        int64_t exl3_short_read = o.short_read_given ? o.short_read : 512;
         strata::core::NativeHead exl3_mtp_head;   // EXL3 + MTP: the drafter's head reads the pack's requantized output.weight
         if (exl3_serve) {
             if (use_mtp) {
@@ -9292,6 +9305,21 @@ int main(int argc, char** argv) {
                              (double) fb / (double) (1ull << 30));
             }
             o.prefill_chunk = chunk;
+            // option (c) (Mile 10-18, on top of (a)): the batched path reads the main tier's experts in place.  While a
+            // part is read, the tier's slots below the loan (exl3_lend: [0, first)) still hold theirs - no window runs,
+            // the adaptive tier's copies have landed (settled before a loan; they only ever go to spare slots, which the
+            // table does not name), and blob() is null for a lent expert - so each chunk streams only what the tier does
+            // not hold now (at a 512-token part ~18,700 of the 24,576 experts instead of all).  The same kernels read the
+            // same bytes, from a tier slot instead of a ring slot.  The helper tier is the other card's, and the two cards
+            // have no peer access here (nvidia-smi topo -p2p r: NS): a copy from it would cross this card's link like the
+            // RAM tier's, so its experts still stream.
+            if (xt != nullptr && exl3_pf_inplace()) {
+                exl3_pf.vram = [xt](int64_t l, int64_t e) { return xt->blob(l, e); };
+                if (!o.short_read_given) exl3_short_read = 384;   // the crossover with the windows moved (above)
+                std::fprintf(stderr, "strata serve: EXL3 prompt path: the VRAM tier's experts below the loan are read in "
+                                     "place, the rest streamed (STRATA_EXL3_PF_INPLACE=0: every expert streamed); prompt "
+                                     "parts of up to %lld tokens through the windows\n", (long long) exl3_short_read);
+            }
             if (!exl3_start_adapt(exl3_adapt, "serve")) return 1;
         }
         if (!exl3_serve) {
@@ -13736,6 +13764,10 @@ int main(int argc, char** argv) {
                     std::vector<strata::kernels::Exl3VramTier::Lent> more;
                     if (!xt.lend(first, more, e)) return false;
                     lent_now = more.size();
+                    if (exl3_lent_first < 0) {   // a new loan: the refill's log line counts from here
+                        exl3_pf_streamed0 = sp.stats().experts_streamed;
+                        exl3_pf_resident0 = sp.stats().experts_resident;
+                    }
                     exl3_lent.insert(exl3_lent.end(), more.begin(), more.end());
                     exl3_lent_first = first;
                 }
@@ -13759,8 +13791,11 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 if (!exl3_tier->restore(exl3_lent, *exl3_ram, e)) return false;
-                std::fprintf(stderr, "strata serve: EXL3 tier: %zu experts refilled in %.2f s\n", exl3_lent.size(),
-                             exl3_tier->restore_seconds());
+                // (the prompt part's experts: streamed through the ring, and the routed ones read in the tier's own slots)
+                std::fprintf(stderr, "strata serve: EXL3 tier: %zu experts refilled in %.2f s; the prompt part streamed %lld "
+                                     "experts, read %lld routed ones in place\n", exl3_lent.size(),
+                             exl3_tier->restore_seconds(), (long long) (sp.stats().experts_streamed - exl3_pf_streamed0),
+                             (long long) (sp.stats().experts_resident - exl3_pf_resident0));
                 exl3_lent.clear();
                 exl3_lent_first = -1;
                 return true;
