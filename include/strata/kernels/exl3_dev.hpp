@@ -39,8 +39,9 @@ struct Mat {
 bool supported(const Mat& m);
 /// Whether the kernels take this bitrate and codebook.
 bool k2_supported(int k2, int cb);
-/// Trellis bytes of a k x n matrix at k2 / 2 bits (16 k2 a tile).
-inline size_t trellis_bytes(int64_t k, int64_t n, int k2) { return (size_t) (k / 16) * (size_t) (n / 16) * 16u * k2; }
+/// Trellis bytes of a k x n matrix at k2 / 2 bits (16 k2 a tile).  (Was trellis_bytes(k, n, K): renamed with the k2
+/// argument so a call written for K does not compile - it would size half the matrix.)
+inline size_t trellis_bytes_k2(int64_t k, int64_t n, int k2) { return (size_t) (k / 16) * (size_t) (n / 16) * 16u * k2; }
 
 /// One routed expert's blob: gate (0), up (1), down (2), each its trellis, suh and svh at byte offsets from the blob's
 /// base (the CPU lane's RAM tier keeps exactly such blobs, every part 64-byte aligned), and each matrix's bitrate.
