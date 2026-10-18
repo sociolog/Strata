@@ -2,6 +2,8 @@
 // reference, on REAL weights.  Needs the downloaded model; not a ctest.
 //
 // Usage: exl3_moe_layer_check <model_dir> <layer> <n_experts> [k]
+#include <cuda_runtime.h>
+
 #include "strata/artifact/exl3_model.hpp"
 #include "strata/kernels/exl3_experts.hpp"
 #include "strata/kernels/cpu/exl3.hpp"
