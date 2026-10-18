@@ -1190,14 +1190,14 @@ inline bool exl3_adapt_helper() {
     static const bool on = [] { const char* v = std::getenv("STRATA_EXL3_ADAPT_HELPER"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
-// --serve, option (c) (Mile 10-18): the batched prompt path reads the main VRAM tier's experts in place - every one in a
+// --serve: the batched prompt path reads the main VRAM tier's experts in place - every one in a
 // slot the prompt part does not borrow - instead of streaming them with the rest.  STRATA_EXL3_PF_INPLACE=0: every expert
-// streams, as the 10-18 morning's server did (an A/B; the same kernels on the same bytes either way).
+// streams, as the first EXL3 server did (an A/B; the same kernels on the same bytes either way).
 inline bool exl3_pf_inplace() {
     static const bool on = [] { const char* v = std::getenv("STRATA_EXL3_PF_INPLACE"); return v == nullptr || v[0] != '0'; }();
     return on;
 }
-// --serve with --exl3-helper-tier (Mile 10-18): while a batched prompt part is read, the helper card computes the rows of
+// --serve with --exl3-helper-tier: while a batched prompt part is read, the helper card computes the rows of
 // the experts its tier holds (Prefill::init_exl3_help / bind_exl3_help) instead of the main card streaming them over its
 // link; the helper tier lends its last slots for the buffers per part and gets them back after, as the main tier does.
 // STRATA_EXL3_PF_HELP=0: they stream as before (b1d62699).  STRATA_EXL3_PF_HELP_MAX: the largest chunk it helps.
@@ -8817,7 +8817,7 @@ int main(int argc, char** argv) {
         // --exl3 --exl3-lane: the EXL3 model's experts on the CPU lane, the VRAM tier (--exl3-lane-profile) and the
         // helper tier inside the verify windows, as the plain generate path runs them; the batched prompt path borrows
         // the tier's coldest slots for its buffers per prompt part and the same experts are copied back before a window
-        // reads (Mile 10-18: "(a) Lend, then refill").  One GPU and its helper card; the GGUF serve features that need a
+        // reads (lend, then refill).  One GPU and its helper card; the GGUF serve features that need a
         // pack's expert cache are refused rather than run on an empty one.
         const bool exl3_serve = exl3_drive.ram != nullptr;
         {
@@ -9244,7 +9244,7 @@ int main(int argc, char** argv) {
         // batched path streams every expert once per chunk however short it is (the 57 GiB at 4.05 bpw), and refills the
         // slots it borrowed: 5.2-5.4 s for 59 to 2,048 tokens (3090 + 3060, 10-18); the windows read ~95 tok/s, 8 prompt
         // tokens routing to ~20 experts a layer the tiers do not hold (the lane's): 512 tokens 5.26 s either way, 1,024
-        // 10.8 s against 5.3, 59 tokens 0.46 s against 5.2.  With option (c) (the main tier read in place, set below) a
+        // 10.8 s against 5.3, 59 tokens 0.46 s against 5.2.  With the main tier read in place (set below) a
         // chunk streams ~18,700 of the 24,576 experts: 4.0-4.1 s for 59 to 1,024 tokens, against the windows' 2.5 s at
         // 256, 3.9 s at 384 and 5.1 s at 512 (~100 tok/s) - the crossover ~400 tokens, so 384 there.
         int64_t exl3_short_read = o.short_read_given ? o.short_read : 512;
@@ -9267,7 +9267,7 @@ int main(int argc, char** argv) {
             strata::kernels::Exl3VramTier* xt = exl3_tier != nullptr && exl3_tier->slots() > 0 ? exl3_tier.get() : nullptr;
             const int64_t xt_slots = xt != nullptr ? xt->slots() : 0;
             const uint64_t xt_slot = xt != nullptr ? xt->slot_bytes() : 1;
-            // option (c) (below): with the tier read in place, the copy ring's slots are tier slots a part lends too, so a
+            // with the tier read in place (below), the copy ring's slots are tier slots a part lends too, so a
             // smaller ring leaves more experts in place and fewer to refill.  Measured (turboderp 4.05, the server's
             // defaults, one text each), a ring of 512 / 384 / 256 / 128 slots: 21K 9.23 / 9.18 / 9.12 / 10.12 s, 7K 4.76 /
             // 4.71 / 4.67 / 5.30, 4K 4.49 / 4.44 / 4.40 / 4.46, 512 tokens 4.07 / 4.02 / 3.97 / 3.93 - so 256 here
@@ -9334,7 +9334,7 @@ int main(int argc, char** argv) {
                              (double) fb / (double) (1ull << 30));
             }
             o.prefill_chunk = chunk;
-            // option (c) (Mile 10-18, on top of (a)): the batched path reads the main tier's experts in place.  While a
+            // on top of the loan: the batched path reads the main tier's experts in place.  While a
             // part is read, the tier's slots below the loan (exl3_lend: [0, first)) still hold theirs - no window runs,
             // the adaptive tier's copies have landed (settled before a loan; they only ever go to spare slots, which the
             // table does not name), and blob() is null for a lent expert - so each chunk streams only what the tier does
@@ -9349,7 +9349,7 @@ int main(int argc, char** argv) {
                                      "place, the rest streamed (STRATA_EXL3_PF_INPLACE=0: every expert streamed); prompt "
                                      "parts of up to %lld tokens through the windows\n", (long long) exl3_short_read);
             }
-            // the helper card's share (Mile 10-18): the two cards have no peer access, so the helper tier's experts
+            // the helper card's share: the two cards have no peer access, so the helper tier's experts
             // would cross this card's link like the RAM tier's - instead the helper computes their rows of each chunk of
             // up to STRATA_EXL3_PF_HELP_MAX tokens itself, its MoE input and rows passed through pinned host memory
             // (Prefill::init_exl3_help).  Its buffers lie over its tier's last slots, lent per part and refilled after
@@ -13802,7 +13802,7 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 return true;
             };
-            // --exl3-lane (Mile 10-18: "(a) Lend, then refill"): the batched prompt path's buffers are laid out over the
+            // --exl3-lane (lend, then refill): the batched prompt path's buffers are laid out over the
             // VRAM tier's last slots - those a part's chunk needs are lent just before it is read (their experts read as
             // the lane's meanwhile; no window runs), and the same experts are copied back into the same slots from the
             // page-locked RAM tier before a window reads the tier again, so the tier the decode left is the tier the next
@@ -16395,7 +16395,7 @@ int main(int argc, char** argv) {
                                  "experts (%.1f s to set up; %.1f GiB of VRAM left)\n", (long long) o.prefill_chunk,
                          std::clamp(exl3_pf.ring, 16, 1024), (double) exl3_pf.max_blob / 1e6,
                          std::chrono::duration<double>(Clock::now() - i0).count(), (double) fb / (double) (1ull << 30));
-            // STRATA_EXL3_PF_HELP_CLI=MiB - a test, not a feature (the KL gate of the server's helper card, Mile 10-18):
+            // STRATA_EXL3_PF_HELP_CLI=MiB - a test, not a feature (the KL gate of the server's helper card):
             // the helper card computes its experts of this prompt as `--serve` has it do (Prefill::init_exl3_help),
             // from a helper tier of that many MiB made for the prompt only - the profile's experts after its first
             // STRATA_EXL3_PF_HELP_CLI_SKIP (default 6440, the server's main tier) - and freed after it, before any tier

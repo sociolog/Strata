@@ -827,7 +827,7 @@ struct PeerPrefill {
     }
 };
 
-// --exl3 with a helper GPU (Exl3PromptExperts::help: --serve with --exl3-helper-tier; Mile 10-18): the experts the helper
+// --exl3 with a helper GPU (Exl3PromptExperts::help: --serve with --exl3-helper-tier): the experts the helper
 // tier holds are computed on that GPU for every chunk it is bound for (bind_exl3_help), with this path's own kernels and
 // launch for launch as this GPU would run them, and are never streamed over this GPU's link.  The two cards have no peer
 // access (the 3090 + 3060 here: nvidia-smi topo -p2p r says NS), so per MoE layer this GPU copies its MoE input (T x N
