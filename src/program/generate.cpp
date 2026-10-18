@@ -925,7 +925,7 @@ void usage() {
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
-                 "                       of the batched prompt path (default 64, 0 = off)\n"
+                 "                       of the batched prompt path (default 64, with --exl3-lane 512; 0 = off)\n"
                  "  --prefill-head-alias --serve: unload the native output head while each fresh prompt is read,\n"
                  "                       then release prompt buffers and reload it before decode\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
@@ -1005,7 +1005,9 @@ void usage() {
                  "                       prompt's buffers are gone, minus STRATA_EXL3_TIER_RESERVE_MIB for the verify\n"
                  "                       window's buffers and graphs, default 512; 0: no tier).  A fixed size and\n"
                  "                       --exl3-tier-adapt 0 give two runs the same experts on the GPU (an oracle\n"
-                 "                       comparison of --spec against single-token)\n"
+                 "                       comparison of --spec against single-token).  --serve makes the tiers at start\n"
+                 "                       (the reserve's default 1664: the prompt path's own buffers too) and lends the\n"
+                 "                       tier's last slots to each batched prompt part, refilled before the next window\n"
                  "  --exl3-helper-tier MIB|auto  the profile's next-hottest experts in a second tier on the run's\n"
                  "                       device 1 (CUDA_VISIBLE_DEVICES=1,2: the helper card), run there beside the lane\n"
                  "                       (auto: its free VRAM minus STRATA_EXL3_HELPER_RESERVE_MIB, default 512; default 0)\n"
@@ -9206,9 +9208,11 @@ int main(int argc, char** argv) {
         int64_t exl3_lent_first = -1;   // its first slot (-1: no loan out)
         int64_t exl3_first_now = -1;    // where the prompt path's buffers are laid out (-1: buffers of its own)
         // --exl3-lane without --short-read: a prompt part of at most this many tokens goes through the verify windows.  The
-        // batched path streams every expert once per chunk, however short (~4.5 s for the 57 GiB at 4.05 bpw), and refills
-        // the slots it borrowed; the windows read the part with the tier's experts on the GPU
-        const int64_t exl3_short_read = o.short_read_given ? o.short_read : 1024;
+        // batched path streams every expert once per chunk however short it is (the 57 GiB at 4.05 bpw), and refills the
+        // slots it borrowed: 5.2-5.4 s for 59 to 2,048 tokens (3090 + 3060, 10-18); the windows read ~95 tok/s, 8 prompt
+        // tokens routing to ~20 experts a layer the tiers do not hold (the lane's): 512 tokens 5.26 s either way, 1,024
+        // 10.8 s against 5.3, 59 tokens 0.46 s against 5.2
+        const int64_t exl3_short_read = o.short_read_given ? o.short_read : 512;
         strata::core::NativeHead exl3_mtp_head;   // EXL3 + MTP: the drafter's head reads the pack's requantized output.weight
         if (exl3_serve) {
             if (use_mtp) {
