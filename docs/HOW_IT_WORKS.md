@@ -67,7 +67,8 @@ The [details](DETAILS.md#how-it-works) explain every part and its numbers, and t
 - Built with parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT). Ideas from
   [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen). More in the [details](DETAILS.md#credits-and-licenses).
-- The EXL3 CPU expert lane (`src/kernels/cpu/exl3_lane.cpp`) is ported from
+- The EXL3 CPU expert lane (`src/kernels/cpu/exl3_lane.cpp`) and the EXL3 device kernels
+  (`src/kernels/cuda/exl3_dev.cu`) are ported from
   [project-maya](https://github.com/mw00/project-maya) (MIT), whose EXL3 support follows
   [exllamav3](https://github.com/turboderp-org/exllamav3) (MIT).
 - The AMD (HIP) backend: [AMD_HIP.md](AMD_HIP.md) names the contributors and the machines it was validated on.
