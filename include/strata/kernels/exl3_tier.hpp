@@ -56,16 +56,31 @@ public:
     bool assign(int64_t slot, int32_t key, std::string& err);
     bool release_slot(int64_t slot, std::string& err);
 
+    /// --serve: the batched prompt path borrows the slots [first, slots()) for its buffers, and they are refilled
+    /// before a window reads the tier again.  `lend` takes the experts those slots hold out of both tables (one upload
+    /// of the device copy; they read as host experts, the lane's, until `restore`) and returns what each slot held -
+    /// a spare slot lends nothing.  `restore` copies every one back into its own slot from `ram` (asynchronously on the
+    /// tier's copy stream, then waits) and puts it back in both tables (one upload), so the tier is what it was before
+    /// the loan.  Only while no window or token graph runs, and with no adaptive copy in flight into the range.
+    struct Lent {
+        int32_t slot, key;   // key: layer * n_expert + e
+    };
+    bool lend(int64_t first, std::vector<Lent>& out, std::string& err);
+    bool restore(const std::vector<Lent>& lent, const cpu::Exl3ExpertRam& ram, std::string& err);
+    double restore_seconds() const { return restore_s_; }   ///< the last restore's copies and table upload
+
 private:
     void release();
+    bool upload_table(std::string& err);   // the host table to the device copy (synchronous)
     uint8_t* base_ = nullptr;
     int32_t* d_res_ = nullptr;
+    void* copy_stream_ = nullptr;   // restore's copies (cudaStream_t), made at its first use
     std::vector<int32_t> h_res_;
     std::vector<int32_t> owner_;   // slot -> its expert, -1 a spare
     int device_ = 0;
     int64_t slots_ = 0, filled_ = 0, n_layers_ = 0, n_expert_ = 0;
     uint64_t slot_bytes_ = 0;
-    double load_s_ = 0.0;
+    double load_s_ = 0.0, restore_s_ = 0.0;
 };
 
 }  // namespace strata::kernels

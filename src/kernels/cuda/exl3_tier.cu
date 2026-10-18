@@ -26,8 +26,13 @@ Exl3VramTier::~Exl3VramTier() { release(); }
 
 void Exl3VramTier::release() {
     const DeviceScope on(device_);
+    if (copy_stream_ != nullptr) {
+        (void) cudaStreamSynchronize((cudaStream_t) copy_stream_);
+        (void) cudaStreamDestroy((cudaStream_t) copy_stream_);
+    }
     if (base_ != nullptr) (void) cudaFree(base_);
     if (d_res_ != nullptr) (void) cudaFree(d_res_);
+    copy_stream_ = nullptr;
     base_ = nullptr;
     d_res_ = nullptr;
     h_res_.clear();
@@ -135,6 +140,83 @@ bool Exl3VramTier::release_slot(int64_t slot, std::string& err) {
         err = std::string("EXL3 VRAM tier: the residency table's update: ") + cudaGetErrorString(e);
         return false;
     }
+    return true;
+}
+
+bool Exl3VramTier::upload_table(std::string& err) {
+    const DeviceScope on(device_);
+    // a pageable copy can return before its DMA has landed: wait for it (the legacy stream) before a kernel reads it
+    cudaError_t e = cudaMemcpy(d_res_, h_res_.data(), h_res_.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(nullptr);
+    if (e != cudaSuccess) {
+        err = std::string("EXL3 VRAM tier: the residency table's upload: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
+
+bool Exl3VramTier::lend(int64_t first, std::vector<Lent>& out, std::string& err) {
+    out.clear();
+    if (first < 0 || first > slots_) {
+        err = "EXL3 VRAM tier: a loan from slot " + std::to_string(first) + " of " + std::to_string(slots_);
+        return false;
+    }
+    for (int64_t s = first; s < slots_; ++s) {
+        const int32_t key = owner_[(size_t) s];
+        if (key < 0) continue;   // a spare: nothing to give back
+        out.push_back({(int32_t) s, key});
+        h_res_[(size_t) key] = -1;
+        owner_[(size_t) s] = -1;
+    }
+    return out.empty() || upload_table(err);
+}
+
+bool Exl3VramTier::restore(const std::vector<Lent>& lent, const cpu::Exl3ExpertRam& ram, std::string& err) {
+    restore_s_ = 0.0;
+    if (lent.empty()) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (ram.n_layers() != n_layers_ || ram.n_expert() != n_expert_) {
+        err = "EXL3 VRAM tier: the refill's RAM tier is not the one the tier was filled from";
+        return false;
+    }
+    for (const Lent& x : lent)
+        if (x.slot < 0 || x.slot >= slots_ || owner_[(size_t) x.slot] >= 0 || x.key < 0 ||
+            x.key >= (int32_t) h_res_.size() || h_res_[(size_t) x.key] >= 0) {
+            err = "EXL3 VRAM tier: refilling expert " + std::to_string(x.key) + " into slot " + std::to_string(x.slot) +
+                  ": the slot is taken or the expert resident already";
+            return false;
+        }
+    const DeviceScope on(device_);
+    if (copy_stream_ == nullptr) {
+        cudaStream_t s = nullptr;
+        if (const cudaError_t e = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking); e != cudaSuccess) {
+            err = std::string("EXL3 VRAM tier: the refill's copy stream: ") + cudaGetErrorString(e);
+            return false;
+        }
+        copy_stream_ = s;
+    }
+    const cudaStream_t s = (cudaStream_t) copy_stream_;
+    // each expert into its own slot again (the tables still read it as a host expert until every copy has landed)
+    for (const Lent& x : lent) {
+        const int l = (int) (x.key / n_expert_), e = (int) (x.key % n_expert_);
+        if (const cudaError_t ce = cudaMemcpyAsync(slot_ptr(x.slot), ram.blob(l, e), (size_t) ram.blob_bytes(l),
+                                                   cudaMemcpyHostToDevice, s);
+            ce != cudaSuccess) {
+            (void) cudaStreamSynchronize(s);
+            err = "EXL3 VRAM tier: refilling slot " + std::to_string(x.slot) + ": " + cudaGetErrorString(ce);
+            return false;
+        }
+    }
+    if (const cudaError_t e = cudaStreamSynchronize(s); e != cudaSuccess) {
+        err = std::string("EXL3 VRAM tier: the refill's copies: ") + cudaGetErrorString(e);
+        return false;
+    }
+    for (const Lent& x : lent) {
+        owner_[(size_t) x.slot] = x.key;
+        h_res_[(size_t) x.key] = x.slot;
+    }
+    if (!upload_table(err)) return false;
+    restore_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
 

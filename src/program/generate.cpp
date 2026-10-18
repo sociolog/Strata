@@ -763,6 +763,7 @@ struct Options {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
+    bool short_read_given = false;   // --short-read on the command line (--exl3-lane has its own default otherwise)
     bool prefill_head_alias = false;   // lend the native output head's VRAM to prompt buffers between request phases
     /// --pipeline-windows N (--serve, a layer split on exactly two GPUs; opt-in): 1 = a prompt's short reads through
     /// the verify windows run with the stages overlapped (stage 0 reads window K+1 while stage 1 reads window K);
@@ -1241,10 +1242,10 @@ struct Exl3Adapt {
             else miss[(size_t) (layer * n_expert + ids[i])] += 1.0f;
         }
     }
-    // a round boundary (no window runs): the last boundary's copies made resident, the counts decayed, the next copies
-    // issued - the most-missed experts to the main tier first, the next ones to the helper's
-    bool round(std::string& err) {
-        ++rounds;
+    // the last boundary's copies waited for and made resident: the first step of a round, and in --serve the step before
+    // the tier lends its slots to a prompt (so no copy is in flight into a prompt buffer, and the loan sees the tables
+    // the decode left)
+    bool settle(std::string& err) {
         for (size_t ti = 0; ti < tiers.size(); ++ti) {
             Tier& T = tiers[ti];
             if (T.pending.empty()) continue;
@@ -1263,6 +1264,13 @@ struct Exl3Adapt {
             }
             T.pending.clear();
         }
+        return true;
+    }
+    // a round boundary (no window runs): the last boundary's copies made resident, the counts decayed, the next copies
+    // issued - the most-missed experts to the main tier first, the next ones to the helper's
+    bool round(std::string& err) {
+        ++rounds;
+        if (!settle(err)) return false;
         for (float& m : miss) m *= decay;
         for (Tier& T : tiers)
             for (float& u : T.use) u *= decay;
@@ -3133,7 +3141,10 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
-        else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+        else if (a == "--short-read") {
+            o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+            o.short_read_given = true;
+        }
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
@@ -8670,12 +8681,135 @@ int main(int argc, char** argv) {
                          ev, v.why.c_str());
         return false;
     };
+    // --exl3-lane-profile: the VRAM tier (kernels/exl3_tier.hpp) from the profile's ranking, hottest first - generate makes
+    // it once its prompt is read (the prompt path's buffers given back), --serve once at start (its prompt path then
+    // borrows the tier's last slots per prompt part).  auto: what is free minus STRATA_EXL3_TIER_RESERVE_MIB (default
+    // `reserve_mib`) for what is made after it - generate: the verify window's buffers and graphs (~70 MB measured: the
+    // K/V and the drafter are in place already; 2048 left 1.9 GiB unused, 512 gave 650 more experts, 75.6 -> 82.2 tok/s);
+    // a fixed --exl3-vram-tier gives every run of a comparison the same experts on the GPU.  Static: no swaps.
+    // --exl3-helper-tier: the profile's next-hottest experts (none the VRAM tier holds) in a second tier on the run's
+    // device 1 (the helper card: CUDA_VISIBLE_DEVICES=1,2 with PCI_BUS_ID order gives the 3060 here).  Both pools run them
+    // there with the same kernels beside the lane.  auto: that card's free VRAM minus STRATA_EXL3_HELPER_RESERVE_MIB
+    // (default 512).  `who`: the log lines' program ("generate", "serve").
+    auto exl3_make_tiers = [&](const char* who, int64_t reserve_mib) -> bool {
+        if (exl3_drive.ram != nullptr && !exl3_ranked.empty() && exl3_drive.stream == nullptr && o.exl3_vram_tier_mib != 0) {
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            const uint64_t reserve = (uint64_t) [reserve_mib] {
+                const char* v = std::getenv("STRATA_EXL3_TIER_RESERVE_MIB");
+                return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : reserve_mib;
+            }() << 20;
+            const uint64_t budget = o.exl3_vram_tier_mib > 0 ? (uint64_t) o.exl3_vram_tier_mib << 20
+                                                             : (fb > reserve ? (uint64_t) fb - reserve : 0);
+            int dev0 = 0;
+            (void) cudaGetDevice(&dev0);
+            exl3_tier = std::make_unique<strata::kernels::Exl3VramTier>();
+            // --exl3-tier-adapt N: 2N of its slots spare (the swaps' copies land there)
+            const int64_t spares = o.exl3_tier_adapt > 0 && o.spec >= 2 ? 2 * (int64_t) o.exl3_tier_adapt : 0;
+            if (!exl3_tier->init(*exl3_ram, exl3_ranked, budget, err, dev0, nullptr, spares) ||
+                !exl3_drive.tok.init(dev0, 1, (int64_t) ss.k, g.n_embd, g.n_ff, err)) {
+                std::fprintf(stderr, "strata %s: %s\n", who, err.c_str());
+                return false;
+            }
+            exl3_drive.tier = exl3_tier.get();
+            cudaMemGetInfo(&fb, &tb);
+            std::fprintf(stderr, "strata %s: EXL3 VRAM tier: the %lld hottest experts of %s (%.2f GiB, %.2f MB slots) in "
+                                 "%.1f s; %.2f GiB of VRAM left\n", who, (long long) exl3_tier->filled(),
+                         o.exl3_lane_profile.c_str(), (double) exl3_tier->bytes() / (double) (1ull << 30),
+                         (double) exl3_tier->slot_bytes() / 1e6, exl3_tier->load_seconds(), (double) fb / (double) (1ull << 30));
+        }
+        if (exl3_drive.ram != nullptr && !exl3_ranked.empty() && exl3_drive.stream == nullptr && o.exl3_helper_tier_mib != 0) {
+            int ndev = 0, dev0 = 0;
+            (void) cudaGetDeviceCount(&ndev);
+            (void) cudaGetDevice(&dev0);
+            const int dev1 = dev0 == 0 ? 1 : 0;
+            if (ndev < 2) {
+                std::fprintf(stderr, "strata %s: --exl3-helper-tier: this run sees one GPU (CUDA_VISIBLE_DEVICES): no "
+                                     "helper tier\n", who);
+            } else {
+                size_t fb1 = 0, tb1 = 0;
+                {
+                    const strata::core::OnDevice on(dev1);
+                    cudaMemGetInfo(&fb1, &tb1);
+                }
+                const uint64_t reserve = (uint64_t) [] {
+                    const char* v = std::getenv("STRATA_EXL3_HELPER_RESERVE_MIB");
+                    return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : (int64_t) 512;
+                }() << 20;
+                const uint64_t budget = o.exl3_helper_tier_mib > 0 ? (uint64_t) o.exl3_helper_tier_mib << 20
+                                                                   : (fb1 > reserve ? (uint64_t) fb1 - reserve : 0);
+                exl3_helper = std::make_unique<strata::kernels::Exl3VramTier>();
+                // --exl3-tier-adapt N (STRATA_EXL3_ADAPT_HELPER=0: the helper's tier stays static): 2N spare slots here too
+                const int64_t spares = o.exl3_tier_adapt > 0 && o.spec >= 2 && exl3_adapt_helper() ? 2 * (int64_t) o.exl3_tier_adapt
+                                                                                                      : 0;
+                if (!exl3_helper->init(*exl3_ram, exl3_ranked, budget, err, dev1, exl3_tier ? exl3_tier->h_res() : nullptr,
+                                       spares) ||
+                    !exl3_drive.help.init(dev1, strata::kernels::cpu::MAXT, (int64_t) strata::kernels::cpu::MAXT * ss.k,
+                                          g.n_embd, g.n_ff, err)) {
+                    std::fprintf(stderr, "strata %s: %s\n", who, err.c_str());
+                    return false;
+                }
+                exl3_drive.helper = exl3_helper.get();
+                std::fprintf(stderr, "strata %s: EXL3 helper tier on device %d: the next %lld experts of %s (%.2f GiB) in "
+                                     "%.1f s\n", who, dev1, (long long) exl3_helper->slots(), o.exl3_lane_profile.c_str(),
+                             (double) exl3_helper->bytes() / (double) (1ull << 30), exl3_helper->load_seconds());
+            }
+        }
+        return true;
+    };
+    // --exl3-tier-adapt: the tier's swaps (Exl3Adapt `ad`), from the page-locked RAM tier (locked here if the prompt path
+    // did not lock it)
+    auto exl3_start_adapt = [&](Exl3Adapt& ad, const char* who) -> bool {
+        if (exl3_tier != nullptr && o.exl3_tier_adapt > 0 && o.spec >= 2) {
+            if (exl3_pin.p == nullptr) {
+                if (cudaHostRegister(const_cast<uint8_t*>(exl3_ram->mapping()), (size_t) exl3_ram->mapping_bytes(),
+                                     cudaHostRegisterPortable) == cudaSuccess)
+                    exl3_pin.p = const_cast<uint8_t*>(exl3_ram->mapping());
+                else
+                    (void) cudaGetLastError();   // pageable: each copy is staged by the driver (slower, still correct)
+            }
+            if (!ad.init(exl3_tier.get(), exl3_adapt_helper() ? exl3_helper.get() : nullptr, exl3_ram.get(),
+                         o.exl3_tier_adapt, err)) {
+                std::fprintf(stderr, "strata %s: %s\n", who, err.c_str());
+                return false;
+            }
+            exl3_drive.adapt = &ad;
+            std::fprintf(stderr, "strata %s: EXL3 VRAM tiers adapt: up to %d swaps a round each, %zu tier%s\n", who,
+                         o.exl3_tier_adapt, ad.tiers.size(), ad.tiers.size() == 1 ? "" : "s");
+        }
+        return true;
+    };
     if (o.serve) {
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
             std::fprintf(stderr, "strata serve: needs --spec T and --prefill CHUNK (and a fillable "
                                  "--expert-cache; the graphed hit path additionally needs --expert-profile P)\n");
             return 2;
+        }
+        // --exl3 --exl3-lane: the EXL3 model's experts on the CPU lane, the VRAM tier (--exl3-lane-profile) and the
+        // helper tier inside the verify windows, as the plain generate path runs them; the batched prompt path borrows
+        // the tier's coldest slots for its buffers per prompt part and the same experts are copied back before a window
+        // reads (Mile 10-18: "(a) Lend, then refill").  One GPU and its helper card; the GGUF serve features that need a
+        // pack's expert cache are refused rather than run on an empty one.
+        const bool exl3_serve = exl3_drive.ram != nullptr;
+        {
+            const char* why = nullptr;
+            if (!o.exl3_dir.empty() && !exl3_serve) why = "an EXL3 model is served with --exl3-lane (the prompt path and the "
+                                                          "verify windows read its experts from the lane's RAM tier)";
+            else if (exl3_serve && exl3_drive.stream != nullptr) why = "STRATA_EXL3_OLD_SHARE=1 is single-token only";
+            else if (exl3_serve && (multi_gpu || !stages.empty())) why = "a layer split is not supported with --exl3-lane "
+                                                                        "(--exl3-helper-tier puts experts on the second card)";
+            else if (exl3_serve && o.batch > 0) why = "--batch slots are not supported with --exl3-lane";
+            else if (exl3_serve && o.peer_device >= 0) why = "--peer-device is not supported with --exl3-lane";
+            else if (exl3_serve && o.prefill_head_alias) why = "--prefill-head-alias is not supported with --exl3-lane";
+            else if (exl3_serve && o.vram_elastic) why = "--vram-elastic is not supported with --exl3-lane";
+            else if (exl3_serve && (o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0))
+                why = "the GGUF helper caches (--expert-cache-device1..3) are not supported with --exl3-lane (--exl3-helper-tier "
+                      "is the EXL3 one)";
+            if (why != nullptr) {
+                std::fprintf(stderr, "strata serve: %s\n", why);
+                return 2;
+            }
         }
         // STRATA_VOLTA_BUILD backport (see docs/ and ninfer-flash-next-v100-backport): --mtp is optional here,
         // mirroring the plain `generate` command's own use_mtp handling below. Without it, drafting falls back
@@ -9019,7 +9153,7 @@ int main(int argc, char** argv) {
                                          "their experts are streamed from the model file during every chunk\n",
                                  (long long) (borrowed - kept), (long long) borrowed);
             }
-        } else {
+        } else if (!exl3_serve) {   // (--exl3-lane: its prompt path borrows from the VRAM tier, below)
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
         }
         rss_probe("the prompt path set up");
@@ -9055,7 +9189,108 @@ int main(int argc, char** argv) {
             return 0;
         };
         static constexpr int64_t kStepChunks[] = {6144, 4096, 3072, 2048, 1536, 1024, 512};
-        {
+        // ---- --exl3-lane: the tiers first (the verify windows' tables point into them), from the free VRAM - the model,
+        // the K/V and the drafter are in place; what is made after them comes out of STRATA_EXL3_TIER_RESERVE_MIB, default
+        // 1664 here: the prompt path's own buffers (its expert streams' FP16 weights, cuBLAS handles and workspaces: 532
+        // MiB measured), the verifier's (350 MiB, windows of up to 8 rows) and its graphs (~15 MiB a window), the drafter's
+        // prompt records - 1,011 MiB in all on a 3090 (10-18) - and the 512 MiB the serve path asks to stay free at a
+        // request's start (#2065; 1024 left 143 MiB, and a 7K prompt's drafter records then did not fit).  Then the
+        // prompt path: its chunk buffers and copy ring are laid
+        // out over the main tier's last slots (Prefill::init with a borrow, relayout per request) for the largest chunk up
+        // to --prefill that the tier can lend - every slot may be lent: every expert is in the RAM tier, and no window
+        // reads the tier while a prompt part is read.  Those slots are lent and refilled once here, so whatever the init
+        // wrote there is gone before the first window.  Without a tier the prompt path keeps buffers of its own, the chunk
+        // halved until they fit (as generate does).  Then the adaptive tier.
+        Exl3Adapt exl3_adapt;
+        std::vector<strata::kernels::Exl3VramTier::Lent> exl3_lent;   // the loan out now (exl3_lend / exl3_refill)
+        int64_t exl3_lent_first = -1;   // its first slot (-1: no loan out)
+        int64_t exl3_first_now = -1;    // where the prompt path's buffers are laid out (-1: buffers of its own)
+        // --exl3-lane without --short-read: a prompt part of at most this many tokens goes through the verify windows.  The
+        // batched path streams every expert once per chunk, however short (~4.5 s for the 57 GiB at 4.05 bpw), and refills
+        // the slots it borrowed; the windows read the part with the tier's experts on the GPU
+        const int64_t exl3_short_read = o.short_read_given ? o.short_read : 1024;
+        strata::core::NativeHead exl3_mtp_head;   // EXL3 + MTP: the drafter's head reads the pack's requantized output.weight
+        if (exl3_serve) {
+            if (use_mtp) {
+                const strata::core::WeightRef* wo = wt.find("output.weight");
+                if (native_pack || wo == nullptr || wo->native_data == nullptr) {
+                    std::fprintf(stderr, "strata serve: --mtp with --exl3 needs the requantized output.weight (the default; "
+                                         "not STRATA_EXL3_DENSE=exl3)\n");
+                    return 1;
+                }
+                if (!exl3_mtp_head.adopt(wo->native_data, wo->native_type, wo->ne0, wo->ne1, err)) {
+                    std::fprintf(stderr, "strata serve: --mtp with --exl3: %s\n", err.c_str());
+                    return 1;
+                }
+            }
+            if (!exl3_make_tiers("serve", 1664)) return 1;
+            mem_mark("before the prompt path init");
+            strata::kernels::Exl3VramTier* xt = exl3_tier != nullptr && exl3_tier->slots() > 0 ? exl3_tier.get() : nullptr;
+            const int64_t xt_slots = xt != nullptr ? xt->slots() : 0;
+            const uint64_t xt_slot = xt != nullptr ? xt->slot_bytes() : 1;
+            sp.set_exl3(&exl3_pf);   // before bytes_needed: the ring's slot is the model's expert
+            auto lend_slots = [&](int64_t c) -> int64_t {   // the tier's slots a c-token chunk's buffers and ring take
+                return (int64_t) ((strata::prefill::Prefill::bytes_needed(g, ss, c, false) + xt_slot - 1) / xt_slot);
+            };
+            int64_t chunk = std::max<int64_t>(256, o.prefill_chunk / 16 * 16);
+            if (xt != nullptr)
+                while (chunk > 256 && lend_slots(chunk) > xt_slots) chunk = std::max<int64_t>(256, chunk - 256);
+            const Clock::time_point i0 = Clock::now();
+            if (xt != nullptr && lend_slots(chunk) <= xt_slots) {
+                exl3_first_now = xt_slots - lend_slots(chunk);
+                if (!sp.init(wt, g, ss, nullptr, nullptr, nullptr, chunk, main_cs, err, xt->slot_ptr(exl3_first_now),
+                             (uint64_t) (xt_slots - exl3_first_now) * xt_slot)) {
+                    std::fprintf(stderr, "strata serve: the EXL3 prompt path over the VRAM tier's last %lld slots: %s\n",
+                                 (long long) (xt_slots - exl3_first_now), err.c_str());
+                    return 1;
+                }
+                // the init's layout, refilled once (the lend/refill every request does - here before any window)
+                std::vector<strata::kernels::Exl3VramTier::Lent> once;
+                if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: the EXL3 prompt path's init: %s\n", cudaGetErrorString(se));
+                    return 1;
+                }
+                if (!xt->lend(exl3_first_now, once, err) || !xt->restore(once, *exl3_ram, err)) {
+                    std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                    return 1;
+                }
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                std::fprintf(stderr, "strata serve: EXL3 prompt path: chunks of up to %lld tokens, a %lld-slot copy ring of "
+                                     "%.2f MB experts; its buffers over the VRAM tier's last %lld slots (%.2f GiB), lent per "
+                                     "prompt part and refilled after (%zu experts in %.2f s); %.2f GiB of VRAM left (%.1f s)\n",
+                             (long long) chunk, (long long) strata::prefill::Prefill::ring_slots_for(chunk),
+                             (double) exl3_pf.max_blob / 1e6, (long long) (xt_slots - exl3_first_now),
+                             (double) ((uint64_t) (xt_slots - exl3_first_now) * xt_slot) / (double) (1ull << 30),
+                             once.size(), xt->restore_seconds(), (double) fb / (double) (1ull << 30),
+                             std::chrono::duration<double>(Clock::now() - i0).count());
+            } else {
+                if (xt != nullptr)
+                    std::fprintf(stderr, "strata serve: the VRAM tier (%lld slots) cannot lend a 256-token chunk's prompt "
+                                         "buffers: the prompt path allocates its own\n", (long long) xt_slots);
+                for (;;) {
+                    sp.set_exl3(&exl3_pf);   // (a reset forgets it)
+                    if (sp.init(wt, g, ss, nullptr, nullptr, nullptr, chunk, main_cs, err)) break;
+                    if (chunk <= 512 || err.find("do not fit") == std::string::npos) {
+                        std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                        return 1;
+                    }
+                    std::fprintf(stderr, "strata serve: %s - trying %lld\n", err.c_str(), (long long) (chunk / 2));
+                    sp.reset();
+                    (void) cudaGetLastError();
+                    chunk /= 2;
+                }
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                std::fprintf(stderr, "strata serve: EXL3 prompt path: chunks of up to %lld tokens, a %lld-slot copy ring of "
+                                     "%.2f MB experts, buffers of its own; %.2f GiB of VRAM left\n", (long long) chunk,
+                             (long long) strata::prefill::Prefill::ring_slots_for(chunk), (double) exl3_pf.max_blob / 1e6,
+                             (double) fb / (double) (1ull << 30));
+            }
+            o.prefill_chunk = chunk;
+            if (!exl3_start_adapt(exl3_adapt, "serve")) return 1;
+        }
+        if (!exl3_serve) {
             // First by arithmetic: a prompt path without a loan allocates its buffers, so the chunk must leave
             // headroom on that device (a chunk that fits to the last MiB left hipBLAS nothing: its GEMMs then
             // failed to launch on gfx1201 and the prompt hung).  `bytes_needed` is the same count `init` makes.
@@ -9093,8 +9328,8 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        mem_mark("before the prompt path init");
-        for (;;) {
+        if (!exl3_serve) mem_mark("before the prompt path init");
+        while (!exl3_serve) {   // (--exl3-lane: its prompt path is made above)
             const int r = init_prompt_paths();
             if (r == 0) break;
             int64_t next = 0;
@@ -9225,6 +9460,36 @@ int main(int argc, char** argv) {
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
+        // --exl3-lane: the windows' tables are the VRAM tier's - the pool publishes the routes to its experts as the
+        // window's GPU plan, and the window runs them on the EXL3 grouped kernels (VerifyHits::exl3_lay) - or, without a
+        // tier, a table of their own that marks every expert absent (every routed expert on the lane), as generate's
+        const bool exl3_hits = exl3_serve && exl3_tier != nullptr && exl3_tier->slots() > 0;
+        std::vector<int32_t> exl3_absent;   // that table on the host
+        int32_t* exl3_res = nullptr;        // and on the device
+        struct Exl3ResFree {
+            int32_t** p;
+            ~Exl3ResFree() { if (*p != nullptr) cudaFree(*p); }
+        } exl3_res_free{&exl3_res};
+        if (exl3_serve) {
+            if (!exl3_hits) {
+                exl3_absent.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
+                if (cudaMalloc((void**) &exl3_res, exl3_absent.size() * sizeof(int32_t)) != cudaSuccess ||
+                    cudaMemcpy(exl3_res, exl3_absent.data(), exl3_absent.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
+                        cudaSuccess ||
+                    cudaStreamSynchronize(nullptr) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: the EXL3 windows' residency table could not be staged\n");
+                    return 1;
+                }
+            }
+            vh.d_res = exl3_hits ? exl3_tier->d_res() : exl3_res;
+            vh.h_res = exl3_hits ? exl3_tier->h_res() : exl3_absent.data();
+            // (without the tier nothing is resident, so the base and the blob size are only checked, never an address)
+            vh.cache_base = exl3_hits ? exl3_tier->base() : (const uint8_t*) exl3_res;
+            vh.blob = exl3_hits ? (int64_t) exl3_tier->slot_bytes() : 1;
+            vh.slot_off = nullptr;
+            vh.n_slots = exl3_hits ? exl3_tier->slots() : 0;
+            vh.exl3_lay = exl3_hits ? exl3_lay.data() : nullptr;
+        }
         // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
@@ -9415,10 +9680,16 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+        // (--exl3-lane: the prompt's short parts go through windows of up to kVerifyMaxT tokens, as generate reads its
+        // prompt; the decode windows stay within --spec.  The drafter's head is the EXL3 pack's own)
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
-            (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
-                                  pipe ? pl_mtp_R : ver.final_R_all(), err))) {
+                      batch_mtp    ? strata::kernels::kVerifyMaxT
+                      : exl3_serve ? std::max(o.spec, strata::kernels::kVerifyMaxT)
+                                   : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
+            (use_mtp && !prefill_head_alias_bound &&
+             !mtp.bind(last_st && !mtp_first ? last_st->wt : wt,
+                       last_st ? &last_st->head : exl3_serve ? &exl3_mtp_head : &native_head,
+                       pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
@@ -9475,10 +9746,20 @@ int main(int argc, char** argv) {
                 stage_ver_p(st, 1).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
             }
         }
-        // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
-        const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
-        void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
+        // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage;
+        // --exl3-lane: the EXL3 pool (the lane, with the tiers' experts on the GPUs)
+        const strata::core::PoolMultiFn win_pool_fn = exl3_serve ? &drive_exl3_pool_multi
+                                                      : n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
+        void* const win_pool_user = exl3_serve ? (void*) &exl3_drive : n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
+        if (exl3_hits) {
+            exl3_drive.plan = ver.plan_sink();   // the tier's routes go to the window's GPU plan (drive_exl3_pool_multi)
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            std::fprintf(stderr, "strata serve: EXL3 windows: the tier's experts on the GPU; %.2f GiB of VRAM left with the "
+                                 "verifier (STRATA_EXL3_TIER_RESERVE_MIB sizes the tier's margin)\n",
+                         (double) fb / (double) (1ull << 30));
+        }
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
@@ -10235,9 +10516,10 @@ int main(int argc, char** argv) {
                 for (const auto& f : strata::kernels::cpu::expert_layout().fmt)
                     nvfp4_experts = nvfp4_experts || f.gu_type == strata::kernels::cpu::kNvfp4Type ||
                                     f.d_type == strata::kernels::cpu::kNvfp4Type;
+            // (--exl3-lane: the skip is the GGUF window dispatch's; the EXL3 pool computes every routed expert)
             const bool tail_default_path = tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch == 0 &&
                                            decode_defaults_arch_ok() &&
-                                           o.peer_device < 0;
+                                           o.peer_device < 0 && !exl3_serve;
             const bool tail_default_ok = tail_default_path && !nvfp4_experts;
             if (tail_default_path && nvfp4_experts)
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default with NVFP4 experts (it moved an NVFP4 "
@@ -10247,16 +10529,22 @@ int main(int argc, char** argv) {
                                      "few are missed and skipping them costs more draft acceptance than it saves; "
                                      "STRATA_ROUTE_TAIL_SKIP=7 turns it on\n", 100.0 * (double) cached_experts / (double) host_res.size());
             if (tail_default_ok) strata::core::set_tail_skip_rank(7);
-            if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
+            if (strata::core::tail_skip_rank() > 0 && exl3_serve)
+                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d has no effect with --exl3-lane (its windows compute "
+                                     "every routed expert)\n", strata::core::tail_skip_rank());
+            else if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a verify window routes at rank %d or "
                                      "lower is skipped (+10..20%% decode on 12-16 GB cards that miss experts, answers differ slightly from 0.1.41); "
                                      "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
                              tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
         }
-        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
+        // (--exl3-lane: no GGUF expert cache to adapt or PCIe share to tune - its VRAM tier adapts in the EXL3 pool,
+        // --exl3-tier-adapt - so the usage stays empty and no GGUF swap round runs, as in generate)
+        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident && !exl3_serve)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         PcieAuto pcie_auto;
-        if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
+        if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok()) &&
+            !exl3_serve) {
             const auto& pl = strata::kernels::cpu::expert_layout();
             double sum = 0.0;
             for (int64_t l = 0; l < g.n_layers; ++l) sum += (double) pl.blob_bytes(l);
@@ -13224,7 +13512,8 @@ int main(int argc, char** argv) {
             // read batched and its header still goes through the windows.  Picture rows need the batched path.
             // STRATA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
-            int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
+            // STRATA_PIPELINE_SWITCH may set it per request (short_read=); --exl3-lane has its own default (exl3_short_read)
+            int64_t req_short_read = exl3_serve ? exl3_short_read : o.short_read;
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
                 if (no_short || b - a > req_short_read) return false;
                 if (sp.embd_rows != nullptr)
@@ -13359,12 +13648,15 @@ int main(int argc, char** argv) {
                     explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
                     ~NoHeadSampling() { v.set_head_sampling(true); }
                 } no_head_sampling(ver);
-                std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
+                // --exl3-lane: windows of up to kVerifyMaxT tokens (an expert several of them route to is read from RAM
+                // once), as generate reads its prompt; the verifier was made for them
+                const int S_read = exl3_serve ? std::max(S, strata::kernels::kVerifyMaxT) : S;
+                std::vector<int32_t> win((size_t) S_read), outw((size_t) S_read), nxt((size_t) S_read);
                 pp_exact = true;   // between windows the session is exactly at `a`
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
                     pp_exact = false;   // until this window and the drafter's rows are in
-                    const int T = (int) std::min<int64_t>(S, b - q);
+                    const int T = (int) std::min<int64_t>(S_read, b - q);
                     for (int t = 0; t < T; ++t) {
                         win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
                         nxt[(size_t) t] = (int32_t) cur[(size_t) (q + t + 1)];
@@ -13406,6 +13698,67 @@ int main(int argc, char** argv) {
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
                 strata::core::progress_beat();
                 std::fflush(stdout);
+                return true;
+            };
+            // --exl3-lane (Mile 10-18: "(a) Lend, then refill"): the batched prompt path's buffers are laid out over the
+            // VRAM tier's last slots - those a part's chunk needs are lent just before it is read (their experts read as
+            // the lane's meanwhile; no window runs), and the same experts are copied back into the same slots from the
+            // page-locked RAM tier before a window reads the tier again, so the tier the decode left is the tier the next
+            // window sees.  The chunk: as few equal ones as the configured chunk allows (each streams every expert once
+            // whatever its size), as generate cuts its prompt.
+            auto exl3_lend = [&](int64_t tokens, std::string& e) -> bool {
+                if (exl3_first_now < 0) return true;   // the prompt path's own buffers: nothing to lend
+                strata::kernels::Exl3VramTier& xt = *exl3_tier;
+                const int64_t slots = xt.slots();
+                if (tokens <= 0) {
+                    e = "prefill: cannot lend buffers for an empty request segment";
+                    return false;
+                }
+                const int64_t pieces = (tokens + o.prefill_chunk - 1) / o.prefill_chunk;
+                const int64_t want = std::min<int64_t>(o.prefill_chunk, ((tokens + pieces - 1) / pieces + 15) / 16 * 16);
+                const uint64_t need_b = strata::prefill::Prefill::bytes_needed(g, ss, want, false);
+                const int64_t need = (int64_t) ((need_b + xt.slot_bytes() - 1) / xt.slot_bytes());
+                if (need <= 0 || need > slots) {   // (the configured chunk was chosen to fit the whole tier)
+                    e = "prefill: a " + std::to_string(want) + "-token chunk's buffers need " + std::to_string(need) +
+                        " of the EXL3 tier's " + std::to_string(slots) + " slots";
+                    return false;
+                }
+                const auto t_ln = Clock::now();
+                const int64_t first = slots - need;
+                size_t lent_now = 0;
+                if (exl3_lent_first < 0 || first < exl3_lent_first) {
+                    // the adaptive tier's copies in flight land first: none may land in a prompt buffer
+                    if (exl3_drive.adapt != nullptr && !exl3_drive.adapt->settle(e)) return false;
+                    std::vector<strata::kernels::Exl3VramTier::Lent> more;
+                    if (!xt.lend(first, more, e)) return false;
+                    lent_now = more.size();
+                    exl3_lent.insert(exl3_lent.end(), more.begin(), more.end());
+                    exl3_lent_first = first;
+                }
+                if (want != sp.chunk() || first != exl3_first_now) {
+                    if (!sp.relayout(want, xt.slot_ptr(first), (uint64_t) (slots - first) * xt.slot_bytes(), e)) return false;
+                    exl3_first_now = first;
+                }
+                if (trace) {
+                    std::fprintf(stderr, "strata trace: lent %zu EXL3 tier slots (%zu out) for %lld tokens, %lld-token chunks, "
+                                         "in %.1f ms\n", lent_now, exl3_lent.size(), (long long) tokens, (long long) want,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
+                    std::fflush(stderr);
+                }
+                return true;
+            };
+            auto exl3_refill = [&](std::string& e) -> bool {
+                if (exl3_lent_first < 0) return true;
+                // the prompt path's work in those slots (its streams, the copy ring's DMA) is over before they are refilled
+                if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess) {
+                    e = std::string("the prompt path before the EXL3 tier's refill: ") + cudaGetErrorString(se);
+                    return false;
+                }
+                if (!exl3_tier->restore(exl3_lent, *exl3_ram, e)) return false;
+                std::fprintf(stderr, "strata serve: EXL3 tier: %zu experts refilled in %.2f s\n", exl3_lent.size(),
+                             exl3_tier->restore_seconds());
+                exl3_lent.clear();
+                exl3_lent_first = -1;
                 return true;
             };
             // the batched path's slots are lent just before its first run and given back (refilled) before a window
@@ -13460,6 +13813,7 @@ int main(int argc, char** argv) {
             // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
             static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
             auto refill = [&](std::string& e) -> bool {
+                if (exl3_serve) return exl3_refill(e);
                 const auto t_rf = Clock::now();
                 int64_t n_lent = 0, n_parts = 0;
                 for (PfPart& p : pf_parts)
@@ -13488,6 +13842,7 @@ int main(int argc, char** argv) {
             int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
             auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
                 seg_lend = 0;
+                if (exl3_serve) return exl3_lend(tokens, e);   // (--exl3-lane runs no layer split: no planned loan)
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
@@ -14312,6 +14667,11 @@ int main(int argc, char** argv) {
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
+            // --exl3-lane: the decode's share of the EXL3 pool's counters (the request's log line below)
+            const int64_t x3_calls0 = exl3_drive.win_calls, x3_entries0 = exl3_drive.win_entries,
+                          x3_jobs0 = exl3_drive.win_jobs, x3_tier0 = exl3_drive.tier_entries,
+                          x3_help0 = exl3_drive.help_entries,
+                          x3_swaps0 = exl3_drive.adapt != nullptr ? exl3_drive.adapt->swaps : 0;
             // the verify windows: the first holds the last prompt token alone (STRATA_ADMIT_MERGE_FIRST: the prompt
             // tokens from merge_at on, the last one's output its first token)
             const int merge_T = merge_at >= 0 && !cancelled ? (int) (n - merge_at) : 0;
@@ -15232,6 +15592,13 @@ int main(int argc, char** argv) {
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
                 std::fflush(stdout);
+                // --exl3-tier-adapt: the round boundary, once the tokens are out - no window runs until the next round's
+                // (the drafter reads no tier table), as generate's
+                if (exl3_drive.adapt != nullptr && !exl3_drive.adapt->round(err)) {
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 ++rounds;
                 if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
                 const Clock::time_point tw2 = Clock::now();
@@ -15572,6 +15939,19 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            if (exl3_serve && exl3_drive.win_calls > x3_calls0) {   // --exl3-lane: where the decode's routed experts ran
+                const double wc = (double) (exl3_drive.win_calls - x3_calls0);
+                const double en = (double) std::max<int64_t>(1, exl3_drive.win_entries - x3_entries0);
+                size_t fb = 0, tb = 0;
+                if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) (void) cudaGetLastError();
+                std::fprintf(stderr, "strata serve: EXL3 decode: %.1f%% of the routes on the VRAM tier, %.1f%% on the helper "
+                                     "tier, %.2f experts a window-layer on the lane; %lld tier swaps; %lld MiB of VRAM free\n",
+                             100.0 * (double) (exl3_drive.tier_entries - x3_tier0) / en,
+                             100.0 * (double) (exl3_drive.help_entries - x3_help0) / en,
+                             (double) (exl3_drive.win_jobs - x3_jobs0) / wc,
+                             (long long) ((exl3_drive.adapt != nullptr ? exl3_drive.adapt->swaps : 0) - x3_swaps0),
+                             (long long) (fb >> 20));
+            }
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count - #588: so that share is said beside it (raising --pcie-frac
             // raises the hit rate while the PCIe reads may make the decode slower)
@@ -15931,98 +16311,11 @@ int main(int argc, char** argv) {
         kvg_start(xcache.slots());
         if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
     }
-    // --exl3-lane-profile: the VRAM tier (kernels/exl3_tier.hpp), made now - the model, the K/V and the drafter in
-    // place, the prompt path's buffers given back - from the profile's ranking, hottest first.  auto: what is free minus
-    // STRATA_EXL3_TIER_RESERVE_MIB (default 512) for the verify window's buffers and graphs (~70 MB measured: the K/V and
-    // the drafter are in place already; 2048 left 1.9 GiB unused, 512 gave 650 more experts, 75.6 -> 82.2 tok/s); a fixed
-    // --exl3-vram-tier gives every run of a comparison the same experts on the GPU.  Static: no swaps.
-    if (exl3_drive.ram != nullptr && !exl3_ranked.empty() && exl3_drive.stream == nullptr && o.exl3_vram_tier_mib != 0) {
-        size_t fb = 0, tb = 0;
-        cudaMemGetInfo(&fb, &tb);
-        const uint64_t reserve = (uint64_t) [] {
-            const char* v = std::getenv("STRATA_EXL3_TIER_RESERVE_MIB");
-            return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : (int64_t) 512;
-        }() << 20;
-        const uint64_t budget = o.exl3_vram_tier_mib > 0 ? (uint64_t) o.exl3_vram_tier_mib << 20
-                                                         : (fb > reserve ? (uint64_t) fb - reserve : 0);
-        int dev0 = 0;
-        (void) cudaGetDevice(&dev0);
-        exl3_tier = std::make_unique<strata::kernels::Exl3VramTier>();
-        // --exl3-tier-adapt N: 2N of its slots spare (the swaps' copies land there)
-        const int64_t spares = o.exl3_tier_adapt > 0 && o.spec >= 2 ? 2 * (int64_t) o.exl3_tier_adapt : 0;
-        if (!exl3_tier->init(*exl3_ram, exl3_ranked, budget, err, dev0, nullptr, spares) ||
-            !exl3_drive.tok.init(dev0, 1, (int64_t) ss.k, g.n_embd, g.n_ff, err)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
-        }
-        exl3_drive.tier = exl3_tier.get();
-        cudaMemGetInfo(&fb, &tb);
-        std::fprintf(stderr, "strata generate: EXL3 VRAM tier: the %lld hottest experts of %s (%.2f GiB, %.2f MB slots) in "
-                             "%.1f s; %.2f GiB of VRAM left\n", (long long) exl3_tier->filled(), o.exl3_lane_profile.c_str(),
-                     (double) exl3_tier->bytes() / (double) (1ull << 30), (double) exl3_tier->slot_bytes() / 1e6,
-                     exl3_tier->load_seconds(), (double) fb / (double) (1ull << 30));
-    }
-    // --exl3-helper-tier: the profile's next-hottest experts (none the VRAM tier holds) in a second tier on the run's
-    // device 1 (the helper card: CUDA_VISIBLE_DEVICES=1,2 with PCI_BUS_ID order gives the 3060 here).  Both pools run them
-    // there with the same kernels beside the lane.  auto: that card's free VRAM minus STRATA_EXL3_HELPER_RESERVE_MIB
-    // (default 512).
-    if (exl3_drive.ram != nullptr && !exl3_ranked.empty() && exl3_drive.stream == nullptr && o.exl3_helper_tier_mib != 0) {
-        int ndev = 0, dev0 = 0;
-        (void) cudaGetDeviceCount(&ndev);
-        (void) cudaGetDevice(&dev0);
-        const int dev1 = dev0 == 0 ? 1 : 0;
-        if (ndev < 2) {
-            std::fprintf(stderr, "strata generate: --exl3-helper-tier: this run sees one GPU (CUDA_VISIBLE_DEVICES): no "
-                                 "helper tier\n");
-        } else {
-            size_t fb1 = 0, tb1 = 0;
-            {
-                const strata::core::OnDevice on(dev1);
-                cudaMemGetInfo(&fb1, &tb1);
-            }
-            const uint64_t reserve = (uint64_t) [] {
-                const char* v = std::getenv("STRATA_EXL3_HELPER_RESERVE_MIB");
-                return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : (int64_t) 512;
-            }() << 20;
-            const uint64_t budget = o.exl3_helper_tier_mib > 0 ? (uint64_t) o.exl3_helper_tier_mib << 20
-                                                               : (fb1 > reserve ? (uint64_t) fb1 - reserve : 0);
-            exl3_helper = std::make_unique<strata::kernels::Exl3VramTier>();
-            // --exl3-tier-adapt N (STRATA_EXL3_ADAPT_HELPER=0: the helper's tier stays static): 2N spare slots here too
-            const int64_t spares = o.exl3_tier_adapt > 0 && o.spec >= 2 && exl3_adapt_helper() ? 2 * (int64_t) o.exl3_tier_adapt
-                                                                                                  : 0;
-            if (!exl3_helper->init(*exl3_ram, exl3_ranked, budget, err, dev1, exl3_tier ? exl3_tier->h_res() : nullptr,
-                                   spares) ||
-                !exl3_drive.help.init(dev1, strata::kernels::cpu::MAXT, (int64_t) strata::kernels::cpu::MAXT * ss.k,
-                                      g.n_embd, g.n_ff, err)) {
-                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-                return 1;
-            }
-            exl3_drive.helper = exl3_helper.get();
-            std::fprintf(stderr, "strata generate: EXL3 helper tier on device %d: the next %lld experts of %s (%.2f GiB) in "
-                                 "%.1f s\n", dev1, (long long) exl3_helper->slots(), o.exl3_lane_profile.c_str(),
-                         (double) exl3_helper->bytes() / (double) (1ull << 30), exl3_helper->load_seconds());
-        }
-    }
-    // --exl3-tier-adapt: the tier's swaps (Exl3Adapt), from the page-locked RAM tier (locked here if the prompt path did
-    // not lock it)
+    // --exl3-lane-profile: the VRAM tier and the helper tier (exl3_make_tiers), made now - the model, the K/V and the
+    // drafter in place, the prompt path's buffers given back - and the adaptive tier (exl3_start_adapt)
+    if (!exl3_make_tiers("generate", 512)) return 1;
     Exl3Adapt exl3_adapt;
-    if (exl3_tier != nullptr && o.exl3_tier_adapt > 0 && o.spec >= 2) {
-        if (exl3_pin.p == nullptr) {
-            if (cudaHostRegister(const_cast<uint8_t*>(exl3_ram->mapping()), (size_t) exl3_ram->mapping_bytes(),
-                                 cudaHostRegisterPortable) == cudaSuccess)
-                exl3_pin.p = const_cast<uint8_t*>(exl3_ram->mapping());
-            else
-                (void) cudaGetLastError();   // pageable: each copy is staged by the driver (slower, still correct)
-        }
-        if (!exl3_adapt.init(exl3_tier.get(), exl3_adapt_helper() ? exl3_helper.get() : nullptr, exl3_ram.get(),
-                             o.exl3_tier_adapt, err)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
-        }
-        exl3_drive.adapt = &exl3_adapt;
-        std::fprintf(stderr, "strata generate: EXL3 VRAM tiers adapt: up to %d swaps a round each, %zu tier%s\n",
-                     o.exl3_tier_adapt, exl3_adapt.tiers.size(), exl3_adapt.tiers.size() == 1 ? "" : "s");
-    }
+    if (!exl3_start_adapt(exl3_adapt, "generate")) return 1;
     // (EXL3 + MTP: the drafter is bound to the EXL3 head before the prompt - see exl3_mtp above the batched prompt)
     // EXL3 lane + --spec: the prompt is read through the verify windows, up to 8 tokens a window with every token
     // committed (the serve path's prompt reader), instead of token by token: an expert several prompt tokens route to
