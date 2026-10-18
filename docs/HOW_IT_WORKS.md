@@ -67,11 +67,15 @@ The [details](DETAILS.md#how-it-works) explain every part and its numbers, and t
 - Built with parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT). Ideas from
   [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen). More in the [details](DETAILS.md#credits-and-licenses).
+- The EXL3 CPU expert lane (`src/kernels/cpu/exl3_lane.cpp`) is ported from
+  [project-maya](https://github.com/mw00/project-maya) (MIT), whose EXL3 support follows
+  [exllamav3](https://github.com/turboderp-org/exllamav3) (MIT).
 - The AMD (HIP) backend: [AMD_HIP.md](AMD_HIP.md) names the contributors and the machines it was validated on.
 
 ## License
 
 Strata is open source under the [MIT License](../LICENSE). A few parts carry their own licenses: `third_party/ggml`
-(MIT, llama.cpp / ggml), the web app's font (SIL Open Font License 1.1) and the experimental speed projection's
+(MIT, llama.cpp / ggml), `third_party/project-maya` and `third_party/exllamav3` (MIT, the EXL3 kernels ported
+from project-maya and the format they follow), the web app's font (SIL Open Font License 1.1) and the experimental speed projection's
 vector in `data/experimental-speed-projection` (Qwen Community License 1.0, from the model's activations). The
 models are not part of this repository; each model's own license applies to its files.
