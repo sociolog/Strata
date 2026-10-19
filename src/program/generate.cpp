@@ -1553,7 +1553,29 @@ struct Exl3Drive {
         std::thread lth;
         std::atomic<uint64_t> lreq{0}, ldone{0};
         std::atomic<bool> lstop{false};
-        int pin_cpu = 11;   // the launch thread's CPU (-1: not pinned)
+        // the launch thread's CPUs (empty: not pinned).  Two, not one (10-19, Mile: the desktop micro-stuttered with this thread
+        // pinned to one core and spinning there) - and it yields while it waits, so other threads on them still run
+        std::vector<int> pin_cpus{10, 11};
+        static std::vector<int> parse_cpus(const char* v) {   // "10,11" / "10-11" / "-" (none)
+            std::vector<int> out;
+            if (v == nullptr || v[0] == '-') return out;
+            for (const char* p = v; *p;) {
+                char* end = nullptr;
+                const long a = std::strtol(p, &end, 10);
+                if (end == p) break;
+                long b = a;
+                if (*end == '-') { p = end + 1; b = std::strtol(p, &end, 10); }
+                for (long c = a; c <= b && c < CPU_SETSIZE; ++c) out.push_back((int) c);
+                p = *end == ',' ? end + 1 : end;
+                if (*end != ',') break;
+            }
+            return out;
+        }
+        static void wait_a_little(int& spins) {   // a short spin, then a yield to whoever else wants this CPU
+            if (++spins < 64) { _mm_pause(); return; }
+            spins = 0;
+            sched_yield();
+        }
         double t_launch = 0, t_wait = 0, t_copy = 0; int64_t t_n = 0;   // proto: the helper thread's round trip
         cudaEvent_t pev[4] = {};                 // proto STRATA_EXL3_HELP_EVENTS=1: plan+x landed / kernels done / rows back
         double t_up = 0, t_k = 0, t_down = 0; int64_t t_ev = 0;
@@ -1571,12 +1593,13 @@ struct Exl3Drive {
         void launch_async(const float* x_host, int64_t n_tok, const strata::kernels::exl3::ExpertLayout& lay, float* out) {
             if (!lth.joinable()) {
                 lth = std::thread([this] {
-                    if (pin_cpu >= 0) {
+                    if (!pin_cpus.empty()) {
                         cpu_set_t set;
                         CPU_ZERO(&set);
-                        CPU_SET(pin_cpu, &set);
+                        for (const int c : pin_cpus) CPU_SET(c, &set);
                         (void) pthread_setaffinity_np(pthread_self(), sizeof set, &set);
                     }
+                    int spins = 0;
                     uint64_t seen = 0;
                     auto idle = std::chrono::steady_clock::now();
                     while (!lstop.load(std::memory_order_acquire)) {
@@ -1585,7 +1608,7 @@ struct Exl3Drive {
                             if (std::chrono::steady_clock::now() - idle > std::chrono::milliseconds(20))
                                 std::this_thread::sleep_for(std::chrono::microseconds(50));
                             else
-                                _mm_pause();
+                                wait_a_little(spins);
                             continue;
                         }
                         seen = r;
@@ -1597,7 +1620,7 @@ struct Exl3Drive {
                         // the rows too, while the lane still runs: wait for the stream here (polled, the core is ours)
                         if (l_ok && entries > 0) {
                             cudaError_t q;
-                            while ((q = cudaStreamQuery(s)) == cudaErrorNotReady) _mm_pause();
+                            while ((q = cudaStreamQuery(s)) == cudaErrorNotReady) wait_a_little(spins);
                             c2 = std::chrono::steady_clock::now();
                             if (events_on() && pev[0] != nullptr && q == cudaSuccess) {
                                 float a1 = 0, a2 = 0, a3 = 0;
@@ -9241,7 +9264,7 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 exl3_drive.helper = exl3_helper.get();
-                if (const char* c = std::getenv("STRATA_EXL3_HELP_CPU")) exl3_drive.help.pin_cpu = c[0] == '-' ? -1 : std::atoi(c);
+                if (const char* c = std::getenv("STRATA_EXL3_HELP_CPU")) exl3_drive.help.pin_cpus = Exl3Drive::X3Runner::parse_cpus(c);
                 std::fprintf(stderr, "strata %s: EXL3 helper tier on device %d: the next %lld experts of %s (%.2f GiB) in "
                                      "%.1f s\n", who, dev1, (long long) exl3_helper->slots(), o.exl3_lane_profile.c_str(),
                              (double) exl3_helper->bytes() / (double) (1ull << 30), exl3_helper->load_seconds());
@@ -9292,8 +9315,7 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 exl3_drive.helper2 = exl3_helper2.get();
-                exl3_drive.help2.pin_cpu = 10;
-                if (const char* c = std::getenv("STRATA_EXL3_HELP2_CPU")) exl3_drive.help2.pin_cpu = c[0] == '-' ? -1 : std::atoi(c);
+                if (const char* c = std::getenv("STRATA_EXL3_HELP2_CPU")) exl3_drive.help2.pin_cpus = Exl3Drive::X3Runner::parse_cpus(c);
                 std::fprintf(stderr, "strata %s: EXL3 third tier on device %d: the next %lld experts of %s (%.2f GiB) in "
                                      "%.1f s\n", who, dev2, (long long) exl3_helper2->slots(), o.exl3_lane_profile.c_str(),
                              (double) exl3_helper2->bytes() / (double) (1ull << 30), exl3_helper2->load_seconds());
