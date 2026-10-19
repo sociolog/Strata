@@ -30,6 +30,11 @@ public:
     /// the slots are left empty, for an adaptive caller (assign / release_slot); they count in the budget.
     bool init(const cpu::Exl3ExpertRam& ram, const std::vector<std::pair<int32_t, int32_t>>& ranked, uint64_t budget,
               std::string& err, int device = -1, const int32_t* exclude = nullptr, int64_t spares = 0);
+    /// proto (the elastic K/V in --serve): the slots in memory the caller owns - a VMM range of `budget` bytes, all
+    /// mapped - instead of the tier's own allocation; the tier never frees it.  Call before init.
+    void use_external(uint8_t* base) { ext_base_ = base; }
+    uint64_t slot_offset(int64_t slot) const { return (uint64_t) slot * slot_bytes_; }
+    const int32_t* h_res_table() const { return h_res_.data(); }
     int device() const { return device_; }
 
     int64_t slots() const { return slots_; }               ///< every slot, the spares included
@@ -67,6 +72,7 @@ public:
         int32_t slot, key;   // key: layer * n_expert + e
     };
     bool lend(int64_t first, std::vector<Lent>& out, std::string& err);
+    bool lend_range(int64_t first, int64_t last, std::vector<Lent>& out, std::string& err);   ///< [first, last)
     bool restore(const std::vector<Lent>& lent, const cpu::Exl3ExpertRam& ram, std::string& err);
     double restore_seconds() const { return restore_s_; }   ///< the last restore's copies and table upload
 
@@ -75,6 +81,7 @@ public:
 private:
     void release();
     uint8_t* base_ = nullptr;
+    uint8_t* ext_base_ = nullptr;   // use_external: base_ points here and is not freed
     int32_t* d_res_ = nullptr;
     void* copy_stream_ = nullptr;   // restore's copies (cudaStream_t), made at its first use
     std::vector<int32_t> h_res_;

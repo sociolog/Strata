@@ -30,7 +30,7 @@ void Exl3VramTier::release() {
         (void) cudaStreamSynchronize((cudaStream_t) copy_stream_);
         (void) cudaStreamDestroy((cudaStream_t) copy_stream_);
     }
-    if (base_ != nullptr) (void) cudaFree(base_);
+    if (base_ != nullptr && base_ != ext_base_) (void) cudaFree(base_);
     if (d_res_ != nullptr) (void) cudaFree(d_res_);
     copy_stream_ = nullptr;
     base_ = nullptr;
@@ -90,7 +90,8 @@ bool Exl3VramTier::init(const cpu::Exl3ExpertRam& ram, const std::vector<std::pa
     if (cudaError_t e = cudaMalloc((void**) &d_res_, h_res_.size() * sizeof(int32_t)); e != cudaSuccess)
         return fail("the residency table", e);
     if (slots_ > 0) {
-        if (cudaError_t e = cudaMalloc((void**) &base_, (size_t) slots_ * slot_bytes_); e != cudaSuccess)
+        if (ext_base_ != nullptr) base_ = ext_base_;
+        else if (cudaError_t e = cudaMalloc((void**) &base_, (size_t) slots_ * slot_bytes_); e != cudaSuccess)
             return fail(std::to_string(slots_) + " slots of " + std::to_string(slot_bytes_) + " bytes", e);
         // one copy a slot, in order, from the RAM tier (page-locked or not: the driver stages a pageable source)
         for (int64_t s = 0; s < filled_; ++s) {
@@ -157,13 +158,16 @@ bool Exl3VramTier::upload_table(std::string& err) {
     return true;
 }
 
-bool Exl3VramTier::lend(int64_t first, std::vector<Lent>& out, std::string& err) {
+bool Exl3VramTier::lend(int64_t first, std::vector<Lent>& out, std::string& err) { return lend_range(first, slots_, out, err); }
+
+bool Exl3VramTier::lend_range(int64_t first, int64_t last, std::vector<Lent>& out, std::string& err) {
     out.clear();
-    if (first < 0 || first > slots_) {
-        err = "EXL3 VRAM tier: a loan from slot " + std::to_string(first) + " of " + std::to_string(slots_);
+    if (first < 0 || first > last || last > slots_) {
+        err = "EXL3 VRAM tier: a loan of slots [" + std::to_string(first) + ", " + std::to_string(last) + ") of " +
+              std::to_string(slots_);
         return false;
     }
-    for (int64_t s = first; s < slots_; ++s) {
+    for (int64_t s = first; s < last; ++s) {
         const int32_t key = owner_[(size_t) s];
         if (key < 0) continue;   // a spare: nothing to give back
         out.push_back({(int32_t) s, key});
