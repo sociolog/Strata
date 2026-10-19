@@ -239,6 +239,7 @@ __device__ __forceinline__ void chunk_store(float (&v)[4], const float (&s)[4], 
 // output i.  Ends with a __syncthreads (out complete).
 constexpr int kTok = 8;   // activations a block takes at once (the MMA's n)
 
+// (tried: Turing's m16n8k8 pair for sm_75 - the RTX 4000's round trip 171 -> 187 us, slower; the CUDA-core product stays)
 #if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define EXL3_TC 1
 #endif
@@ -251,10 +252,20 @@ __device__ __forceinline__ float dot4_acc(float a, const float* v, float x0, flo
 #else
 __device__ __forceinline__ void mma_f32(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                         uint32_t b0, uint32_t b1) {
+#if __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    // sm_75: k 0..7 (a0 rows g, a1 rows g + 8; b0) then k 8..15 (a2, a3; b1) - the k16 fragments split in halves
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b0));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a2), "r"(a3), "r"(b1));
+#endif
 }
 #endif
 
@@ -462,6 +473,8 @@ struct KGroup {
     float* out;
     size_t out_stride;
     unsigned* cnt;       // groups x n_ff / 128: the gate / up pairs
+    float* part;         // proto: [split][2][max_entries][n_ff] partial sums (split > 1)
+    int split, max_entries;
     size_t suh[3], svh[3], tr[3];
     int n_embd, n_ff;
     float limit;
@@ -469,26 +482,70 @@ struct KGroup {
 
 // grid (n_ff / 128, max groups, 2): group blockIdx.y's gate (z 0, into h) or up (z 1, into u) for 128 h values of
 // each of its entries, kTok entries a pass; the pair's second block to finish turns them into the swiglu, in h
+// the last of a tile's `n` blocks to finish (its counter back at zero for the next launch)
+__device__ __forceinline__ bool tile_last(unsigned* cnt, unsigned n, int& last) {
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(cnt, 1u) == n - 1u;
+    __syncthreads();
+    if (!last) return false;
+    __threadfence();
+    if (threadIdx.x == 0) *cnt = 0u;
+    return true;
+}
+
 template <int K2, int cb>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) group_gu_kernel(const KGroup a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
     __shared__ int last;
-    const int grp = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
+    const int grp = blockIdx.y, g = blockIdx.x, r = blockIdx.z & 1, sp = blockIdx.z >> 1, S = a.split;
     if (grp >= *a.n_groups) return;
     const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
-    const int warp = threadIdx.x >> 5;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     float* dst = r == 0 ? a.h : a.u;
+    // proto (split S > 1): this block takes inputs [k0, k1) and leaves its sums (before the output transform) in part;
+    // the tile's last block adds the S slices in slice order, transforms and scales them, and makes the swiglu
+    const int ks = a.n_embd / S, k0 = sp * ks, k1 = k0 + ks;
     for (int mm = m0; mm < m1; mm += kTok) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.x + (size_t) a.ent_tok[mm + warp] * a.x_stride;
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, k0, k1, x,
                           (const uint16_t*) (blob + a.suh[r]), nc, sm);
-        if (warp < nc)
-            block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
-                      dst + (size_t) (mm + warp) * a.n_ff + g * kCols);
+        if (warp < nc) {
+            if (S == 1) {
+                block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
+                          dst + (size_t) (mm + warp) * a.n_ff + g * kCols);
+            } else {
+                float* pr = a.part + (((size_t) (sp * 2 + r) * a.max_entries + (mm + warp)) * a.n_ff + g * kCols);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) pr[lane * 4 + i] = sm.out[warp * kCols + lane * 4 + i];
+            }
+        }
         __syncthreads();
+    }
+    if (S > 1) {
+        if (!tile_last(a.cnt + grp * (a.n_ff / kCols) + g, 2u * (unsigned) S, last)) return;
+        // warp w: entries m0 + w, m0 + w + 8, ... - both products, then the swiglu, as the unsplit kernels' last block
+        for (int m = m0 + warp; m < m1; m += kWarps) {
+            float hv[4], uv[4];
+            for (int rr = 0; rr < 2; ++rr) {
+                float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (int q = 0; q < S; ++q) {
+                    const float* pr = a.part + (((size_t) (q * 2 + rr) * a.max_entries + m) * a.n_ff + g * kCols);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) v[i] = __fadd_rn(v[i], __ldcg(pr + lane * 4 + i));
+                }
+                had128(v, lane);
+                const uint16_t* svh = (const uint16_t*) (blob + a.svh[rr]) + g * kCols;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) (rr == 0 ? hv : uv)[i] = __fmul_rn(v[i], h2f(svh[lane * 4 + i]));
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) a.h[(size_t) m * a.n_ff + g * kCols + lane * 4 + i] = swiglu(hv[i], uv[i], a.limit);
+        }
+        return;
     }
     if (!pair_last(a.cnt + grp * (a.n_ff / kCols) + g, last)) return;
     if (threadIdx.x < kCols)
@@ -881,7 +938,7 @@ bool dispatch(int K2, int cb, A&&... args) {
 
 template <int K2, int cb> struct RunGroupGU {
     static void run(const KGroup& a, int groups, cudaStream_t s) {
-        group_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(a);
+        group_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u * (unsigned) a.split), kThreads, 0, s>>>(a);
     }
 };
 template <int K2, int cb> struct RunGroupDown {
@@ -944,7 +1001,28 @@ bool device_ok() {
 
 int launch_errors() { return g_launch_errors.load(std::memory_order_relaxed); }
 
+bool kernels_ok() {
+    cudaFuncAttributes fa{};
+    if (cudaFuncGetAttributes(&fa, group_down_kernel<8, 2>) != cudaSuccess) {   // no image for this device's architecture
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 size_t group_counters(int max_groups, int n_ff) { return (size_t) std::max(0, max_groups) * (size_t) (n_ff / kCols); }
+int group_split() {
+    static const int s = [] {
+        const char* v = std::getenv("STRATA_EXL3_GU_SPLIT");
+        const int x = v != nullptr ? std::atoi(v) : 1;   // default off: no end-to-end gain measured (helpers 85 -> 78 us, decode the same)
+        return x == 2 || x == 4 || x == 5 || x == 10 ? x : 1;   // 2,560 inputs in whole 128-input chunks
+    }();
+    return s;
+}
+size_t group_partials(int max_entries, int n_ff) {
+    const int S = group_split();
+    return S > 1 ? (size_t) S * 2 * (size_t) std::max(0, max_entries) * (size_t) n_ff : 0;
+}
 
 bool grouped_experts(const GroupArgs& a, void* stream) {
     if (a.max_groups < 1 || a.max_entries < 1 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxKR ||
@@ -970,6 +1048,9 @@ bool grouped_experts(const GroupArgs& a, void* stream) {
     k.out = a.out;
     k.out_stride = a.out_stride;
     k.cnt = a.cnt;
+    k.part = a.part;
+    k.max_entries = a.max_entries;
+    k.split = a.part != nullptr && a.n_embd % (kCols * group_split()) == 0 ? group_split() : 1;
     for (int r = 0; r < 3; ++r) {
         k.suh[r] = a.lay.suh[r];
         k.svh[r] = a.lay.svh[r];

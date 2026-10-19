@@ -75,6 +75,8 @@ struct GroupArgs {
     float* h = nullptr;                  // scratch [max_entries][n_ff]: the gate's values, then the swiglu
     float* u = nullptr;                  // scratch [max_entries][n_ff]: the up's values
     unsigned* cnt = nullptr;             // scratch: group_counters() counters, zero (the kernels leave them zero)
+    float* part = nullptr;               // proto: scratch group_partials() floats - the gate/up's split-K partial sums
+                                         // (null: no split, the kernels as before)
     ExpertLayout lay;
     int max_groups = 0, max_entries = 0;
     int n_embd = 0, n_ff = 0;
@@ -82,6 +84,12 @@ struct GroupArgs {
 };
 /// The counters GroupArgs::cnt must hold.
 size_t group_counters(int max_groups, int n_ff);
+/// proto: the floats GroupArgs::part must hold for max_entries entries (STRATA_EXL3_GU_SPLIT slices of the inputs, 4 by
+/// default; 1: no split, 0 floats)
+size_t group_partials(int max_entries, int n_ff);
+int group_split();
+/// Whether this build carries the grouped kernels for the current device (its CMAKE_CUDA_ARCHITECTURES cover it).
+bool kernels_ok();
 /// Launches gate/up and down for the groups.  false (nothing launched) when the geometry is not covered.
 bool grouped_experts(const GroupArgs& a, void* stream);
 

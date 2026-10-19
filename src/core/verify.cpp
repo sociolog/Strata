@@ -795,6 +795,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff),
             x3_on_ ? 2 * T * K * (uint64_t) g.n_ff * sizeof(float) : 0}));   // --exl3: the grouped kernels' h and u
         x3_cnt_ = x3_on_ ? b.take<uint32_t>(strata::kernels::exl3::group_counters((int) (T * K), (int) g.n_ff)) : nullptr;
+        {
+            // the main card's tier: no split by default (measured: the split's partials cost more there than they gain;
+            // STRATA_EXL3_GU_SPLIT_MAIN=1 splits here too) - the helper cards split (their few blocks wait on latency)
+            static const bool split_main = [] { const char* v = std::getenv("STRATA_EXL3_GU_SPLIT_MAIN"); return v && v[0] == '1'; }();
+            const size_t np = x3_on_ && split_main ? strata::kernels::exl3::group_partials((int) (T * K), (int) g.n_ff) : 0;
+            x3_part_ = np > 0 ? b.take<float>(np) : nullptr;
+        }
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
@@ -1998,6 +2005,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.h = (float*) hit_scratch_;
                 a.u = a.h + (size_t) capx * (size_t) g.n_ff;
                 a.cnt = x3_cnt_;
+                a.part = x3_part_;
                 a.lay = hits_.exl3_lay[(size_t) l];
                 a.max_groups = (int) cap;
                 a.max_entries = (int) cap;

@@ -444,7 +444,9 @@ void test_experts(const std::vector<HExpert>& xs, const std::string& tag) {
     float* d_x = dev_copy(x);
     float *d_out = nullptr, *d_h = nullptr, *d_u = nullptr;
     unsigned* d_cnt = nullptr;
+    float* d_part = nullptr;   // proto: the gate/up's split-K partials (STRATA_EXL3_GU_SPLIT)
     const size_t ncnt = x3::group_counters(max_groups, F);
+    if (const size_t np = x3::group_partials(max_groups, F); np > 0 && !ck(cudaMalloc(&d_part, np * 4), "malloc part")) return;
     if (!d_gptr || !d_gstart || !d_etok || !d_edst || !d_ng || !d_x ||
         !ck(cudaMalloc(&d_out, (size_t) T * k * E * 4), "malloc out") ||
         !ck(cudaMalloc(&d_h, (size_t) max_groups * F * 4), "malloc h") ||
@@ -465,6 +467,7 @@ void test_experts(const std::vector<HExpert>& xs, const std::string& tag) {
     a.h = d_h;
     a.u = d_u;
     a.cnt = d_cnt;
+    a.part = d_part;
     a.lay = b.lay;
     a.max_groups = max_groups;
     a.max_entries = max_groups;
