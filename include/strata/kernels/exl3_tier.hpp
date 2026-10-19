@@ -53,8 +53,9 @@ public:
     /// the host's and the device copy (synchronously) - so a caller does it only while no window or token graph runs.
     int32_t owner(int64_t slot) const { return owner_[(size_t) slot]; }
     uint8_t* slot_ptr(int64_t slot) const { return base_ + (uint64_t) slot * slot_bytes_; }
-    bool assign(int64_t slot, int32_t key, std::string& err);
-    bool release_slot(int64_t slot, std::string& err);
+    // `upload` false: the host table only - the caller uploads the whole table once after a batch (upload_table)
+    bool assign(int64_t slot, int32_t key, std::string& err, bool upload = true);
+    bool release_slot(int64_t slot, std::string& err, bool upload = true);
 
     /// --serve: the batched prompt path borrows the slots [first, slots()) for its buffers, and they are refilled
     /// before a window reads the tier again.  `lend` takes the experts those slots hold out of both tables (one upload
@@ -69,9 +70,10 @@ public:
     bool restore(const std::vector<Lent>& lent, const cpu::Exl3ExpertRam& ram, std::string& err);
     double restore_seconds() const { return restore_s_; }   ///< the last restore's copies and table upload
 
+    bool upload_table(std::string& err);   // the host table to the device copy (synchronous)
+
 private:
     void release();
-    bool upload_table(std::string& err);   // the host table to the device copy (synchronous)
     uint8_t* base_ = nullptr;
     int32_t* d_res_ = nullptr;
     void* copy_stream_ = nullptr;   // restore's copies (cudaStream_t), made at its first use

@@ -108,7 +108,7 @@ bool Exl3VramTier::init(const cpu::Exl3ExpertRam& ram, const std::vector<std::pa
     return true;
 }
 
-bool Exl3VramTier::assign(int64_t slot, int32_t key, std::string& err) {
+bool Exl3VramTier::assign(int64_t slot, int32_t key, std::string& err, bool upload) {
     if (slot < 0 || slot >= slots_ || owner_[(size_t) slot] >= 0 || key < 0 || key >= (int32_t) h_res_.size() ||
         h_res_[(size_t) key] >= 0) {
         err = "EXL3 VRAM tier: assign of expert " + std::to_string(key) + " to slot " + std::to_string(slot) +
@@ -117,6 +117,7 @@ bool Exl3VramTier::assign(int64_t slot, int32_t key, std::string& err) {
     }
     h_res_[(size_t) key] = (int32_t) slot;
     owner_[(size_t) slot] = key;
+    if (!upload) return true;
     const DeviceScope on(device_);
     if (const cudaError_t e = cudaMemcpy(d_res_ + key, &h_res_[(size_t) key], sizeof(int32_t), cudaMemcpyHostToDevice);
         e != cudaSuccess) {
@@ -126,7 +127,7 @@ bool Exl3VramTier::assign(int64_t slot, int32_t key, std::string& err) {
     return true;
 }
 
-bool Exl3VramTier::release_slot(int64_t slot, std::string& err) {
+bool Exl3VramTier::release_slot(int64_t slot, std::string& err, bool upload) {
     const int32_t key = slot >= 0 && slot < slots_ ? owner_[(size_t) slot] : -1;
     if (key < 0) {
         err = "EXL3 VRAM tier: slot " + std::to_string(slot) + " holds no expert";
@@ -134,6 +135,7 @@ bool Exl3VramTier::release_slot(int64_t slot, std::string& err) {
     }
     h_res_[(size_t) key] = -1;
     owner_[(size_t) slot] = -1;
+    if (!upload) return true;
     const DeviceScope on(device_);
     if (const cudaError_t e = cudaMemcpy(d_res_ + key, &h_res_[(size_t) key], sizeof(int32_t), cudaMemcpyHostToDevice);
         e != cudaSuccess) {

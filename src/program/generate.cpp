@@ -1223,7 +1223,32 @@ struct Exl3Adapt {
         struct Pending { int32_t slot, key, victim; float score; };
         std::vector<Pending> pending;
         cudaStream_t s = nullptr;
+        struct Copy { void* dst; const void* src; size_t bytes; };
+        std::deque<Copy> todo;   // proto (STRATA_EXL3_ADAPT_SPREAD): the copies not issued yet, one a window-layer
     };
+    static bool spread_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_EXL3_ADAPT_SPREAD"); return v == nullptr || v[0] != '0'; }();
+        return on;
+    }
+    // proto: issue up to `n` queued copies (a window-layer's end: the next layer's dense part runs while they land, the
+    // DRAM idle then - a copy during the lane's work slows the lane ~30 %)
+    bool pump(int n, std::string& err) {
+        for (Tier& T : tiers) {
+            if (T.todo.empty()) continue;
+            const strata::core::OnDevice on(T.tier->device());
+            while (n > 0 && !T.todo.empty()) {
+                const Tier::Copy c = T.todo.front();
+                T.todo.pop_front();
+                if (const cudaError_t ce = cudaMemcpyAsync(c.dst, c.src, c.bytes, cudaMemcpyHostToDevice, T.s); ce != cudaSuccess) {
+                    err = std::string("--exl3-tier-adapt: an expert's copy: ") + cudaGetErrorString(ce);
+                    return false;
+                }
+                --n;
+            }
+            if (n == 0) break;
+        }
+        return true;
+    }
     std::vector<Tier> tiers;   // [0] the main tier, [1] the helper's (optional)
     const strata::kernels::cpu::Exl3ExpertRam* ram = nullptr;
     int per_round = 0;
@@ -1276,6 +1301,7 @@ struct Exl3Adapt {
     // the tier lends its slots to a prompt (so no copy is in flight into a prompt buffer, and the loan sees the tables
     // the decode left)
     bool settle(std::string& err) {
+        if (!pump(1 << 30, err)) return false;   // whatever the windows did not issue yet
         for (size_t ti = 0; ti < tiers.size(); ++ti) {
             Tier& T = tiers[ti];
             if (T.pending.empty()) continue;
@@ -1283,8 +1309,9 @@ struct Exl3Adapt {
                 err = std::string("--exl3-tier-adapt: an expert's copy: ") + cudaGetErrorString(e);
                 return false;
             }
+            const bool batch = spread_on();   // proto: the table uploaded once, not 2 synchronous copies a swap
             for (const Tier::Pending& p : T.pending) {
-                if (!T.tier->release_slot(p.victim, err) || !T.tier->assign(p.slot, p.key, err)) return false;
+                if (!T.tier->release_slot(p.victim, err, !batch) || !T.tier->assign(p.slot, p.key, err, !batch)) return false;
                 T.use[(size_t) p.slot] = p.score;
                 miss[(size_t) p.key] = 0.0f;
                 T.use[(size_t) p.victim] = 0.0f;
@@ -1292,6 +1319,7 @@ struct Exl3Adapt {
                 T.spares.push_back(p.victim);
                 ++(ti == 0 ? swaps : swaps_help);
             }
+            if (batch && !T.tier->upload_table(err)) return false;
             T.pending.clear();
         }
         return true;
@@ -1326,9 +1354,11 @@ struct Exl3Adapt {
                 if (cand[next].first <= vict[i].first + margin) break;
                 const int32_t key = cand[next].second, victim = vict[i].second, slot = T.spares.back();
                 const int layer = (int) (key / n_expert), e = (int) (key % n_expert);
-                if (const cudaError_t ce = cudaMemcpyAsync(T.tier->slot_ptr(slot), ram->blob(layer, e),
-                                                           (size_t) ram->blob_bytes(layer), cudaMemcpyHostToDevice, T.s);
-                    ce != cudaSuccess) {
+                if (spread_on()) {
+                    T.todo.push_back({T.tier->slot_ptr(slot), ram->blob(layer, e), (size_t) ram->blob_bytes(layer)});
+                } else if (const cudaError_t ce = cudaMemcpyAsync(T.tier->slot_ptr(slot), ram->blob(layer, e),
+                                                                  (size_t) ram->blob_bytes(layer), cudaMemcpyHostToDevice, T.s);
+                           ce != cudaSuccess) {
                     err = std::string("--exl3-tier-adapt: an expert's copy: ") + cudaGetErrorString(ce);
                     return false;
                 }
@@ -1800,6 +1830,7 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
         ok = false;
         err = "the helper tier's experts failed: " + err;
     }
+    if (ok && t->adapt != nullptr && Exl3Adapt::spread_on() && !t->adapt->pump(1, err)) ok = false;
     if (!ok) {
         // as the single-token hook: a wrong row would be weighted and added downstream, so the engine stops
         std::fprintf(stderr, "strata generate: EXL3 CPU lane failed in a verify window at layer %lld: %s - stopping\n",
