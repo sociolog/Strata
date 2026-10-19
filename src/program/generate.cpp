@@ -7388,6 +7388,11 @@ int main(int argc, char** argv) {
             }
             exl3_pf.host = [r = exl3_ram.get()](int64_t l, int64_t e) { return r->blob((int) l, (int) e); };
             exl3_pf.lay = exl3_lay;
+            if (!exl3_ranked.empty()) {   // proto: the profile's order, for the helper's pick of a prompt part's coldest experts
+                exl3_pf.rank.assign((size_t) (g.n_layers * g.n_expert), INT32_MAX);
+                for (size_t i = 0; i < exl3_ranked.size(); ++i)
+                    exl3_pf.rank[(size_t) (exl3_ranked[i].first * g.n_expert + exl3_ranked[i].second)] = (int32_t) i;
+            }
             exl3_pf.blob.assign((size_t) g.n_layers, 0);
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 exl3_pf.blob[(size_t) l] = exl3_ram->blob_bytes((int) l);

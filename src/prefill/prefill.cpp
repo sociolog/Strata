@@ -884,6 +884,7 @@ struct X3Help {
     // to the helper instead - copied over the helper's own link from the page-locked RAM tier into its ring (in the
     // bound region, STRATA_EXL3_PF_HELP_RING slots) and computed there with its tier's: the two links stream at once
     double share = 0.0;
+    double share_small = 0.0;   // chunks of up to 4,096 tokens (STRATA_EXL3_PF_HELP_SHARE_SMALL): link-bound, a larger share
     int R = 0;
     uint64_t rblob = 0;
     cudaStream_t s_cp = nullptr;                 // the ring's copies (the helper GPU)
@@ -2557,11 +2558,15 @@ bool Prefill::init_exl3_help(int64_t max_tokens, std::string& err) {
     if (h->f16) h->sum_copy = false;
     h->share = 0.45;
     if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_SHARE")) h->share = std::clamp(std::atof(v), 0.0, 0.9);
+    // measured with the cold pick (6.05, serve): 0.5-2K parts 3.42 s at 0.45, 3.21-3.30 at 0.50, 3.47-3.58 at 0.55; a 7K
+    // part 4.12 at 0.45, 4.40 at 0.50 (the helper's GEMMs bind there)
+    h->share_small = h->share > 0.0 ? 0.50 : 0.0;
+    if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_SHARE_SMALL")) h->share_small = std::clamp(std::atof(v), 0.0, 0.9);
     if (h->check) h->share = 0.0;
     h->R = 96;
     if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_RING")) h->R = std::clamp(std::atoi(v), 8, 512);
     h->rblob = (m.x3->max_blob + 255) & ~(uint64_t) 255;
-    if (h->share <= 0.0) h->R = 0;
+    if (h->share <= 0.0 && h->share_small <= 0.0) h->R = 0;
     auto fail = [&](const char* what) {
         err = std::string("prefill: the EXL3 helper's ") + what + ": " + cudaGetErrorString(cudaGetLastError());
         return false;   // (h's destructor frees what was made)
@@ -3194,7 +3199,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             double ps_acc = 0.0;
             // P.1: the helper's share of this chunk's stream
-            const bool h_share = x3_help && !x3_check && m.xh->R > 0 && m.xh->share > 0.0 && m.xh->b.ring != nullptr;
+            const double h_frac = x3_help ? (T <= 4096 ? m.xh->share_small : m.xh->share) : 0.0;
+            const bool h_share = x3_help && !x3_check && m.xh->R > 0 && h_frac > 0.0 && m.xh->b.ring != nullptr;
             double h_acc = 0.0;
             if (x3_help) {
                 X3Help& H = *m.xh;
@@ -3205,9 +3211,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 H.r_issued = 0;
                 H.r_released = 0;
             }
+            // the pick (STRATA_EXL3_PF_HELP_PICK): "cold" (default) - per layer the share of the streamed experts that
+            // the profile ranks coldest, the fewest rows of a chunk (the helper computes less for the same bytes);
+            // "stride" - every share-th one in id order
+            static const bool pick_cold = [] { const char* v = std::getenv("STRATA_EXL3_PF_HELP_PICK"); return !(v && std::strcmp(v, "stride") == 0); }();
+            std::vector<uint8_t> h_pick;
             for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
                 if (x3_help) m.xh->hseq_start[(size_t) l] = m.xh->hseq.size();
+                if (h_share && pick_cold && !m.x3->rank.empty()) {
+                    std::vector<std::pair<int32_t, int32_t>> cand;   // (rank, e) of the layer's streamed experts
+                    for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                        if (m.x3->vram && m.x3->vram(l, e) != nullptr) continue;
+                        if (m.x3->help(l, e) != nullptr) continue;
+                        cand.emplace_back(m.x3->rank[(size_t) l * m.g->n_expert + e], e);
+                    }
+                    const size_t nh = (size_t) std::llround(h_frac * (double) cand.size());
+                    std::partial_sort(cand.begin(), cand.begin() + (std::ptrdiff_t) std::min(nh, cand.size()), cand.end(),
+                                      [](const auto& a, const auto& b) { return a.first > b.first; });   // coldest first
+                    h_pick.assign((size_t) m.g->n_expert, 0);
+                    for (size_t i = 0; i < nh && i < cand.size(); ++i) h_pick[(size_t) cand[i].second] = 1;
+                } else {
+                    h_pick.clear();
+                }
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
@@ -3217,9 +3243,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const uint8_t* xb = m.x3->host ? m.x3->host(l, e) : nullptr;
                         if (xb == nullptr) { err = "prefill: an EXL3 expert has no host blob"; return false; }
                         if (h_share) {
-                            h_acc += m.xh->share;
-                            if (h_acc >= 1.0) {
-                                h_acc -= 1.0;
+                            bool to_help;
+                            if (!h_pick.empty()) to_help = h_pick[(size_t) e] != 0;
+                            else { h_acc += h_frac; to_help = h_acc >= 1.0; if (to_help) h_acc -= 1.0; }
+                            if (to_help) {
                                 m.xh->hidx[(size_t) l * m.g->n_expert + e] = (int32_t) m.xh->hseq.size();
                                 m.xh->hseq.push_back({(int32_t) l, e, xb, (uint64_t) entry_bytes(l)});
                                 continue;
