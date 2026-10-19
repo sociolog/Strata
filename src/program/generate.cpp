@@ -9784,7 +9784,9 @@ int main(int argc, char** argv) {
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         // (--exl3-lane: the prompt's short parts go through windows of up to kVerifyMaxT tokens, as generate reads its
         // prompt; the decode windows stay within --spec.  The drafter's head is the EXL3 pack's own)
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
+        static const bool exl3_vhead_s = [] { const char* v = std::getenv("STRATA_EXL3_VERIFY_HEAD"); return v == nullptr || v[0] != '0'; }();
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head
+                                     : exl3_vhead_s && exl3_mtp_head.loaded() ? &exl3_mtp_head : nullptr,
                       batch_mtp    ? strata::kernels::kVerifyMaxT
                       : exl3_serve ? std::max(o.spec, strata::kernels::kVerifyMaxT)
                                    : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
@@ -16861,7 +16863,12 @@ int main(int argc, char** argv) {
         if (pcie_balance()) ver.set_pcie_balance(&drive.d.pcie_model);
         // (the EXL3 prompt reader's windows take up to kVerifyMaxT tokens; the decode windows stay within --spec)
         const int ver_max_t = exl3_win_prompt ? std::max(o.spec, strata::kernels::kVerifyMaxT) : o.spec;
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, ver_max_t, err)) {
+        // the EXL3 windows read the adopted output.weight once for all their rows - the per-row head re-read the 675 MB
+        // matrix a row (2.09 -> 0.85 ms a window, the same logits bit for bit; STRATA_EXL3_VERIFY_HEAD=0: per row)
+        static const bool exl3_vhead = [] { const char* v = std::getenv("STRATA_EXL3_VERIFY_HEAD"); return v == nullptr || v[0] != '0'; }();
+        strata::core::NativeHead* ver_head = native_head.loaded() ? &native_head
+                                           : exl3_vhead && exl3_mtp_head.loaded() ? &exl3_mtp_head : nullptr;
+        if (!ver.init(wt, g, ss, vh, ver_head, ver_max_t, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
