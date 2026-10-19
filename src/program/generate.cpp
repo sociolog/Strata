@@ -1835,7 +1835,7 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
         static const double le = [] { const char* v = std::getenv("STRATA_EXL3_SCHED_LANE"); return v ? std::atof(v) : 100.0; }();
         static const double h1c = [] { const char* v = std::getenv("STRATA_EXL3_SCHED_H1"); return v ? std::atof(v) : 110.0; }();
         static const double h2c = [] { const char* v = std::getenv("STRATA_EXL3_SCHED_H2"); return v ? std::atof(v) : 200.0; }();
-        if (ok && sched && (take1 || take2)) {
+        if (ok && sched && take2) {   // with a third tier only: on the 3090 + 3060 it measured neutral (62.18 vs 62.35)
             int n1 = 0, n2 = 0, nl = 0;
             const int64_t n = n_tok * k;
             for (int64_t i = 0; i < n; ++i) {
