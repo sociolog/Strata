@@ -435,6 +435,7 @@ struct Options {
     std::string exl3_lane_profile;    // --exl3-lane: fill the EXL3 VRAM tier from this routing profile (the GPU share)
     int64_t exl3_vram_tier_mib = -1;  // --exl3-vram-tier: that tier's VRAM in MiB; -1 auto (what is left), 0 none
     int64_t exl3_helper_tier_mib = 0; // --exl3-helper-tier: a second tier on the helper card, MiB; -1 auto, 0 none
+    int64_t exl3_helper2_tier_mib = 0; // proto --exl3-helper2-tier: a third tier on the run's device 2, MiB; -1 auto, 0 none
     int exl3_tier_adapt = 32;         // --exl3-tier-adapt: experts the VRAM tier swaps in a round (0: static)
     bool no_ple = false;              // explicit diagnostic ablation; never a normal inference default
     bool stream_token = false;        // R2.6 experiment: ordered work on the session stream
@@ -1317,10 +1318,12 @@ struct Exl3Adapt {
         return n == 0 || T.tier->upload_table(err);
     }
     // a window-layer's routes: the main tier's (on_gpu) and the helper's (on_help) per slot, the lane's per expert
-    void count(int64_t layer, const int32_t* ids, int64_t n, const bool* on_gpu, const bool* on_help) {
+    void count(int64_t layer, const int32_t* ids, int64_t n, const bool* on_gpu, const bool* on_help,
+               const bool* on_help2 = nullptr) {
         const int32_t* r0 = tiers[0].tier->h_res() + layer * n_expert;
         const int32_t* r1 = tiers.size() > 1 ? tiers[1].tier->h_res() + layer * n_expert : nullptr;
         for (int64_t i = 0; i < n; ++i) {
+            if (on_help2 != nullptr && on_help2[i]) continue;   // the third tier's: no slot here, and no miss
             if (on_gpu[i]) tiers[0].use[(size_t) r0[ids[i]]] += 1.0f;
             else if (on_help[i]) { if (r1 != nullptr) tiers[1].use[(size_t) r1[ids[i]]] += 1.0f; }
             else miss[(size_t) (layer * n_expert + ids[i])] += 1.0f;
@@ -1441,6 +1444,10 @@ struct Exl3Drive {
     // run them there (`help`) beside the lane, their rows back in the pool's own rows
     const strata::kernels::Exl3VramTier* helper = nullptr;
     int64_t help_entries = 0, help_groups = 0;
+    // proto --exl3-helper2-tier: a third tier (the run's device 2, e.g. the RTX 4000), run there by `help2` the same way
+    const strata::kernels::Exl3VramTier* helper2 = nullptr;
+    int64_t help2_entries = 0, help2_groups = 0;
+    int64_t sched_skip1 = 0, sched_skip2 = 0;   // proto STRATA_EXL3_SCHED: window-layers whose helper's experts stayed on the lane
     // A tier's experts run by the pool itself, on a stream of the tier's device: the routes grouped by expert as a
     // window's plan is (exl3_dev.hpp: grouped_experts - every entry the bits it gets alone), the activations uploaded,
     // the rows written compact and copied back into pinned memory, then put in the caller's rows.  Buffers made when the
@@ -1535,6 +1542,7 @@ struct Exl3Drive {
         std::thread lth;
         std::atomic<uint64_t> lreq{0}, ldone{0};
         std::atomic<bool> lstop{false};
+        int pin_cpu = 11;   // the launch thread's CPU (-1: not pinned)
         double t_launch = 0, t_wait = 0, t_copy = 0; int64_t t_n = 0;   // proto: the helper thread's round trip
         const float* l_x = nullptr;
         float* l_out = nullptr;   // where the thread puts the rows (the window's mapped rows), once they are back
@@ -1549,10 +1557,10 @@ struct Exl3Drive {
         void launch_async(const float* x_host, int64_t n_tok, const strata::kernels::exl3::ExpertLayout& lay, float* out) {
             if (!lth.joinable()) {
                 lth = std::thread([this] {
-                    if (const char* c = std::getenv("STRATA_EXL3_HELP_CPU"); c == nullptr || c[0] != '-') {
+                    if (pin_cpu >= 0) {
                         cpu_set_t set;
                         CPU_ZERO(&set);
-                        CPU_SET(c != nullptr ? std::atoi(c) : 11, &set);
+                        CPU_SET(pin_cpu, &set);
                         (void) pthread_setaffinity_np(pthread_self(), sizeof set, &set);
                     }
                     uint64_t seen = 0;
@@ -1631,6 +1639,7 @@ struct Exl3Drive {
     X3Runner tok;    // the token path's share of the tier (device 0)
     Exl3Adapt* adapt = nullptr;   // --exl3-tier-adapt: the windows' route counts
     X3Runner help;   // the helper tier's, both pools (device 1)
+    X3Runner help2;  // proto: the third tier's (device 2)
 };
 void drive_exl3_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                      int64_t k, float* out) {
@@ -1795,10 +1804,54 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
         }
     }
     const Clock::time_point a1 = Clock::now();
+    // proto (STRATA_EXL3_SCHED, default on): a helper card takes its experts only where that shortens the layer - its round
+    // trip is ~fixed (the 3060 ~110 us, the RTX 4000 ~200 us), the lane's ~21 + ~100 us an expert, so in a layer where
+    // the lane has little to do a helper's one or two experts come back sooner from the lane (same RAM tier, exact)
+    bool take1 = t->helper != nullptr, take2 = t->helper2 != nullptr;
+    {
+        static const bool sched = [] { const char* v = std::getenv("STRATA_EXL3_SCHED"); return v == nullptr || v[0] != '0'; }();
+        static const double l0 = [] { const char* v = std::getenv("STRATA_EXL3_SCHED_LANE0"); return v ? std::atof(v) : 21.0; }();
+        static const double le = [] { const char* v = std::getenv("STRATA_EXL3_SCHED_LANE"); return v ? std::atof(v) : 100.0; }();
+        static const double h1c = [] { const char* v = std::getenv("STRATA_EXL3_SCHED_H1"); return v ? std::atof(v) : 110.0; }();
+        static const double h2c = [] { const char* v = std::getenv("STRATA_EXL3_SCHED_H2"); return v ? std::atof(v) : 200.0; }();
+        if (ok && sched && (take1 || take2)) {
+            int n1 = 0, n2 = 0, nl = 0;
+            const int64_t n = n_tok * k;
+            for (int64_t i = 0; i < n; ++i) {
+                if (on_gpu[i]) continue;
+                const int32_t e = ids[i];
+                bool first = true;
+                for (int64_t j = 0; j < i && first; ++j) first = ids[j] != e || on_gpu[j];
+                if (!first) continue;
+                if (take1 && t->helper->blob(layer, e) != nullptr) ++n1;
+                else if (take2 && t->helper2->blob(layer, e) != nullptr) ++n2;
+                else ++nl;
+            }
+            auto lane = [&](int m) { return m > 0 ? l0 + le * m : 0.0; };
+            auto crit = [&](bool a, bool b) {
+                const int m = nl + (a ? 0 : n1) + (b ? 0 : n2);
+                return std::max({lane(m), a && n1 > 0 ? h1c : 0.0, b && n2 > 0 ? h2c : 0.0});
+            };
+            bool b1 = take1, b2 = take2;
+            double best = crit(b1, b2);
+            for (int a = 0; a < 2; ++a)
+                for (int b = 0; b < 2; ++b) {
+                    if ((a && !take1) || (b && !take2)) continue;
+                    const double c = crit(a != 0, b != 0);
+                    if (c < best - 1e-9) { best = c; b1 = a != 0; b2 = b != 0; }
+                }
+            take1 = b1;
+            take2 = b2;
+            if (!take1 && t->helper != nullptr) t->help.begin();     // nothing of the last layer's plan is read again
+            if (!take2 && t->helper2 != nullptr) t->help2.begin();
+            if (!take1 && t->helper != nullptr) ++t->sched_skip1;
+            if (!take2 && t->helper2 != nullptr) ++t->sched_skip2;
+        }
+    }
     // the helper tier's share: the window's experts the helper card holds (never the main tier's), run there now with the
     // same kernels; their rows reach `out` after the lane's (the window takes them as the CPU's rows)
     bool on_help[cpu::MAXT * 64] = {};
-    if (ok && t->helper != nullptr) {
+    if (ok && t->helper != nullptr && take1) {
         Exl3Drive::X3Runner& h = t->help;
         const int64_t n = n_tok * k;
         h.begin();
@@ -1825,7 +1878,31 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
         t->help_entries += h.entries;
     }
     const Clock::time_point a2 = Clock::now();
-    if (ok && t->adapt != nullptr && t->tier != nullptr) t->adapt->count(layer, ids, n_tok * k, on_gpu, on_help);
+    // proto: the third tier's share (its experts none of the other two hold), the same way on device 2
+    bool on_help2[cpu::MAXT * 64] = {};
+    if (ok && t->helper2 != nullptr && take2) {
+        Exl3Drive::X3Runner& h = t->help2;
+        const int64_t n = n_tok * k;
+        h.begin();
+        for (int64_t i = 0; i < n && ok; ++i) {
+            if (on_gpu[i] || on_help[i] || on_help2[i]) continue;
+            const int32_t e = ids[i];
+            const uint8_t* b = t->helper2->blob(layer, e);
+            if (b == nullptr) continue;
+            if (h.entries + n_tok > h.cap) { ok = false; err = "the window has more entries than the third tier's buffers"; break; }
+            h.group(b);
+            for (int64_t q = i; q < n; ++q)
+                if (ids[q] == e) {
+                    h.entry((int32_t) (q / k), (int32_t) q);
+                    on_help2[q] = true;
+                }
+        }
+        if (ok && h.entries > 0) h.launch_async(x_f, n_tok, (*t->lay)[(size_t) layer], out);
+        t->help2_groups += h.groups;
+        t->help2_entries += h.entries;
+    }
+    if (ok && t->adapt != nullptr && t->tier != nullptr)
+        t->adapt->count(layer, ids, n_tok * k, on_gpu, on_help, t->helper2 != nullptr ? on_help2 : nullptr);
     Clock::time_point a3 = Clock::now(), a4 = a3;
     if (ok) {
         const int ne = t->ram->n_expert();
@@ -1835,7 +1912,7 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
         for (int64_t q = 0; q < n_tok && ok; ++q)
             for (int64_t i = 0; i < k; ++i) {
                 const int32_t e = ids[q * k + i];
-                if (on_gpu[q * k + i] || on_help[q * k + i]) continue;   // the tiers': computed on a GPU
+                if (on_gpu[q * k + i] || on_help[q * k + i] || on_help2[q * k + i]) continue;   // the tiers': computed on a GPU
                 int16_t& s = t->job_of[(size_t) e];
                 if (s < 0) {
                     s = (int16_t) njobs;
@@ -1858,6 +1935,10 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
     if (ok && t->helper != nullptr && !t->help.finish(out, err)) {
         ok = false;
         err = "the helper tier's experts failed: " + err;
+    }
+    if (ok && t->helper2 != nullptr && !t->help2.finish(out, err)) {
+        ok = false;
+        err = "the third tier's experts failed: " + err;
     }
     if (ok && t->adapt != nullptr && Exl3Adapt::spread_on() && !t->adapt->pump(1, err)) ok = false;
     if (!ok) {
@@ -3077,9 +3158,10 @@ int main(int argc, char** argv) {
         else if (a == "--exl3-lane") o.exl3_lane = true;
         else if (a == "--exl3-lane-profile") o.exl3_lane_profile = next("--exl3-lane-profile");
         else if (a == "--exl3-tier-adapt") o.exl3_tier_adapt = std::max(0, std::atoi(next("--exl3-tier-adapt")));
-        else if (a == "--exl3-vram-tier" || a == "--exl3-helper-tier") {
+        else if (a == "--exl3-vram-tier" || a == "--exl3-helper-tier" || a == "--exl3-helper2-tier") {
             const std::string v = next(a.c_str());
-            int64_t& mib = a == "--exl3-vram-tier" ? o.exl3_vram_tier_mib : o.exl3_helper_tier_mib;
+            int64_t& mib = a == "--exl3-vram-tier" ? o.exl3_vram_tier_mib
+                         : a == "--exl3-helper-tier" ? o.exl3_helper_tier_mib : o.exl3_helper2_tier_mib;
             mib = v == "auto" ? -1 : std::atoll(v.c_str());
             if (v != "auto" && (v.empty() || v.find_first_not_of("0123456789") != std::string::npos)) {
                 std::fprintf(stderr, "strata generate: %s takes a size in MiB or auto, not '%s'\n", a.c_str(), v.c_str());
@@ -7243,7 +7325,7 @@ int main(int argc, char** argv) {
     // the VRAM tier (--exl3-lane-profile) and the tier itself (made once the prompt is read)
     std::vector<strata::kernels::exl3::ExpertLayout> exl3_lay;
     std::vector<std::pair<int32_t, int32_t>> exl3_ranked;
-    std::unique_ptr<strata::kernels::Exl3VramTier> exl3_tier, exl3_helper;
+    std::unique_ptr<strata::kernels::Exl3VramTier> exl3_tier, exl3_helper, exl3_helper2;
     // proto: the elastic K/V in --serve on the EXL3 lane - the main tier's slots in a VMM range; the K/V takes the tier's
     // last slots [lo, slots) as a conversation grows (their experts go to the lane) and gives them back for a short one
     std::unique_ptr<strata::core::VmmRange> exl3_xr;
@@ -9135,9 +9217,52 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 exl3_drive.helper = exl3_helper.get();
+                if (const char* c = std::getenv("STRATA_EXL3_HELP_CPU")) exl3_drive.help.pin_cpu = c[0] == '-' ? -1 : std::atoi(c);
                 std::fprintf(stderr, "strata %s: EXL3 helper tier on device %d: the next %lld experts of %s (%.2f GiB) in "
                                      "%.1f s\n", who, dev1, (long long) exl3_helper->slots(), o.exl3_lane_profile.c_str(),
                              (double) exl3_helper->bytes() / (double) (1ull << 30), exl3_helper->load_seconds());
+            }
+        }
+        // proto --exl3-helper2-tier: the profile's next-hottest experts after both tiers on the run's device 2 (the RTX 4000
+        // with CUDA_VISIBLE_DEVICES=1,2,0), run there by its own runner and launch thread beside the lane
+        if (exl3_drive.ram != nullptr && !exl3_ranked.empty() && exl3_drive.stream == nullptr && o.exl3_helper2_tier_mib != 0 &&
+            exl3_helper != nullptr) {
+            int ndev = 0;
+            (void) cudaGetDeviceCount(&ndev);
+            const int dev2 = 2;
+            if (ndev < 3) {
+                std::fprintf(stderr, "strata %s: --exl3-helper2-tier: this run sees %d GPUs (CUDA_VISIBLE_DEVICES): no third "
+                                     "tier\n", who, ndev);
+            } else {
+                size_t fb2 = 0, tb2 = 0;
+                {
+                    const strata::core::OnDevice on(dev2);
+                    cudaMemGetInfo(&fb2, &tb2);
+                }
+                const uint64_t reserve = (uint64_t) [] {
+                    const char* v = std::getenv("STRATA_EXL3_HELPER2_RESERVE_MIB");
+                    return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : (int64_t) 768;   // the desktop's
+                }() << 20;
+                const uint64_t budget = o.exl3_helper2_tier_mib > 0 ? (uint64_t) o.exl3_helper2_tier_mib << 20
+                                                                    : (fb2 > reserve ? (uint64_t) fb2 - reserve : 0);
+                std::vector<int32_t> excl((size_t) (exl3_ram->n_layers() * exl3_ram->n_expert()), -1);
+                for (const strata::kernels::Exl3VramTier* x : {exl3_tier.get(), exl3_helper.get()})
+                    if (x != nullptr)
+                        for (size_t i = 0; i < excl.size(); ++i)
+                            if (x->h_res_table()[i] >= 0) excl[i] = 0;
+                exl3_helper2 = std::make_unique<strata::kernels::Exl3VramTier>();
+                if (!exl3_helper2->init(*exl3_ram, exl3_ranked, budget, err, dev2, excl.data(), 0) ||
+                    !exl3_drive.help2.init(dev2, strata::kernels::cpu::MAXT, (int64_t) strata::kernels::cpu::MAXT * ss.k,
+                                           g.n_embd, g.n_ff, err)) {
+                    std::fprintf(stderr, "strata %s: %s\n", who, err.c_str());
+                    return false;
+                }
+                exl3_drive.helper2 = exl3_helper2.get();
+                exl3_drive.help2.pin_cpu = 10;
+                if (const char* c = std::getenv("STRATA_EXL3_HELP2_CPU")) exl3_drive.help2.pin_cpu = c[0] == '-' ? -1 : std::atoi(c);
+                std::fprintf(stderr, "strata %s: EXL3 third tier on device %d: the next %lld experts of %s (%.2f GiB) in "
+                                     "%.1f s\n", who, dev2, (long long) exl3_helper2->slots(), o.exl3_lane_profile.c_str(),
+                             (double) exl3_helper2->bytes() / (double) (1ull << 30), exl3_helper2->load_seconds());
             }
         }
         return true;
@@ -17769,6 +17894,11 @@ int main(int argc, char** argv) {
                             "EXL3 helper round trip", exl3_drive.help.t_launch / exl3_drive.help.t_n,
                             exl3_drive.help.t_wait / exl3_drive.help.t_n, exl3_drive.help.t_copy / exl3_drive.help.t_n,
                             (long long) exl3_drive.help.t_n);
+            if (exl3_drive.help2.t_n > 0)
+                std::printf("%-24s launch %.1f  device (copies + kernels + rows back) %.1f  placing the rows %.1f us a call (%lld calls)\n",
+                            "EXL3 third round trip", exl3_drive.help2.t_launch / exl3_drive.help2.t_n,
+                            exl3_drive.help2.t_wait / exl3_drive.help2.t_n, exl3_drive.help2.t_copy / exl3_drive.help2.t_n,
+                            (long long) exl3_drive.help2.t_n);
         }
         if (exl3_hits && exl3_drive.win_calls > 0)
             std::printf("%-24s %.1f%% of the routes (%.2f entries in %.2f experts a window-layer) on the GPU tier\n",
@@ -17782,6 +17912,16 @@ int main(int argc, char** argv) {
                                                                               (double) exl3_drive.win_entries : 0.0,
                         (double) exl3_drive.help_entries / (double) exl3_drive.win_calls,
                         (double) exl3_drive.help_groups / (double) exl3_drive.win_calls);
+        if (exl3_win && exl3_drive.win_calls > 0 && (exl3_drive.sched_skip1 > 0 || exl3_drive.sched_skip2 > 0))
+            std::printf("%-24s the helper's experts on the lane in %.1f%%, the third tier's in %.1f%% of the window-layers\n",
+                        "EXL3 lane scheduling", 100.0 * (double) exl3_drive.sched_skip1 / (double) exl3_drive.win_calls,
+                        100.0 * (double) exl3_drive.sched_skip2 / (double) exl3_drive.win_calls);
+        if (exl3_drive.helper2 != nullptr && exl3_drive.win_calls > 0)
+            std::printf("%-24s %.1f%% of the routes (%.2f entries in %.2f experts a window-layer) on the third tier\n",
+                        "EXL3 third tier", exl3_drive.win_entries > 0 ? 100.0 * (double) exl3_drive.help2_entries /
+                                                                             (double) exl3_drive.win_entries : 0.0,
+                        (double) exl3_drive.help2_entries / (double) exl3_drive.win_calls,
+                        (double) exl3_drive.help2_groups / (double) exl3_drive.win_calls);
         if (exl3_drive.adapt != nullptr)
             std::printf("%-24s %lld swaps in the main tier, %lld in the helper's, over %lld rounds (up to %d a round each)\n",
                         "EXL3 tier adapt", (long long) exl3_drive.adapt->swaps, (long long) exl3_drive.adapt->swaps_help,

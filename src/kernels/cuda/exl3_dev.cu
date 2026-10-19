@@ -239,6 +239,7 @@ __device__ __forceinline__ void chunk_store(float (&v)[4], const float (&s)[4], 
 // output i.  Ends with a __syncthreads (out complete).
 constexpr int kTok = 8;   // activations a block takes at once (the MMA's n)
 
+// (tried: Turing's m16n8k8 pair for sm_75 - the RTX 4000's round trip 171 -> 187 us, slower; the CUDA-core product stays)
 #if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define EXL3_TC 1
 #endif
@@ -251,10 +252,20 @@ __device__ __forceinline__ float dot4_acc(float a, const float* v, float x0, flo
 #else
 __device__ __forceinline__ void mma_f32(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                         uint32_t b0, uint32_t b1) {
+#if __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    // sm_75: k 0..7 (a0 rows g, a1 rows g + 8; b0) then k 8..15 (a2, a3; b1) - the k16 fragments split in halves
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b0));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a2), "r"(a3), "r"(b1));
+#endif
 }
 #endif
 
