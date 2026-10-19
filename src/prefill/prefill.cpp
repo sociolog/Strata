@@ -878,13 +878,50 @@ struct X3Help {
         void* ws[NS] = {};              // per stream: its cuBLAS workspace
         float* wk = nullptr;            // sums: T x K routing weights
         float* sum = nullptr;           // sums: T x N, its experts' weighted rows per token
+        uint8_t* ring = nullptr;        // P.1: the share's copy ring, R slots of rblob bytes
     } b;
+    // P.1 (STRATA_EXL3_PF_HELP_SHARE, default 0.45; 0: off): of the experts this GPU would stream, every share-th goes
+    // to the helper instead - copied over the helper's own link from the page-locked RAM tier into its ring (in the
+    // bound region, STRATA_EXL3_PF_HELP_RING slots) and computed there with its tier's: the two links stream at once
+    double share = 0.0;
+    int R = 0;
+    uint64_t rblob = 0;
+    cudaStream_t s_cp = nullptr;                 // the ring's copies (the helper GPU)
+    std::vector<cudaEvent_t> rcopied, rused;     // per slot: its copy landed / its last reader is done
+    std::vector<uint8_t> rlive;
+    struct HEntry { int32_t l, e; const uint8_t* blob; uint64_t bytes; };
+    std::vector<HEntry> hseq;                    // the chunk's share, layer by layer in id order (entry k: slot k % R)
+    std::vector<size_t> hseq_start;
+    std::vector<int32_t> hidx;                   // (layer * n_expert + e) -> its entry, -1: not the helper's to stream
+    size_t r_issued = 0;
+    size_t r_released = 0;                       // entries [0, r_released) have their slot's `rused` recorded
+    int64_t streamed = 0;
+    // entries [r_released, upto) that the routing did not pick give their slots back (on the ring's stream), then the
+    // ring is issued as far as the released ones allow - a copy waits only on an event that is already recorded
+    void release_until(size_t upto, const std::vector<int32_t>& cnt) {
+        for (; r_released < upto; ++r_released)
+            if (cnt[(size_t) hseq[r_released].e] == 0) cudaEventRecord(rused[r_released % (size_t) R], s_cp);
+        ring_issue_until(r_released + (size_t) R);
+    }
+    void ring_issue_until(size_t limit) {        // on the helper device
+        limit = std::min(limit, hseq.size());
+        while (r_issued < limit) {
+            const HEntry& en = hseq[r_issued];
+            const size_t sl = r_issued % (size_t) R;
+            if (rlive[sl]) cudaStreamWaitEvent(s_cp, rused[sl], 0);
+            cudaMemcpyAsync(b.ring + sl * rblob, en.blob, (size_t) en.bytes, cudaMemcpyHostToDevice, s_cp);
+            cudaEventRecord(rcopied[sl], s_cp);
+            rlive[sl] = 1;
+            ++r_issued;
+            ++streamed;
+        }
+    }
     // the table: [0, T*K) its rows' tokens, [T*K, T*K + NE + 1) its experts' row bounds, then (sums) each row's routed
     // pair (t * K + k) at pair_at(T)
     static int64_t pair_at(int64_t T) { return T * K + NE + 1; }
     static size_t tab_ints(int64_t T, bool sums) { return (size_t) (pair_at(T) + (sums ? T * K : 0)); }
     // `base` null: only counts.  The bytes of the layout for chunks of T tokens.
-    static uint64_t layout(Bufs& o, uint8_t* base, int64_t T, int ns, bool sums) {
+    static uint64_t layout(Bufs& o, uint8_t* base, int64_t T, int ns, bool sums, int R = 0, uint64_t rblob = 0) {
         uint64_t used = 0;
         auto take = [&](auto*& p, size_t n) {
             const uint64_t at = (used + 255) & ~(uint64_t) 255;
@@ -907,6 +944,7 @@ struct X3Help {
             take(w, WS);
             o.ws[q] = w;
         }
+        if (R > 0) take(o.ring, (size_t) R * rblob);
         return used;
     }
     // pinned host memory (portable, mapped)
@@ -969,6 +1007,9 @@ struct X3Help {
                 if (ev_q[q]) cudaEventDestroy(ev_q[q]);
             }
             if (s_out) cudaStreamDestroy(s_out);
+            if (s_cp) { cudaStreamSynchronize(s_cp); cudaStreamDestroy(s_cp); }
+            for (cudaEvent_t e : rcopied) if (e) cudaEventDestroy(e);
+            for (cudaEvent_t e : rused) if (e) cudaEventDestroy(e);
             for (cudaEvent_t e : {ev_in, ev_flush, ev_done})
                 if (e) cudaEventDestroy(e);
             for (auto& set : pe_h)
@@ -2514,6 +2555,13 @@ bool Prefill::init_exl3_help(int64_t max_tokens, std::string& err) {
     if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_SLICES")) h->slices = std::clamp(std::atoi(v), 1, X3Help::MAX_SLICES);
     if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_F16")) h->f16 = h->sums && v[0] == '1';
     if (h->f16) h->sum_copy = false;
+    h->share = 0.45;
+    if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_SHARE")) h->share = std::clamp(std::atof(v), 0.0, 0.9);
+    if (h->check) h->share = 0.0;
+    h->R = 96;
+    if (const char* v = std::getenv("STRATA_EXL3_PF_HELP_RING")) h->R = std::clamp(std::atoi(v), 8, 512);
+    h->rblob = (m.x3->max_blob + 255) & ~(uint64_t) 255;
+    if (h->share <= 0.0) h->R = 0;
     auto fail = [&](const char* what) {
         err = std::string("prefill: the EXL3 helper's ") + what + ": " + cudaGetErrorString(cudaGetLastError());
         return false;   // (h's destructor frees what was made)
@@ -2535,6 +2583,16 @@ bool Prefill::init_exl3_help(int64_t max_tokens, std::string& err) {
             }
         }
         if (cudaStreamCreateWithFlags(&h->s_out, cudaStreamNonBlocking) != cudaSuccess) return fail("copy stream");
+        if (h->R > 0) {
+            if (cudaStreamCreateWithFlags(&h->s_cp, cudaStreamNonBlocking) != cudaSuccess) return fail("ring stream");
+            h->rcopied.assign((size_t) h->R, nullptr);
+            h->rused.assign((size_t) h->R, nullptr);
+            h->rlive.assign((size_t) h->R, 0);
+            for (int i = 0; i < h->R; ++i)
+                if (cudaEventCreateWithFlags(&h->rcopied[(size_t) i], cudaEventDisableTiming) != cudaSuccess ||
+                    cudaEventCreateWithFlags(&h->rused[(size_t) i], cudaEventDisableTiming) != cudaSuccess)
+                    return fail("ring event");
+        }
         for (cudaEvent_t* e : {&h->ev_in, &h->ev_flush, &h->ev_done})
             if (cudaEventCreateWithFlags(e, cudaEventDisableTiming) != cudaSuccess) return fail("event");
         if (h->prof)
@@ -2579,7 +2637,7 @@ uint64_t Prefill::exl3_help_bytes(int64_t chunk) const {
     const Impl& m = *impl_;
     if (!m.xh || chunk < 1) return 0;
     X3Help::Bufs b;
-    return X3Help::layout(b, nullptr, chunk, m.xh->ns, m.xh->sums);
+    return X3Help::layout(b, nullptr, chunk, m.xh->ns, m.xh->sums, m.xh->R, m.xh->rblob);
 }
 bool Prefill::bind_exl3_help(void* region, uint64_t bytes, int64_t chunk, std::string& err) {
     Impl& m = *impl_;
@@ -2594,6 +2652,8 @@ bool Prefill::bind_exl3_help(void* region, uint64_t bytes, int64_t chunk, std::s
         for (int q = 0; q < h.ns; ++q)
             if (cudaStreamSynchronize(h.s[q]) != cudaSuccess) return err = "prefill: the EXL3 helper's stream failed", false;
         if (cudaStreamSynchronize(h.s_out) != cudaSuccess) return err = "prefill: the EXL3 helper's copies failed", false;
+        if (h.s_cp && cudaStreamSynchronize(h.s_cp) != cudaSuccess) return err = "prefill: the EXL3 helper's ring failed", false;
+        std::fill(h.rlive.begin(), h.rlive.end(), 0);   // a new region: no slot holds anything yet
     }
     h.b = X3Help::Bufs{};
     h.T = 0;
@@ -2604,13 +2664,13 @@ bool Prefill::bind_exl3_help(void* region, uint64_t bytes, int64_t chunk, std::s
         return false;
     }
     X3Help::Bufs b;
-    const uint64_t need = X3Help::layout(b, nullptr, chunk, h.ns, h.sums);
+    const uint64_t need = X3Help::layout(b, nullptr, chunk, h.ns, h.sums, h.R, h.rblob);
     if (need > bytes) {
         err = "prefill: the EXL3 helper's buffers for " + std::to_string(chunk) + "-token chunks need " +
               std::to_string(need >> 20) + " MiB, the region has " + std::to_string(bytes >> 20);
         return false;
     }
-    X3Help::layout(h.b, (uint8_t*) region, chunk, h.ns, h.sums);
+    X3Help::layout(h.b, (uint8_t*) region, chunk, h.ns, h.sums, h.R, h.rblob);
     {
         const core::OnDevice od(h.dev);   // (each handle is the helper GPU's)
         for (int q = 0; q < h.ns; ++q) h.gemm[q]->rebind(nullptr, 0, h.b.ws[q], X3Help::WS);
@@ -3133,8 +3193,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 m.pp->p_issued = m.pp->pk = 0;
             }
             double ps_acc = 0.0;
+            // P.1: the helper's share of this chunk's stream
+            const bool h_share = x3_help && !x3_check && m.xh->R > 0 && m.xh->share > 0.0 && m.xh->b.ring != nullptr;
+            double h_acc = 0.0;
+            if (x3_help) {
+                X3Help& H = *m.xh;
+                H.hseq.clear();
+                H.hseq_start.assign((size_t) g.n_layers + 1, 0);
+                if (h_share) H.hidx.assign((size_t) g.n_layers * (size_t) m.g->n_expert, -1);
+                else H.hidx.clear();
+                H.r_issued = 0;
+                H.r_released = 0;
+            }
             for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
+                if (x3_help) m.xh->hseq_start[(size_t) l] = m.xh->hseq.size();
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
@@ -3143,6 +3216,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (x3_help && !x3_check && m.x3->help(l, e) != nullptr) continue;   // the helper GPU's
                         const uint8_t* xb = m.x3->host ? m.x3->host(l, e) : nullptr;
                         if (xb == nullptr) { err = "prefill: an EXL3 expert has no host blob"; return false; }
+                        if (h_share) {
+                            h_acc += m.xh->share;
+                            if (h_acc >= 1.0) {
+                                h_acc -= 1.0;
+                                m.xh->hidx[(size_t) l * m.g->n_expert + e] = (int32_t) m.xh->hseq.size();
+                                m.xh->hseq.push_back({(int32_t) l, e, xb, (uint64_t) entry_bytes(l)});
+                                continue;
+                            }
+                        }
                         seq.push_back({(int32_t) l, e, xb, -1});
                         continue;
                     }
@@ -3174,9 +3256,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             for (int64_t l = LE; l <= g.n_layers; ++l) {
                 seq_start[(size_t) l] = seq.size();
+                if (x3_help) m.xh->hseq_start[(size_t) l] = m.xh->hseq.size();
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
             }
             m.stager->start(std::move(js));
+            if (h_share && !m.xh->hseq.empty()) {   // the helper's link starts on layer LB's share at once
+                const core::OnDevice od(m.xh->dev);
+                m.xh->ring_issue_until((size_t) m.xh->R);
+            }
         }
         struct StagerDone {
             Stager* st;
@@ -3897,7 +3984,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.x3_is_help.assign((size_t) NX, 0);
                             for (int32_t e = 0; e < NX; ++e)
                                 if (m.cnt[(size_t) e] > 0 && !(m.x3->vram && m.x3->vram(l, e) != nullptr) &&
-                                    m.x3->help(l, e) != nullptr) {
+                                    (m.x3->help(l, e) != nullptr ||
+                                     (!m.xh->hidx.empty() && m.xh->hidx[(size_t) l * NX + e] >= 0))) {
                                     m.x3_is_help[(size_t) e] = 1;
                                     m.x3_help_e.push_back(e);
                                 }
@@ -4031,7 +4119,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     const int q = q_next_h;
                                     q_next_h = q_next_h + 1 == H.ns ? 0 : q_next_h + 1;
                                     const cudaStream_t sq = H.s[q];
-                                    const uint8_t* blob = m.x3->help(l, e);
+                                    const int32_t hi = H.hidx.empty() ? -1 : H.hidx[(size_t) l * NX + e];
+                                    const uint8_t* blob = hi >= 0 ? H.b.ring + (size_t) (hi % H.R) * H.rblob : m.x3->help(l, e);
+                                    if (hi >= 0) {   // its copy issued (the unrouted ones before it released), then awaited
+                                        H.release_until((size_t) hi, m.cnt);
+                                        cudaStreamWaitEvent(sq, H.rcopied[(size_t) (hi % H.R)], 0);
+                                    }
                                     const int64_t lr = r0 - base;   // its first row in the batch's buffers
                                     if (h_tc && ne <= m.x3->light_rows) {
                                         x3::SetArgs sa;
@@ -4076,6 +4169,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         H.gemm[q]->f16(Hh, wd, Y, ne, N, 640, N);
                                         x3::rows_rot_out(Y, (int) N, ne, (int) N, md.svh, sq);
                                     }
+                                    if (hi >= 0) {   // its slot is free again once these kernels are done
+                                        cudaEventRecord(H.rused[(size_t) (hi % H.R)], sq);
+                                        H.r_released = (size_t) hi + 1;
+                                        H.ring_issue_until(H.r_released + (size_t) H.R);
+                                    }
                                 }
                                 flush(batch_i0, nh, base, rows_help);
                                 H.prof_h(2, H.s_out);
@@ -4114,6 +4212,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             x3_rows_loc = rows_loc;
                             stats_.experts_help += nh;
                             stats_.rows_help += rows_help;
+                        }
+                        // P.1: the helper's share of this layer - the unrouted entries give their slots back (the routed
+                        // ones did after their experts), then its ring copies the next layer's share
+                        if (x3_help && !m.xh->hidx.empty()) {
+                            X3Help& H = *m.xh;
+                            const core::OnDevice od(H.dev);
+                            H.release_until(H.hseq_start[(size_t) l + 1], m.cnt);
                         }
                         // the layer's streamed entries [kq, kend) in id order; one the routing did not pick only gives
                         // its slot back
