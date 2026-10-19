@@ -1001,6 +1001,15 @@ bool device_ok() {
 
 int launch_errors() { return g_launch_errors.load(std::memory_order_relaxed); }
 
+bool kernels_ok() {
+    cudaFuncAttributes fa{};
+    if (cudaFuncGetAttributes(&fa, group_down_kernel<8, 2>) != cudaSuccess) {   // no image for this device's architecture
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 size_t group_counters(int max_groups, int n_ff) { return (size_t) std::max(0, max_groups) * (size_t) (n_ff / kCols); }
 int group_split() {
     static const int s = [] {

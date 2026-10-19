@@ -4576,15 +4576,6 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: the EXL3 loader left a CUDA error: %s\n", cudaGetErrorString(pe));
             return 1;
         }
-        {   // proto: the Q8-only hyper-connection rows (no BF16 copy) need hc_bf16_view's scratches
-            uint64_t el = 0;
-            for (const auto& kv : wt.all())
-                if (kv.second.hc_q8 != nullptr && kv.second.data == nullptr) el = std::max<uint64_t>(el, (uint64_t) kv.second.elements);
-            if (el > 0 && !strata::core::NativeDense::hc_scratch_init(el, err)) {
-                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-                return 1;
-            }
-        }
         std::fprintf(stderr, "strata generate: EXL3 %s: %zu roles, %.1f MiB EXL3 linears, %.1f MiB staged, in %.1f s\n",
                      o.exl3_dir.c_str(), wt.all().size(), (double) exl3_pack->exl3_bytes() / (1 << 20),
                      (double) exl3_pack->arena_bytes() / (1 << 20), load_s());
@@ -9221,9 +9212,16 @@ int main(int argc, char** argv) {
                                      "helper tier\n", who);
             } else {
                 size_t fb1 = 0, tb1 = 0;
+                bool ok1 = true;
                 {
                     const strata::core::OnDevice on(dev1);
                     cudaMemGetInfo(&fb1, &tb1);
+                    ok1 = strata::kernels::exl3::kernels_ok();
+                }
+                if (!ok1) {
+                    std::fprintf(stderr, "strata %s: --exl3-helper-tier: device %d has no EXL3 kernels in this build "
+                                         "(CMAKE_CUDA_ARCHITECTURES): no helper tier\n", who, dev1);
+                    return true;
                 }
                 const uint64_t reserve = (uint64_t) [] {
                     const char* v = std::getenv("STRATA_EXL3_HELPER_RESERVE_MIB");
@@ -9261,9 +9259,19 @@ int main(int argc, char** argv) {
                                      "tier\n", who, ndev);
             } else {
                 size_t fb2 = 0, tb2 = 0;
+                bool ok2 = true;
                 {
                     const strata::core::OnDevice on(dev2);
                     cudaMemGetInfo(&fb2, &tb2);
+                    ok2 = strata::kernels::exl3::kernels_ok();
+                }
+                if (!ok2) {
+                    cudaDeviceProp pr{};
+                    (void) cudaGetDeviceProperties(&pr, dev2);
+                    std::fprintf(stderr, "strata %s: --exl3-helper2-tier: device %d (%s, compute %d.%d) has no EXL3 kernels in "
+                                         "this build (build with CMAKE_CUDA_ARCHITECTURES covering it, e.g. \"75;86\"): no "
+                                         "third tier\n", who, dev2, pr.name, pr.major, pr.minor);
+                    return true;
                 }
                 const uint64_t reserve = (uint64_t) [] {
                     const char* v = std::getenv("STRATA_EXL3_HELPER2_RESERVE_MIB");

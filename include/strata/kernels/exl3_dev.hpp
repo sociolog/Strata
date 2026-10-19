@@ -88,6 +88,8 @@ size_t group_counters(int max_groups, int n_ff);
 /// default; 1: no split, 0 floats)
 size_t group_partials(int max_entries, int n_ff);
 int group_split();
+/// Whether this build carries the grouped kernels for the current device (its CMAKE_CUDA_ARCHITECTURES cover it).
+bool kernels_ok();
 /// Launches gate/up and down for the groups.  false (nothing launched) when the geometry is not covered.
 bool grouped_experts(const GroupArgs& a, void* stream);
 

@@ -532,21 +532,6 @@ const uint16_t* NativeDense::hc_bf16_view(const WeightRef& w, void* stream, int 
     return (const uint16_t*) buf;
 }
 
-bool NativeDense::hc_scratch_init(uint64_t elems, std::string& err) {
-    int dev = 0;
-    if (elems == 0 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { err = "hc scratch: no device"; return false; }
-    for (int c = 0; c < 2; ++c)
-        for (int i = 0; i < 2; ++i)
-            if (g_hc_scratch[dev][c][i] == nullptr && cudaMalloc(&g_hc_scratch[dev][c][i], (size_t) elems * 2) != cudaSuccess) {
-                err = "hc scratch: alloc"; return false;
-            }
-    for (int i = 0; i < 2; ++i)
-        if (g_hc_ev[dev][i] == nullptr && cudaEventCreateWithFlags(&g_hc_ev[dev][i], cudaEventDisableTiming) != cudaSuccess) {
-            err = "hc scratch: event"; return false;
-        }
-    return true;
-}
-
 void NativeDense::hc_bf16_release(void* stream, int slot, int cls) {
     int dev = 0;
     if (cls != 0 || slot < 0 || slot > 1 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64 || g_hc_ev[dev][slot] == nullptr) return;
