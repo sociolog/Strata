@@ -5754,6 +5754,7 @@ int main(int argc, char** argv) {
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
+    bool exl3_kv_grow = false;   // proto: the EXL3 lane's CLI maps only its run's K/V cells (STRATA_EXL3_KV_GROW)
     {
         const strata::core::OnDevice on0(primary_device);   // STRATA_PRIMARY_DEVICE (upstream: a literal 0)
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
@@ -5773,8 +5774,17 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
                                      "every expert in RAM, no --batch, --vram-elastic or --peer-device)\n");
             const char* iv = std::getenv("STRATA_KV_GROW_INIT");
-            strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
+            // proto (STRATA_EXL3_KV_GROW, default on): the EXL3 lane's CLI maps only the cells this run needs (the
+            // prompt plus --max-new), so the VRAM tier made after the prompt fills what a full --max-context K/V
+            // would have held (262K: ~3.4 GiB, ~970 6.05 experts).  --serve needs the tier to give room back
+            // (not yet): off there.
+            const char* xv = std::getenv("STRATA_EXL3_KV_GROW");
+            const bool exl3_kv = !o.exl3_dir.empty() && o.exl3_lane && !o.serve && !(xv != nullptr && xv[0] == '0') &&
+                                 !multi_gpu && o.kv_resident <= 0 && strata::core::vmm_available() && o.batch == 0 &&
+                                 !o.vram_elastic && o.peer_device < 0;
+            strata::core::qsa_set_kv_elastic(on || exl3_kv, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
+            exl3_kv_grow = exl3_kv && strata::core::qsa_kv_elastic();
         }
         if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
@@ -16436,6 +16446,19 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (exl3_kv_grow) {   // proto: the run's cells, from new VRAM (no tier exists yet) - after the drafter registered its K/V
+            const int64_t want = std::min<int64_t>(o.max_context, (int64_t) o.tokens.size() + o.max_new + 512);
+            const int64_t target = std::min<int64_t>(o.max_context, (want + 8191) / 8192 * 8192);
+            if (strata::core::qsa_kv_elastic_need(target) > 0 &&
+                !strata::core::qsa_kv_elastic_grow(target, []() -> strata::core::VmmChunk { return 0; })) {
+                std::fprintf(stderr, "strata generate: the elastic K/V could not grow to %lld cells\n", (long long) target);
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: EXL3 elastic K/V: %lld of %lld cells mapped (%.2f of %.2f GiB)\n",
+                         (long long) strata::core::qsa_kv_elastic_cells(), (long long) o.max_context,
+                         (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
+                         (double) strata::core::qsa_kv_elastic_full_bytes() / 1073741824.0);
+    }
     // ---- plan v0.3 P5: the prompt's conditioning positions [0, n_prompt - 1) in batched chunks.  The token loop
     // then starts at the last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
