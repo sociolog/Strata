@@ -52,6 +52,9 @@ public:
     /// event wait on an outside event is illegal). The scratches are allocated by `load`, never on first use.
     static const uint16_t* hc_bf16_view(const WeightRef& w, void* stream, int slot, int cls);
     static void hc_bf16_release(void* stream, int slot, int cls);
+    /// proto: the scratches and events of `hc_bf16_view` for a loader other than `load` (the EXL3 pack's Q8-only hyper-
+    /// connections): `elems` the largest projection, on the current device; a no-op when they exist
+    static bool hc_scratch_init(uint64_t elems, std::string& err);
     uint64_t weight_bytes() const { return bytes_; }
     /// What the device lost to `load`: each matrix rounded up to the granule `cudaMalloc` backs it with.
     uint64_t allocated_bytes() const { return allocated_; }

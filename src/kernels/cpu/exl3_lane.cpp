@@ -942,6 +942,12 @@ EXL3_AVX2 void band_avx2_n(const Exl3Part& m, const float* const* xh, int tc0, i
         }
 }
 
+// proto: the split-K piece's prefetch distance in tiles (STRATA_LANE_PFD, default 16)
+inline int lane_pfd() {
+    static const int d = [] { const char* v = std::getenv("STRATA_LANE_PFD"); return v ? std::max(0, std::atoi(v)) : 16; }();
+    return d;
+}
+
 // #188's split-K piece (rows_avx512_n) on the AVX2 tier: slices [ks0, ks1) of EVERY column for N activations, the
 // tile rows in memory order, a tile's sums in acc between slices; each row's decode and FMAs are band_avx2's, so acc[i]
 // is the band kernel's for its columns and xh[i] alone, bit for bit (and rows_avx512_n's)
@@ -960,7 +966,7 @@ EXL3_AVX2 void rows_avx2_n(const Exl3Part& m, const float* const* xh, int ks0, i
         for (int i = 0; i < N; ++i) xk[i] = xh[i] + ks * 16;
         for (int t = 0; t < ld; ++t) {
             const uint32_t* w = row + (size_t) t * W;
-            for (int l = 0; l < W * 4; l += 64) _mm_prefetch((const char*) (w + 16 * W) + l, _MM_HINT_T0);
+            for (int l = 0; l < W * 4; l += 64) _mm_prefetch((const char*) (w + lane_pfd() * W) + l, _MM_HINT_T0);
             Tile T;
             T.load(w);
             if constexpr (N == 1) {

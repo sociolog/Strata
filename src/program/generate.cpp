@@ -121,6 +121,8 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <functional>
 #include <future>
 #include <thread>
+#include <pthread.h>
+#include <immintrin.h>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -1221,7 +1223,32 @@ struct Exl3Adapt {
         struct Pending { int32_t slot, key, victim; float score; };
         std::vector<Pending> pending;
         cudaStream_t s = nullptr;
+        struct Copy { void* dst; const void* src; size_t bytes; };
+        std::deque<Copy> todo;   // proto (STRATA_EXL3_ADAPT_SPREAD): the copies not issued yet, one a window-layer
     };
+    static bool spread_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_EXL3_ADAPT_SPREAD"); return v == nullptr || v[0] != '0'; }();
+        return on;
+    }
+    // proto: issue up to `n` queued copies (a window-layer's end: the next layer's dense part runs while they land, the
+    // DRAM idle then - a copy during the lane's work slows the lane ~30 %)
+    bool pump(int n, std::string& err) {
+        for (Tier& T : tiers) {
+            if (T.todo.empty()) continue;
+            const strata::core::OnDevice on(T.tier->device());
+            while (n > 0 && !T.todo.empty()) {
+                const Tier::Copy c = T.todo.front();
+                T.todo.pop_front();
+                if (const cudaError_t ce = cudaMemcpyAsync(c.dst, c.src, c.bytes, cudaMemcpyHostToDevice, T.s); ce != cudaSuccess) {
+                    err = std::string("--exl3-tier-adapt: an expert's copy: ") + cudaGetErrorString(ce);
+                    return false;
+                }
+                --n;
+            }
+            if (n == 0) break;
+        }
+        return true;
+    }
     std::vector<Tier> tiers;   // [0] the main tier, [1] the helper's (optional)
     const strata::kernels::cpu::Exl3ExpertRam* ram = nullptr;
     int per_round = 0;
@@ -1260,6 +1287,35 @@ struct Exl3Adapt {
         }
         return true;
     }
+    // proto (the elastic K/V): main-tier slots the K/V takes, and gives back
+    void give_up(int64_t slot) {
+        Tier& T = tiers[0];
+        T.spares.erase(std::remove(T.spares.begin(), T.spares.end(), (int32_t) slot), T.spares.end());
+        T.chosen[(size_t) slot] = 1;
+        T.use[(size_t) slot] = 0.0f;
+    }
+    void take_back(int64_t slot) {
+        tiers[0].chosen[(size_t) slot] = 0;
+        tiers[0].use[(size_t) slot] = 0.0f;
+    }
+    // the main tier's coldest residents below `below` made spares until it has `want` (the swaps need spares)
+    bool make_spares(size_t want, int64_t below, std::string& err) {
+        Tier& T = tiers[0];
+        if (T.spares.size() >= want) return true;
+        std::vector<std::pair<float, int32_t>> v;
+        for (int32_t q = 0; q < (int32_t) below; ++q)
+            if (T.tier->owner(q) >= 0 && !T.chosen[(size_t) q]) v.emplace_back(T.use[(size_t) q], q);
+        const size_t n = std::min(v.size(), want - T.spares.size());
+        std::partial_sort(v.begin(), v.begin() + (std::ptrdiff_t) n, v.end(),
+                          [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (size_t i = 0; i < n; ++i) {
+            const int32_t q = v[i].second;
+            if (!T.tier->release_slot(q, err, false)) return false;
+            T.use[(size_t) q] = 0.0f;
+            T.spares.push_back(q);
+        }
+        return n == 0 || T.tier->upload_table(err);
+    }
     // a window-layer's routes: the main tier's (on_gpu) and the helper's (on_help) per slot, the lane's per expert
     void count(int64_t layer, const int32_t* ids, int64_t n, const bool* on_gpu, const bool* on_help) {
         const int32_t* r0 = tiers[0].tier->h_res() + layer * n_expert;
@@ -1274,6 +1330,7 @@ struct Exl3Adapt {
     // the tier lends its slots to a prompt (so no copy is in flight into a prompt buffer, and the loan sees the tables
     // the decode left)
     bool settle(std::string& err) {
+        if (!pump(1 << 30, err)) return false;   // whatever the windows did not issue yet
         for (size_t ti = 0; ti < tiers.size(); ++ti) {
             Tier& T = tiers[ti];
             if (T.pending.empty()) continue;
@@ -1281,8 +1338,9 @@ struct Exl3Adapt {
                 err = std::string("--exl3-tier-adapt: an expert's copy: ") + cudaGetErrorString(e);
                 return false;
             }
+            const bool batch = spread_on();   // proto: the table uploaded once, not 2 synchronous copies a swap
             for (const Tier::Pending& p : T.pending) {
-                if (!T.tier->release_slot(p.victim, err) || !T.tier->assign(p.slot, p.key, err)) return false;
+                if (!T.tier->release_slot(p.victim, err, !batch) || !T.tier->assign(p.slot, p.key, err, !batch)) return false;
                 T.use[(size_t) p.slot] = p.score;
                 miss[(size_t) p.key] = 0.0f;
                 T.use[(size_t) p.victim] = 0.0f;
@@ -1290,6 +1348,7 @@ struct Exl3Adapt {
                 T.spares.push_back(p.victim);
                 ++(ti == 0 ? swaps : swaps_help);
             }
+            if (batch && !T.tier->upload_table(err)) return false;
             T.pending.clear();
         }
         return true;
@@ -1324,9 +1383,11 @@ struct Exl3Adapt {
                 if (cand[next].first <= vict[i].first + margin) break;
                 const int32_t key = cand[next].second, victim = vict[i].second, slot = T.spares.back();
                 const int layer = (int) (key / n_expert), e = (int) (key % n_expert);
-                if (const cudaError_t ce = cudaMemcpyAsync(T.tier->slot_ptr(slot), ram->blob(layer, e),
-                                                           (size_t) ram->blob_bytes(layer), cudaMemcpyHostToDevice, T.s);
-                    ce != cudaSuccess) {
+                if (spread_on()) {
+                    T.todo.push_back({T.tier->slot_ptr(slot), ram->blob(layer, e), (size_t) ram->blob_bytes(layer)});
+                } else if (const cudaError_t ce = cudaMemcpyAsync(T.tier->slot_ptr(slot), ram->blob(layer, e),
+                                                                  (size_t) ram->blob_bytes(layer), cudaMemcpyHostToDevice, T.s);
+                           ce != cudaSuccess) {
                     err = std::string("--exl3-tier-adapt: an expert's copy: ") + cudaGetErrorString(ce);
                     return false;
                 }
@@ -1366,6 +1427,7 @@ struct Exl3Drive {
     int64_t n_embd = 0;
     int64_t win_calls = 0, win_entries = 0, win_jobs = 0;
     double win_ms = 0;
+    double ph_gpu = 0, ph_help = 0, ph_jobs = 0, ph_lane = 0, ph_fin = 0;   // proto: where a window-layer's host time goes
     std::vector<int16_t> job_of;      // n_expert entries: a window's expert -> its job (-1: none yet)
     std::vector<int32_t> touched;     // the experts the call gave a job; job_of is reset through them
     // --exl3-lane-profile: the VRAM tier (kernels/exl3_tier.hpp).  A window publishes the routes to its experts as the
@@ -1468,8 +1530,82 @@ struct Exl3Drive {
             }
             return true;
         }
+        // proto (STRATA_EXL3_HELP_THREAD, default on): `launch` on a thread of its own (pinned to a core the lane does not
+        // use), so the lane starts at once instead of after the helper's ~4 CUDA calls (11 us a window-layer, measured)
+        std::thread lth;
+        std::atomic<uint64_t> lreq{0}, ldone{0};
+        std::atomic<bool> lstop{false};
+        double t_launch = 0, t_wait = 0, t_copy = 0; int64_t t_n = 0;   // proto: the helper thread's round trip
+        const float* l_x = nullptr;
+        float* l_out = nullptr;   // where the thread puts the rows (the window's mapped rows), once they are back
+        int64_t l_n = 0;
+        const strata::kernels::exl3::ExpertLayout* l_lay = nullptr;
+        bool l_ok = true;
+        std::string l_err;
+        static bool thread_on() {
+            static const bool on = [] { const char* v = std::getenv("STRATA_EXL3_HELP_THREAD"); return v == nullptr || v[0] != '0'; }();
+            return on;
+        }
+        void launch_async(const float* x_host, int64_t n_tok, const strata::kernels::exl3::ExpertLayout& lay, float* out) {
+            if (!lth.joinable()) {
+                lth = std::thread([this] {
+                    if (const char* c = std::getenv("STRATA_EXL3_HELP_CPU"); c == nullptr || c[0] != '-') {
+                        cpu_set_t set;
+                        CPU_ZERO(&set);
+                        CPU_SET(c != nullptr ? std::atoi(c) : 11, &set);
+                        (void) pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+                    }
+                    uint64_t seen = 0;
+                    auto idle = std::chrono::steady_clock::now();
+                    while (!lstop.load(std::memory_order_acquire)) {
+                        const uint64_t r = lreq.load(std::memory_order_acquire);
+                        if (r == seen) {
+                            if (std::chrono::steady_clock::now() - idle > std::chrono::milliseconds(20))
+                                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                            else
+                                _mm_pause();
+                            continue;
+                        }
+                        seen = r;
+                        std::string e;
+                        const auto c0 = std::chrono::steady_clock::now();
+                        l_ok = launch(l_x, l_n, *l_lay, e);
+                        const auto c1 = std::chrono::steady_clock::now();
+                        auto c2 = c1;
+                        // the rows too, while the lane still runs: wait for the stream here (polled, the core is ours)
+                        if (l_ok && entries > 0) {
+                            cudaError_t q;
+                            while ((q = cudaStreamQuery(s)) == cudaErrorNotReady) _mm_pause();
+                            c2 = std::chrono::steady_clock::now();
+                            if (q != cudaSuccess) { l_ok = false; e = "device " + std::to_string(device) + ": " + cudaGetErrorString(q); }
+                            else
+                                for (int32_t m = 0; m < entries; ++m)
+                                    std::memcpy(l_out + (size_t) row_of[(size_t) m] * (size_t) n_embd,
+                                                h_rows + (size_t) m * (size_t) n_embd, (size_t) n_embd * sizeof(float));
+                        }
+                        {
+                            using us = std::chrono::duration<double, std::micro>;
+                            t_launch += us(c1 - c0).count(); t_wait += us(c2 - c1).count();
+                            t_copy += us(std::chrono::steady_clock::now() - c2).count(); ++t_n;
+                        }
+                        l_err = e;
+                        ldone.store(r, std::memory_order_release);
+                        idle = std::chrono::steady_clock::now();
+                    }
+                });
+            }
+            l_x = x_host; l_n = n_tok; l_lay = &lay; l_out = out;
+            lreq.fetch_add(1, std::memory_order_acq_rel);
+        }
+        bool wait_launch(std::string& err) {
+            const uint64_t r = lreq.load(std::memory_order_acquire);
+            while (ldone.load(std::memory_order_acquire) != r) _mm_pause();
+            if (!l_ok) { err = l_err; return false; }
+            return true;
+        }
         // waits for the rows and puts each in the caller's row of `out`
         bool finish(float* out, std::string& err) {
+            if (lth.joinable()) return wait_launch(err);   // the thread launched, waited and placed the rows
             if (entries == 0) return true;
             if (const cudaError_t e = cudaStreamSynchronize(s); e != cudaSuccess) {
                 err = "device " + std::to_string(device) + ": " + cudaGetErrorString(e);
@@ -1481,6 +1617,7 @@ struct Exl3Drive {
             return true;
         }
         ~X3Runner() {
+            if (lth.joinable()) { lstop.store(true, std::memory_order_release); lth.join(); }
             if (s == nullptr) return;
             const strata::core::OnDevice on(device);
             cudaStreamSynchronize(s);
@@ -1657,6 +1794,7 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
             t->tier_entries += entries;
         }
     }
+    const Clock::time_point a1 = Clock::now();
     // the helper tier's share: the window's experts the helper card holds (never the main tier's), run there now with the
     // same kernels; their rows reach `out` after the lane's (the window takes them as the CPU's rows)
     bool on_help[cpu::MAXT * 64] = {};
@@ -1677,14 +1815,18 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
                     on_help[q] = true;
                 }
         }
-        if (ok && !h.launch(x_f, n_tok, (*t->lay)[(size_t) layer], err)) {
+        if (ok && Exl3Drive::X3Runner::thread_on()) {
+            if (h.entries > 0) h.launch_async(x_f, n_tok, (*t->lay)[(size_t) layer], out);
+        } else if (ok && !h.launch(x_f, n_tok, (*t->lay)[(size_t) layer], err)) {
             ok = false;
             err = "the helper tier's experts could not run: " + err;
         }
         t->help_groups += h.groups;
         t->help_entries += h.entries;
     }
+    const Clock::time_point a2 = Clock::now();
     if (ok && t->adapt != nullptr && t->tier != nullptr) t->adapt->count(layer, ids, n_tok * k, on_gpu, on_help);
+    Clock::time_point a3 = Clock::now(), a4 = a3;
     if (ok) {
         const int ne = t->ram->n_expert();
         if ((int) t->job_of.size() != ne) t->job_of.assign((size_t) ne, -1);
@@ -1709,18 +1851,41 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
                 ++j.nt;
             }
         for (int32_t e : t->touched) t->job_of[(size_t) e] = -1;
+        a3 = Clock::now();
         if (ok && njobs > 0) ok = t->moe->run(*t->pool, t->jobs.data(), njobs, err);
+        a4 = Clock::now();
     }
     if (ok && t->helper != nullptr && !t->help.finish(out, err)) {
         ok = false;
         err = "the helper tier's experts failed: " + err;
     }
+    if (ok && t->adapt != nullptr && Exl3Adapt::spread_on() && !t->adapt->pump(1, err)) ok = false;
     if (!ok) {
         // as the single-token hook: a wrong row would be weighted and added downstream, so the engine stops
         std::fprintf(stderr, "strata generate: EXL3 CPU lane failed in a verify window at layer %lld: %s - stopping\n",
                      (long long) layer, err.c_str());
         std::fflush(stderr);
         std::abort();
+    }
+    // proto: STRATA_EXL3_ROUTE_DUMP=PATH - each window-layer's routes and where they ran (0 lane, 1 VRAM tier, 2 helper):
+    // int32 layer, n_tok, k, then n_tok*k int32 ids, then n_tok*k uint8 placements
+    {
+        static std::FILE* rd = [] { const char* v = std::getenv("STRATA_EXL3_ROUTE_DUMP"); return v ? std::fopen(v, "wb") : nullptr; }();
+        if (rd != nullptr) {
+            const int32_t hdr[3] = {(int32_t) layer, (int32_t) n_tok, (int32_t) k};
+            std::fwrite(hdr, sizeof hdr, 1, rd);
+            std::fwrite(ids, sizeof(int32_t), (size_t) (n_tok * k), rd);
+            uint8_t pl[cpu::MAXT * 64];
+            for (int64_t i = 0; i < n_tok * k; ++i) pl[i] = on_gpu[i] ? 1 : on_help[i] ? 2 : 0;
+            std::fwrite(pl, 1, (size_t) (n_tok * k), rd);
+            if (layer == t->ram->n_layers() - 1) std::fflush(rd);
+        }
+    }
+    {
+        using ms = std::chrono::duration<double, std::milli>;
+        const Clock::time_point a5 = Clock::now();
+        t->ph_gpu += ms(a1 - a).count(); t->ph_help += ms(a2 - a1).count(); t->ph_jobs += ms(a3 - a2).count();
+        t->ph_lane += ms(a4 - a3).count(); t->ph_fin += ms(a5 - a4).count();
     }
     t->win_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->win_calls;
@@ -4308,6 +4473,15 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: the EXL3 loader left a CUDA error: %s\n", cudaGetErrorString(pe));
             return 1;
         }
+        {   // proto: the Q8-only hyper-connection rows (no BF16 copy) need hc_bf16_view's scratches
+            uint64_t el = 0;
+            for (const auto& kv : wt.all())
+                if (kv.second.hc_q8 != nullptr && kv.second.data == nullptr) el = std::max<uint64_t>(el, (uint64_t) kv.second.elements);
+            if (el > 0 && !strata::core::NativeDense::hc_scratch_init(el, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+        }
         std::fprintf(stderr, "strata generate: EXL3 %s: %zu roles, %.1f MiB EXL3 linears, %.1f MiB staged, in %.1f s\n",
                      o.exl3_dir.c_str(), wt.all().size(), (double) exl3_pack->exl3_bytes() / (1 << 20),
                      (double) exl3_pack->arena_bytes() / (1 << 20), load_s());
@@ -5609,6 +5783,7 @@ int main(int argc, char** argv) {
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
+    bool exl3_kv_grow = false;   // proto: the EXL3 lane's CLI maps only its run's K/V cells (STRATA_EXL3_KV_GROW)
     {
         const strata::core::OnDevice on0(primary_device);   // STRATA_PRIMARY_DEVICE (upstream: a literal 0)
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
@@ -5628,8 +5803,17 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
                                      "every expert in RAM, no --batch, --vram-elastic or --peer-device)\n");
             const char* iv = std::getenv("STRATA_KV_GROW_INIT");
-            strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
+            // proto (STRATA_EXL3_KV_GROW, default on): the EXL3 lane's CLI maps only the cells this run needs (the
+            // prompt plus --max-new), so the VRAM tier made after the prompt fills what a full --max-context K/V
+            // would have held (262K: ~3.4 GiB, ~970 6.05 experts).  --serve needs the tier to give room back
+            // (not yet): off there.
+            const char* xv = std::getenv("STRATA_EXL3_KV_GROW");
+            const bool exl3_kv = !o.exl3_dir.empty() && o.exl3_lane && !(xv != nullptr && xv[0] == '0') &&
+                                 !multi_gpu && o.kv_resident <= 0 && strata::core::vmm_available() && o.batch == 0 &&
+                                 !o.vram_elastic && o.peer_device < 0;
+            strata::core::qsa_set_kv_elastic(on || exl3_kv, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
+            exl3_kv_grow = exl3_kv && strata::core::qsa_kv_elastic();
         }
         if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
@@ -7060,6 +7244,16 @@ int main(int argc, char** argv) {
     std::vector<strata::kernels::exl3::ExpertLayout> exl3_lay;
     std::vector<std::pair<int32_t, int32_t>> exl3_ranked;
     std::unique_ptr<strata::kernels::Exl3VramTier> exl3_tier, exl3_helper;
+    // proto: the elastic K/V in --serve on the EXL3 lane - the main tier's slots in a VMM range; the K/V takes the tier's
+    // last slots [lo, slots) as a conversation grows (their experts go to the lane) and gives them back for a short one
+    std::unique_ptr<strata::core::VmmRange> exl3_xr;
+    struct KvX {
+        bool on = false;
+        int64_t lo = 0, floor = 1024, step = 8192;
+        std::vector<strata::core::VmmChunk> spare;
+        std::vector<int32_t> evicted;   // the experts the K/V's slots held, the latest last (refilled first)
+        int64_t grows = 0, trims = 0, gave = 0, refilled = 0;
+    } kvx;
     // --exl3-lane with --prefill: the batched prompt path's view of the RAM tier's experts, and the tier page-locked for
     // its copy engine (declared after the tier, so it is unregistered before the tier is unmapped)
     strata::prefill::Exl3PromptExperts exl3_pf;
@@ -8219,6 +8413,146 @@ int main(int argc, char** argv) {
         }
         return 0;
     };
+    // ---- proto: the elastic K/V on the EXL3 lane's --serve (kvx: the main tier's last slots go to the K/V)
+    auto kvx_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
+        if (!kvx.on || cells <= strata::core::qsa_kv_elastic_cells()) return true;
+        const int64_t target = std::min<int64_t>(o.max_context, (cells + kvx.step - 1) / kvx.step * kvx.step);
+        const int64_t need = strata::core::qsa_kv_elastic_need(target);
+        if (need == 0) return true;
+        quiesce();
+        std::string e;
+        if (exl3_drive.adapt != nullptr && !exl3_drive.adapt->settle(e)) {
+            std::fprintf(stderr, "strata: the elastic K/V: %s\n", e.c_str());
+            return false;
+        }
+        strata::kernels::Exl3VramTier& xt = *exl3_tier;
+        strata::core::VmmRange& r = *exl3_xr;
+        const uint64_t G = strata::core::vmm_granularity();
+        auto first_free = [&]() { return (int64_t) ((xt.slot_offset(kvx.lo) + G - 1) / G); };
+        auto freeable = [&]() {
+            int64_t k = 0;
+            for (int64_t c = first_free(); c < r.chunks(); ++c) k += r.mapped(c) ? 1 : 0;
+            return k;
+        };
+        int64_t gave = 0;
+        while ((int64_t) kvx.spare.size() + freeable() < need && kvx.lo > kvx.floor) {
+            --kvx.lo;
+            ++gave;
+            const int32_t key = xt.owner(kvx.lo);
+            if (key >= 0) {
+                if (!xt.release_slot(kvx.lo, e, false)) { std::fprintf(stderr, "strata: the elastic K/V: %s\n", e.c_str()); return false; }
+                kvx.evicted.push_back(key);
+            }
+            if (exl3_drive.adapt != nullptr) exl3_drive.adapt->give_up(kvx.lo);
+        }
+        if (gave > 0 && (!xt.upload_table(e) || cudaDeviceSynchronize() != cudaSuccess)) {
+            std::fprintf(stderr, "strata: the elastic K/V: %s\n", e.c_str());
+            return false;
+        }
+        for (int64_t c = first_free(); c < r.chunks(); ++c)
+            if (r.mapped(c))
+                if (const strata::core::VmmChunk h = r.unmap(c)) kvx.spare.push_back(h);
+        if (exl3_drive.adapt != nullptr && o.exl3_tier_adapt > 0 &&
+            !exl3_drive.adapt->make_spares((size_t) (2 * o.exl3_tier_adapt), kvx.lo, e)) {
+            std::fprintf(stderr, "strata: the elastic K/V: %s\n", e.c_str());
+            return false;
+        }
+        int64_t fresh = 0;
+        const bool ok = strata::core::qsa_kv_elastic_grow(target, [&]() -> strata::core::VmmChunk {
+            if (kvx.spare.empty()) { ++fresh; return 0; }
+            const strata::core::VmmChunk h = kvx.spare.back();
+            kvx.spare.pop_back();
+            return h;
+        });
+        ++kvx.grows;
+        kvx.gave += gave;
+        std::fprintf(stderr, "strata: K/V grown to %lld cells (%.2f GiB); the EXL3 tier gave %lld slots (it holds experts "
+                             "in %lld of %lld)%s\n", (long long) strata::core::qsa_kv_elastic_cells(),
+                     (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0, (long long) gave,
+                     (long long) kvx.lo, (long long) xt.slots(), fresh > 0 ? " - and new VRAM" : "");
+        if (!ok) std::fprintf(stderr, "strata: the K/V could not grow to %lld cells\n", (long long) target);
+        return ok;
+    };
+    auto kvx_trim = [&](int64_t cells, int64_t hold) -> bool {
+        if (!kvx.on) return true;
+        strata::kernels::Exl3VramTier& xt = *exl3_tier;
+        if (kvx.lo >= xt.slots()) return true;
+        const int64_t want = std::max<int64_t>(cells, hold);
+        const int64_t target = std::max<int64_t>(kvx.step, (want + kvx.step - 1) / kvx.step * kvx.step);
+        if (strata::core::qsa_kv_elastic_cells() < target + 2 * kvx.step) return true;
+        std::string e;
+        if (exl3_drive.adapt != nullptr && !exl3_drive.adapt->settle(e)) {
+            std::fprintf(stderr, "strata: the elastic K/V: %s\n", e.c_str());
+            return false;
+        }
+        strata::core::qsa_kv_elastic_shrink(target, [&](strata::core::VmmChunk h) { kvx.spare.push_back(h); });
+        strata::core::VmmRange& r = *exl3_xr;
+        const uint64_t G = strata::core::vmm_granularity();
+        const int64_t c0 = (int64_t) (xt.slot_offset(kvx.lo) / G);
+        const int64_t cend = (int64_t) ((xt.slot_offset(xt.slots()) + G - 1) / G);
+        int64_t cmap = c0, have = (int64_t) kvx.spare.size();   // as far as the chunks handed back reach
+        while (cmap < cend && have > 0) have -= r.mapped(cmap++) ? 0 : 1;
+        if (!r.map_range(c0, cmap, [&]() -> strata::core::VmmChunk {
+                if (kvx.spare.empty()) return 0;
+                const strata::core::VmmChunk h = kvx.spare.back();
+                kvx.spare.pop_back();
+                return h;
+            }))
+            std::fprintf(stderr, "strata: the EXL3 tier could not take its VRAM back from the K/V\n");
+        const int64_t lo0 = kvx.lo;
+        while (kvx.lo < xt.slots()) {
+            const int64_t a = (int64_t) (xt.slot_offset(kvx.lo) / G), b = (int64_t) ((xt.slot_offset(kvx.lo + 1) + G - 1) / G);
+            bool all = true;
+            for (int64_t c = a; c < b && all; ++c) all = r.mapped(c);
+            if (!all) break;
+            ++kvx.lo;
+        }
+        // the slots back: the experts they gave up first (the latest first), then the profile's hottest not held
+        const int32_t* hr = xt.h_res_table();
+        const int32_t* hh = exl3_helper != nullptr ? exl3_helper->h_res_table() : nullptr;
+        const int64_t ne = exl3_ram->n_expert();
+        auto free_key = [&](int32_t key) { return hr[key] < 0 && (hh == nullptr || hh[key] < 0); };
+        std::vector<std::pair<int64_t, int32_t>> fill;
+        size_t pi = 0;
+        std::vector<uint8_t> taken((size_t) (exl3_ram->n_layers() * ne), 0);
+        for (int64_t q = lo0; q < kvx.lo; ++q) {
+            int32_t key = -1;
+            while (key < 0 && !kvx.evicted.empty()) {
+                const int32_t k2 = kvx.evicted.back();
+                kvx.evicted.pop_back();
+                if (free_key(k2) && !taken[(size_t) k2]) key = k2;
+            }
+            for (; key < 0 && pi < exl3_ranked.size(); ++pi) {
+                const int32_t k2 = exl3_ranked[pi].first * (int32_t) ne + exl3_ranked[pi].second;
+                if (free_key(k2) && !taken[(size_t) k2]) key = k2;
+            }
+            if (key < 0) break;
+            taken[(size_t) key] = 1;
+            const int l = (int) (key / ne), x = (int) (key % ne);
+            cudaMemcpyAsync(xt.slot_ptr(q), exl3_ram->blob(l, x), (size_t) exl3_ram->blob_bytes(l), cudaMemcpyHostToDevice,
+                            nullptr);
+            fill.emplace_back(q, key);
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            std::fprintf(stderr, "strata: refilling the EXL3 tier failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
+        for (const auto& [q, key] : fill) {
+            if (!xt.assign(q, key, e, false)) { std::fprintf(stderr, "strata: the elastic K/V: %s\n", e.c_str()); return false; }
+            if (exl3_drive.adapt != nullptr) exl3_drive.adapt->take_back(q);
+        }
+        for (int64_t q = lo0 + (int64_t) fill.size(); q < kvx.lo; ++q)   // no expert left to put there: a spare
+            if (exl3_drive.adapt != nullptr) { exl3_drive.adapt->take_back(q); exl3_drive.adapt->tiers[0].spares.push_back((int32_t) q); }
+        if (!xt.upload_table(e)) { std::fprintf(stderr, "strata: the elastic K/V: %s\n", e.c_str()); return false; }
+        for (const strata::core::VmmChunk h : kvx.spare) strata::core::vmm_chunk_free(h);
+        kvx.spare.clear();
+        ++kvx.trims;
+        kvx.refilled += (int64_t) fill.size();
+        std::fprintf(stderr, "strata: K/V trimmed to %lld cells; %lld slots back to the EXL3 tier, %zu refilled (experts in "
+                             "%lld of %lld)\n", (long long) strata::core::qsa_kv_elastic_cells(), (long long) (kvx.lo - lo0),
+                     fill.size(), (long long) kvx.lo, (long long) xt.slots());
+        return true;
+    };
     // ---- THE ELASTIC K/V (--kv-grow; vmm.hpp).  Allocated for the whole --max-context up front, the K/V of a 262K
     // context (3.35 GiB with the drafter's at int8) takes VRAM the expert cache could hold more experts in.  Now the K/V pools hold physical memory only for the cells
     // the requests reach.  When a request needs more, slots just below the prompt path's loan give up their experts
@@ -8254,6 +8588,7 @@ int main(int argc, char** argv) {
     // Room for `cells` cells (rounded up to a step).  `quiesce` must leave nothing running on the device and land
     // the adaptive tier's swaps (a swap in flight could still be writing a slot given up here).
     auto kvg_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
+        if (kvx.on) return kvx_ensure(cells, quiesce);
         if (!kvg.on || cells <= kvg.cells) return true;
         const int64_t target = std::min<int64_t>(o.max_context, (cells + kvg.step - 1) / kvg.step * kvg.step);
         const int64_t need = strata::core::qsa_kv_elastic_need(target);
@@ -8358,6 +8693,7 @@ int main(int argc, char** argv) {
     // A request that needs far fewer cells than the K/V holds gives the rest back: the slots refill with the
     // profile's hottest experts the GPU does not hold.  Run on a quiet device (as kvg_ensure's `quiesce`).
     auto kvg_trim = [&](int64_t cells, int64_t hold) -> bool {   // `hold`: the cells a parked conversation could need
+        if (kvx.on) return kvx_trim(cells, hold);
         if (!kvg.on) return true;
         // #1128: a parked conversation comes back through kvg_ensure's grow, so a K/V that fell to a short request's
         // size is grown again (its experts shuffled again) after every short request in between: the K/V keeps the
@@ -8734,10 +9070,31 @@ int main(int argc, char** argv) {
             exl3_tier = std::make_unique<strata::kernels::Exl3VramTier>();
             // --exl3-tier-adapt N: 2N of its slots spare (the swaps' copies land there)
             const int64_t spares = o.exl3_tier_adapt > 0 && o.spec >= 2 ? 2 * (int64_t) o.exl3_tier_adapt : 0;
+            if (exl3_kv_grow && std::strcmp(who, "serve") == 0 && budget > 0) {
+                exl3_xr = std::make_unique<strata::core::VmmRange>();
+                if (!exl3_xr->reserve(budget) ||
+                    !exl3_xr->map_range(0, exl3_xr->chunks(), []() -> strata::core::VmmChunk { return 0; })) {
+                    std::fprintf(stderr, "strata %s: the EXL3 tier's VMM range (%.2f GiB) failed: a plain allocation, no "
+                                         "elastic K/V\n", who, (double) budget / (double) (1ull << 30));
+                    exl3_xr.reset();
+                } else {
+                    exl3_tier->use_external(exl3_xr->base());
+                }
+            }
             if (!exl3_tier->init(*exl3_ram, exl3_ranked, budget, err, dev0, nullptr, spares) ||
                 !exl3_drive.tok.init(dev0, 1, (int64_t) ss.k, g.n_embd, g.n_ff, err)) {
                 std::fprintf(stderr, "strata %s: %s\n", who, err.c_str());
                 return false;
+            }
+            if (exl3_xr != nullptr) {   // the range's chunks past the last slot back to the device
+                const uint64_t G = strata::core::vmm_granularity();
+                const int64_t used = (int64_t) ((exl3_tier->slot_offset(exl3_tier->slots()) + G - 1) / G);
+                for (int64_t c = used; c < exl3_xr->chunks(); ++c)
+                    if (exl3_xr->mapped(c)) strata::core::vmm_chunk_free(exl3_xr->unmap(c));
+                kvx.on = true;
+                kvx.lo = exl3_tier->slots();
+                kvx.floor = std::min<int64_t>(kvx.floor, exl3_tier->slots() / 2);
+                if (const char* v = std::getenv("STRATA_KV_GROW_STEP"); v != nullptr && std::atoll(v) > 0) kvx.step = std::atoll(v);
             }
             exl3_drive.tier = exl3_tier.get();
             cudaMemGetInfo(&fb, &tb);
@@ -9234,6 +9591,7 @@ int main(int argc, char** argv) {
         int64_t exl3_lent_first = -1;   // its first slot (-1: no loan out)
         int64_t exl3_pf_streamed0 = 0, exl3_pf_resident0 = 0;   // the prompt path's counts when the loan began (the log)
         int64_t exl3_first_now = -1;    // where the prompt path's buffers are laid out (-1: buffers of its own)
+        int64_t exl3_top_now = -1;      // proto: and where that layout ends (the elastic K/V's slots above it)
         // the helper card's share (exl3_pf_help): the largest chunk it helps (0: none), its tier's loan out now, and the
         // prompt path's counts when that loan began (the log)
         int64_t exl3_help_max = 0;
@@ -9284,6 +9642,7 @@ int main(int argc, char** argv) {
             const Clock::time_point i0 = Clock::now();
             if (xt != nullptr && lend_slots(chunk) <= xt_slots) {
                 exl3_first_now = xt_slots - lend_slots(chunk);
+                exl3_top_now = xt_slots;
                 if (!sp.init(wt, g, ss, nullptr, nullptr, nullptr, chunk, main_cs, err, xt->slot_ptr(exl3_first_now),
                              (uint64_t) (xt_slots - exl3_first_now) * xt_slot)) {
                     std::fprintf(stderr, "strata serve: the EXL3 prompt path over the VRAM tier's last %lld slots: %s\n",
@@ -13095,7 +13454,7 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
             }
             auto kv_quiesce = adapt_quiesce;
-            if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
+            if (kvg.on || kvx.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
                 // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
                 if (!kvg_ensure(n + 256, kv_quiesce)) {
                     std::printf("ERR the K/V cannot grow to this prompt: no VRAM is left\n");
@@ -13491,7 +13850,7 @@ int main(int argc, char** argv) {
             live_ok = false;   // until this request has finished, the session is in between
             // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
-            if (kvg.on) {
+            if (kvg.on || kvx.on) {
                 kv_quiesce();
                 // STRATA_KV_GROW_HOLD=1 (opt-in): keep the K/V as long as the longest parked conversation; default: trim to this request alone, as 0.1.40
                 static const bool hold_on = [] { const char* v = std::getenv("STRATA_KV_GROW_HOLD"); return v != nullptr && std::atoi(v) != 0; }();
@@ -13818,23 +14177,30 @@ int main(int argc, char** argv) {
                     e = "prefill: cannot lend buffers for an empty request segment";
                     return false;
                 }
-                const int64_t pieces = (tokens + o.prefill_chunk - 1) / o.prefill_chunk;
-                const int64_t want = std::min<int64_t>(o.prefill_chunk, ((tokens + pieces - 1) / pieces + 15) / 16 * 16);
-                const uint64_t need_b = strata::prefill::Prefill::bytes_needed(g, ss, want, false);
-                const int64_t need = (int64_t) ((need_b + xt.slot_bytes() - 1) / xt.slot_bytes());
-                if (need <= 0 || need > slots) {   // (the configured chunk was chosen to fit the whole tier)
+                // proto (the elastic K/V): the loan sits below the slots the K/V took, its chunk capped to fit there
+                const int64_t top = kvx.on ? kvx.lo : slots;
+                int64_t cap_chunk = o.prefill_chunk;
+                auto need_of = [&](int64_t c) {
+                    return (int64_t) ((strata::prefill::Prefill::bytes_needed(g, ss, c, false) + xt.slot_bytes() - 1) /
+                                      xt.slot_bytes());
+                };
+                while (cap_chunk > 256 && need_of(cap_chunk) > top) cap_chunk = std::max<int64_t>(256, cap_chunk - 256);
+                const int64_t pieces = (tokens + cap_chunk - 1) / cap_chunk;
+                const int64_t want = std::min<int64_t>(cap_chunk, ((tokens + pieces - 1) / pieces + 15) / 16 * 16);
+                const int64_t need = need_of(want);
+                if (need <= 0 || need > top) {   // (the configured chunk was chosen to fit the whole tier)
                     e = "prefill: a " + std::to_string(want) + "-token chunk's buffers need " + std::to_string(need) +
-                        " of the EXL3 tier's " + std::to_string(slots) + " slots";
+                        " of the EXL3 tier's " + std::to_string(top) + " slots below the K/V's";
                     return false;
                 }
                 const auto t_ln = Clock::now();
-                const int64_t first = slots - need;
+                const int64_t first = top - need;
                 size_t lent_now = 0;
                 if (exl3_lent_first < 0 || first < exl3_lent_first) {
                     // the adaptive tier's copies in flight land first: none may land in a prompt buffer
                     if (exl3_drive.adapt != nullptr && !exl3_drive.adapt->settle(e)) return false;
                     std::vector<strata::kernels::Exl3VramTier::Lent> more;
-                    if (!xt.lend(first, more, e)) return false;
+                    if (!xt.lend_range(first, top, more, e)) return false;
                     lent_now = more.size();
                     if (exl3_lent_first < 0) {   // a new loan: the refill's log line counts from here
                         exl3_pf_streamed0 = sp.stats().experts_streamed;
@@ -13843,9 +14209,10 @@ int main(int argc, char** argv) {
                     exl3_lent.insert(exl3_lent.end(), more.begin(), more.end());
                     exl3_lent_first = first;
                 }
-                if (want != sp.chunk() || first != exl3_first_now) {
-                    if (!sp.relayout(want, xt.slot_ptr(first), (uint64_t) (slots - first) * xt.slot_bytes(), e)) return false;
+                if (want != sp.chunk() || first != exl3_first_now || top != exl3_top_now) {
+                    if (!sp.relayout(want, xt.slot_ptr(first), (uint64_t) (top - first) * xt.slot_bytes(), e)) return false;
                     exl3_first_now = first;
+                    exl3_top_now = top;
                 }
                 // the helper card's buffers (exl3_help_max > 0): over its tier's last slots, for chunks of this part's
                 // size (a binding for larger chunks covers it); a part of larger chunks streams the helper's experts
@@ -15676,7 +16043,7 @@ int main(int argc, char** argv) {
                                cudaMemcpyHostToDevice);
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them
-                if (kvg.on && p + T + 64 > kvg.cells &&
+                if ((kvg.on ? p + T + 64 > kvg.cells : kvx.on && p + T + 64 > strata::core::qsa_kv_elastic_cells()) &&
                     !kvg_ensure(p + T + 64, adapt_quiesce)) {
                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                     return 1;
@@ -16291,6 +16658,19 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (exl3_kv_grow) {   // proto: the run's cells, from new VRAM (no tier exists yet) - after the drafter registered its K/V
+            const int64_t want = std::min<int64_t>(o.max_context, (int64_t) o.tokens.size() + o.max_new + 512);
+            const int64_t target = std::min<int64_t>(o.max_context, (want + 8191) / 8192 * 8192);
+            if (strata::core::qsa_kv_elastic_need(target) > 0 &&
+                !strata::core::qsa_kv_elastic_grow(target, []() -> strata::core::VmmChunk { return 0; })) {
+                std::fprintf(stderr, "strata generate: the elastic K/V could not grow to %lld cells\n", (long long) target);
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: EXL3 elastic K/V: %lld of %lld cells mapped (%.2f of %.2f GiB)\n",
+                         (long long) strata::core::qsa_kv_elastic_cells(), (long long) o.max_context,
+                         (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
+                         (double) strata::core::qsa_kv_elastic_full_bytes() / 1073741824.0);
+    }
     // ---- plan v0.3 P5: the prompt's conditioning positions [0, n_prompt - 1) in batched chunks.  The token loop
     // then starts at the last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
@@ -17379,6 +17759,17 @@ int main(int argc, char** argv) {
                         "EXL3 lane in windows", exl3_drive.win_ms / (double) exl3_drive.win_calls,
                         (double) exl3_drive.win_jobs / (double) exl3_drive.win_calls,
                         (double) exl3_drive.win_entries / (double) exl3_drive.win_calls);
+        if (exl3_win && exl3_drive.win_calls > 0) {
+            const double c = (double) exl3_drive.win_calls * 1e-3;
+            std::printf("%-24s gpu plan %.1f  helper launch %.1f  adapt+jobs %.1f  lane %.1f  helper finish %.1f us a window-layer\n",
+                        "EXL3 lane phases", exl3_drive.ph_gpu / c, exl3_drive.ph_help / c, exl3_drive.ph_jobs / c,
+                        exl3_drive.ph_lane / c, exl3_drive.ph_fin / c);
+            if (exl3_drive.help.t_n > 0)
+                std::printf("%-24s launch %.1f  device (copies + kernels + rows back) %.1f  placing the rows %.1f us a call (%lld calls)\n",
+                            "EXL3 helper round trip", exl3_drive.help.t_launch / exl3_drive.help.t_n,
+                            exl3_drive.help.t_wait / exl3_drive.help.t_n, exl3_drive.help.t_copy / exl3_drive.help.t_n,
+                            (long long) exl3_drive.help.t_n);
+        }
         if (exl3_hits && exl3_drive.win_calls > 0)
             std::printf("%-24s %.1f%% of the routes (%.2f entries in %.2f experts a window-layer) on the GPU tier\n",
                         "EXL3 VRAM tier", exl3_drive.win_entries > 0 ? 100.0 * (double) exl3_drive.tier_entries /

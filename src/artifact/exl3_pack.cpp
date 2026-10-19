@@ -7,6 +7,7 @@
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/cpu/exl3.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/fused_gr.hpp"
 
 #include <ggml.h>
 
@@ -612,6 +613,18 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
         }();
         bool embed_host = embed_host_env;
         auto on_host = [&](const Staged& s) { return embed_host && !s.r->deq && s.engine == "token_embd.weight"; };
+        // proto (STRATA_EXL3_HC_Q8=1): the layers' hyper-connection down / up projections live only as Q8_0 - staged on the
+        // host, quantized on the GPU, no BF16 copy in the arena (the paths without a Q8 kernel dequantize through
+        // NativeDense::hc_bf16_view's scratches); STRATA_EXL3_HC_Q8_KEEP_BF16=1 keeps both copies (the first prototype)
+        static const bool hc_q8_only = [] {
+            const char* v = std::getenv("STRATA_EXL3_HC_Q8"), *k = std::getenv("STRATA_EXL3_HC_Q8_KEEP_BF16");
+            return v != nullptr && v[0] == '1' && !(k != nullptr && k[0] == '1');
+        }();
+        auto q8_only = [&](const Staged& s) {
+            if (!hc_q8_only || s.r->deq || s.engine.rfind("blk.", 0) != 0) return false;
+            return s.engine.ends_with(".hc_attn_down.weight") || s.engine.ends_with(".hc_attn_up.weight") ||
+                   s.engine.ends_with(".hc_ffn_down.weight") || s.engine.ends_with(".hc_ffn_up.weight");
+        };
         uint64_t need = 0, need_host = 0;
         for (const Staged& s : staged) {
             if (s.r->deq) {   // reconstructed to BF16 [in, out]
@@ -624,6 +637,7 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
             const StTensor* t = nullptr; im.raw_data(s.hf, &t);
             if (!t) { err = "exl3: missing tensor " + s.hf; return false; }
             const uint64_t bytes = t->nelem() * (s.r->form == Form::F32 ? 4 : 2);
+            if (q8_only(s)) continue;
             (on_host(s) ? need_host : need) += (bytes + 255) & ~(uint64_t) 255;
         }
         if (need_host > 0 &&
@@ -640,8 +654,37 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
         uint8_t* dst = host_arena.data();
         std::vector<std::pair<std::string, uint64_t>> placed;
         uint8_t* hdst = (uint8_t*) im.host_embed;
+        std::vector<uint8_t> q8_stage;
+        void* q8_dev = nullptr;
+        size_t q8_dev_bytes = 0;
+        uint64_t q8_only_bytes = 0;
         for (const Staged& s : staged) {
             WeightRef w;
+            if (q8_only(s)) {
+                const StTensor* t = nullptr; im.raw_data(s.hf, &t);
+                const size_t bytes = (size_t) t->nelem() * 2;
+                if (q8_stage.size() < bytes) q8_stage.resize(bytes);
+                uint8_t* hp = q8_stage.data();
+                if (!stage_role(im, *s.r, g, s.hf, s.engine, hp, w, err)) return false;
+                if (w.elements % 32 != 0) { err = "exl3 (STRATA_EXL3_HC_Q8): " + s.engine + " is not a whole number of Q8_0 blocks"; return false; }
+                if (q8_dev_bytes < bytes) {
+                    if (q8_dev != nullptr) cudaFree(q8_dev);
+                    if (cudaMalloc(&q8_dev, bytes) != cudaSuccess) { err = "exl3 (STRATA_EXL3_HC_Q8): staging alloc"; return false; }
+                    q8_dev_bytes = bytes;
+                }
+                const int64_t nb = w.elements / 32;
+                void* q = im.alloc((size_t) nb * 34);
+                if (cudaMemcpy(q8_dev, q8_stage.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "exl3 (STRATA_EXL3_HC_Q8): staging copy"; return false;
+                }
+                strata::kernels::fused_gr_quantize_q8_0((const uint16_t*) q8_dev, (uint8_t*) q, nb, nullptr);
+                if (cudaDeviceSynchronize() != cudaSuccess) { err = "exl3 (STRATA_EXL3_HC_Q8): quantize"; return false; }
+                w.data = nullptr;
+                w.hc_q8 = q;
+                wt.set(s.engine, w);
+                q8_only_bytes += (uint64_t) nb * 34;
+                continue;
+            }
             if (on_host(s)) {   // staged in place in the page-locked table; the kernels take its device address
                 if (!stage_role(im, *s.r, g, s.hf, s.engine, hdst, w, err)) return false;
                 void* dp = nullptr;
@@ -662,6 +705,10 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
             w.data = nullptr;   // filled in after the upload
             wt.set(s.engine, w);
         }
+        if (q8_dev != nullptr) cudaFree(q8_dev);
+        if (q8_only_bytes > 0)
+            std::fprintf(stderr, "exl3: the layers' hyper-connection projections only as Q8_0 (%.0f MiB, no BF16 copy; "
+                                 "STRATA_EXL3_HC_Q8=1)\n", (double) q8_only_bytes / (1 << 20));
         uint8_t* arena = (uint8_t*) im.alloc((size_t) need);
         arena_bytes_ = need;
         if (cudaMemcpy(arena, host_arena.data(), (size_t) need, cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -730,6 +777,41 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
             if (!for_each(kCommon, sizeof kCommon / sizeof kCommon[0])) return false;
             if (!for_each(qsa ? kQsa : kGdn, qsa ? sizeof kQsa / sizeof kQsa[0] : sizeof kGdn / sizeof kGdn[0]))
                 return false;
+        }
+
+        // ---- proto (STRATA_EXL3_HC_Q8=1): a Q8_0 copy of the hyper-connections' down / up projections (the layers' and
+        // the final mixer's), quantized on the GPU from the staged BF16 as the GGUF path does for a bf16 pack, so the
+        // verify windows take launch_q8 (split-K down with the norm folded in, half the bytes).  The BF16 copies stay
+        // (the prompt path, the single-token path and the drafter read them).  The inject rows stay BF16.
+        if (const char* hq = std::getenv("STRATA_EXL3_HC_Q8"); hq != nullptr && hq[0] == '1') {
+            std::vector<std::string> names;
+            for (const auto& kv : wt.all()) {
+                const std::string& n = kv.first;
+                const bool hc = n.find(".hc_attn_") != std::string::npos || n.find(".hc_ffn_") != std::string::npos ||
+                                n.rfind("output_hc_", 0) == 0;
+                if (hc && (n.ends_with("_down.weight") || n.ends_with("_up.weight"))) names.push_back(n);
+            }
+            uint64_t q8_bytes = 0;
+            for (const std::string& n : names) {
+                WeightRef r = *wt.find(n);
+                if (r.hc_q8 != nullptr) continue;   // the Q8-only rows (above)
+                if (r.data == nullptr || r.ne0 % 32 != 0 || r.elements % 32 != 0) {
+                    err = "exl3 (STRATA_EXL3_HC_Q8): " + n + " is not a bf16 matrix the Q8_0 copy can take";
+                    return false;
+                }
+                const int64_t nb = r.elements / 32;
+                void* q = im.alloc((size_t) nb * 34);
+                strata::kernels::fused_gr_quantize_q8_0((const uint16_t*) r.data, (uint8_t*) q, nb, nullptr);
+                r.hc_q8 = q;
+                wt.set(n, r);
+                q8_bytes += (uint64_t) nb * 34;
+            }
+            if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+                err = "exl3 (STRATA_EXL3_HC_Q8): quantizing the hyper-connection projections failed";
+                return false;
+            }
+            std::fprintf(stderr, "exl3: Q8_0 copies of %zu hyper-connection projections (%.0f MiB, STRATA_EXL3_HC_Q8=1)\n",
+                         names.size(), (double) q8_bytes / (1 << 20));
         }
 
         // ---- validate against the engine's own shape contract

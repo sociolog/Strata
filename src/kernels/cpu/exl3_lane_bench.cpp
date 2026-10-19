@@ -453,7 +453,7 @@ int main(int argc, char** argv) {
     for (const auto& kk : k2s) {
         const Layout L(kk.first, kk.second);
         const int K = 100 * kk.first + kk.second;   // a seed
-        const size_t E = std::max<size_t>(64, ((size_t) mb << 20) / L.bytes);
+        const size_t E = std::max<size_t>(3, ((size_t) mb << 20) / L.bytes);
         std::unique_ptr<uint8_t[]> mem(new uint8_t[E * L.bytes + 4096]);
         uint8_t* blobs = (uint8_t*) (((uintptr_t) mem.get() + 4095) & ~(uintptr_t) 4095);
         {   // 16 distinct experts, copied over the whole buffer (the bytes in DRAM are what is measured)
