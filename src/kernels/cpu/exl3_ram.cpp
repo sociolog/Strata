@@ -3,6 +3,7 @@
 
 #include "strata/artifact/exl3_model.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -125,7 +126,10 @@ bool Exl3ExpertRam::open(const std::string& dir, int n_layers, int n_expert, int
         void* m = ::mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (m == MAP_FAILED) return fail("cannot map " + std::to_string(gib(total)) + " GiB: " + std::strerror(errno));
         map = (uint8_t*) m;
-        (void) ::madvise(map, total, MADV_HUGEPAGE);   // fewer TLB misses for the lane's reads; a hint only
+        // proto: STRATA_EXL3_RAM_THP=0 leaves the huge-page hint out (the 84.8 GiB 6.05 tier's cudaHostRegister stalled in
+        // reclaim_throttle with ~2.5e9 failed page migrations while pinning the THP-backed mapping)
+        if (const char* v = std::getenv("STRATA_EXL3_RAM_THP"); v != nullptr && v[0] == '1')
+            (void) ::madvise(map, total, MADV_HUGEPAGE);   // fewer TLB misses for the lane's reads; a hint only
         std::map<std::string, int> file_ix;
         reads.reserve((size_t) n_layers * (size_t) n_expert * 9);
         for (int l = 0; l < n_layers; ++l) {

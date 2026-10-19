@@ -1366,6 +1366,7 @@ struct Exl3Drive {
     int64_t n_embd = 0;
     int64_t win_calls = 0, win_entries = 0, win_jobs = 0;
     double win_ms = 0;
+    double ph_gpu = 0, ph_help = 0, ph_jobs = 0, ph_lane = 0, ph_fin = 0;   // proto: where a window-layer's host time goes
     std::vector<int16_t> job_of;      // n_expert entries: a window's expert -> its job (-1: none yet)
     std::vector<int32_t> touched;     // the experts the call gave a job; job_of is reset through them
     // --exl3-lane-profile: the VRAM tier (kernels/exl3_tier.hpp).  A window publishes the routes to its experts as the
@@ -1657,6 +1658,7 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
             t->tier_entries += entries;
         }
     }
+    const Clock::time_point a1 = Clock::now();
     // the helper tier's share: the window's experts the helper card holds (never the main tier's), run there now with the
     // same kernels; their rows reach `out` after the lane's (the window takes them as the CPU's rows)
     bool on_help[cpu::MAXT * 64] = {};
@@ -1684,7 +1686,9 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
         t->help_groups += h.groups;
         t->help_entries += h.entries;
     }
+    const Clock::time_point a2 = Clock::now();
     if (ok && t->adapt != nullptr && t->tier != nullptr) t->adapt->count(layer, ids, n_tok * k, on_gpu, on_help);
+    Clock::time_point a3 = Clock::now(), a4 = a3;
     if (ok) {
         const int ne = t->ram->n_expert();
         if ((int) t->job_of.size() != ne) t->job_of.assign((size_t) ne, -1);
@@ -1709,7 +1713,9 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
                 ++j.nt;
             }
         for (int32_t e : t->touched) t->job_of[(size_t) e] = -1;
+        a3 = Clock::now();
         if (ok && njobs > 0) ok = t->moe->run(*t->pool, t->jobs.data(), njobs, err);
+        a4 = Clock::now();
     }
     if (ok && t->helper != nullptr && !t->help.finish(out, err)) {
         ok = false;
@@ -1721,6 +1727,26 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
                      (long long) layer, err.c_str());
         std::fflush(stderr);
         std::abort();
+    }
+    // proto: STRATA_EXL3_ROUTE_DUMP=PATH - each window-layer's routes and where they ran (0 lane, 1 VRAM tier, 2 helper):
+    // int32 layer, n_tok, k, then n_tok*k int32 ids, then n_tok*k uint8 placements
+    {
+        static std::FILE* rd = [] { const char* v = std::getenv("STRATA_EXL3_ROUTE_DUMP"); return v ? std::fopen(v, "wb") : nullptr; }();
+        if (rd != nullptr) {
+            const int32_t hdr[3] = {(int32_t) layer, (int32_t) n_tok, (int32_t) k};
+            std::fwrite(hdr, sizeof hdr, 1, rd);
+            std::fwrite(ids, sizeof(int32_t), (size_t) (n_tok * k), rd);
+            uint8_t pl[cpu::MAXT * 64];
+            for (int64_t i = 0; i < n_tok * k; ++i) pl[i] = on_gpu[i] ? 1 : on_help[i] ? 2 : 0;
+            std::fwrite(pl, 1, (size_t) (n_tok * k), rd);
+            if (layer == t->ram->n_layers() - 1) std::fflush(rd);
+        }
+    }
+    {
+        using ms = std::chrono::duration<double, std::milli>;
+        const Clock::time_point a5 = Clock::now();
+        t->ph_gpu += ms(a1 - a).count(); t->ph_help += ms(a2 - a1).count(); t->ph_jobs += ms(a3 - a2).count();
+        t->ph_lane += ms(a4 - a3).count(); t->ph_fin += ms(a5 - a4).count();
     }
     t->win_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->win_calls;
@@ -4307,6 +4333,15 @@ int main(int argc, char** argv) {
         if (const cudaError_t pe = cudaGetLastError(); pe != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the EXL3 loader left a CUDA error: %s\n", cudaGetErrorString(pe));
             return 1;
+        }
+        {   // proto: the Q8-only hyper-connection rows (no BF16 copy) need hc_bf16_view's scratches
+            uint64_t el = 0;
+            for (const auto& kv : wt.all())
+                if (kv.second.hc_q8 != nullptr && kv.second.data == nullptr) el = std::max<uint64_t>(el, (uint64_t) kv.second.elements);
+            if (el > 0 && !strata::core::NativeDense::hc_scratch_init(el, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
         }
         std::fprintf(stderr, "strata generate: EXL3 %s: %zu roles, %.1f MiB EXL3 linears, %.1f MiB staged, in %.1f s\n",
                      o.exl3_dir.c_str(), wt.all().size(), (double) exl3_pack->exl3_bytes() / (1 << 20),
@@ -9784,7 +9819,9 @@ int main(int argc, char** argv) {
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         // (--exl3-lane: the prompt's short parts go through windows of up to kVerifyMaxT tokens, as generate reads its
         // prompt; the decode windows stay within --spec.  The drafter's head is the EXL3 pack's own)
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
+        static const bool exl3_vhead_s = [] { const char* v = std::getenv("STRATA_EXL3_VERIFY_HEAD"); return v == nullptr || v[0] != '0'; }();
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head
+                                     : exl3_vhead_s && exl3_mtp_head.loaded() ? &exl3_mtp_head : nullptr,
                       batch_mtp    ? strata::kernels::kVerifyMaxT
                       : exl3_serve ? std::max(o.spec, strata::kernels::kVerifyMaxT)
                                    : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
@@ -16861,7 +16898,12 @@ int main(int argc, char** argv) {
         if (pcie_balance()) ver.set_pcie_balance(&drive.d.pcie_model);
         // (the EXL3 prompt reader's windows take up to kVerifyMaxT tokens; the decode windows stay within --spec)
         const int ver_max_t = exl3_win_prompt ? std::max(o.spec, strata::kernels::kVerifyMaxT) : o.spec;
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, ver_max_t, err)) {
+        // proto: the EXL3 windows read the adopted output.weight once for all their rows (STRATA_EXL3_VERIFY_HEAD=0: the
+        // per-row head as before)
+        static const bool exl3_vhead = [] { const char* v = std::getenv("STRATA_EXL3_VERIFY_HEAD"); return v == nullptr || v[0] != '0'; }();
+        strata::core::NativeHead* ver_head = native_head.loaded() ? &native_head
+                                           : exl3_vhead && exl3_mtp_head.loaded() ? &exl3_mtp_head : nullptr;
+        if (!ver.init(wt, g, ss, vh, ver_head, ver_max_t, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -17372,6 +17414,12 @@ int main(int argc, char** argv) {
                         "EXL3 lane in windows", exl3_drive.win_ms / (double) exl3_drive.win_calls,
                         (double) exl3_drive.win_jobs / (double) exl3_drive.win_calls,
                         (double) exl3_drive.win_entries / (double) exl3_drive.win_calls);
+        if (exl3_win && exl3_drive.win_calls > 0) {
+            const double c = (double) exl3_drive.win_calls * 1e-3;
+            std::printf("%-24s gpu plan %.1f  helper launch %.1f  adapt+jobs %.1f  lane %.1f  helper finish %.1f us a window-layer\n",
+                        "EXL3 lane phases", exl3_drive.ph_gpu / c, exl3_drive.ph_help / c, exl3_drive.ph_jobs / c,
+                        exl3_drive.ph_lane / c, exl3_drive.ph_fin / c);
+        }
         if (exl3_hits && exl3_drive.win_calls > 0)
             std::printf("%-24s %.1f%% of the routes (%.2f entries in %.2f experts a window-layer) on the GPU tier\n",
                         "EXL3 VRAM tier", exl3_drive.win_entries > 0 ? 100.0 * (double) exl3_drive.tier_entries /
