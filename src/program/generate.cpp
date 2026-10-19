@@ -121,6 +121,8 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <functional>
 #include <future>
 #include <thread>
+#include <pthread.h>
+#include <immintrin.h>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -1469,8 +1471,82 @@ struct Exl3Drive {
             }
             return true;
         }
+        // proto (STRATA_EXL3_HELP_THREAD, default on): `launch` on a thread of its own (pinned to a core the lane does not
+        // use), so the lane starts at once instead of after the helper's ~4 CUDA calls (11 us a window-layer, measured)
+        std::thread lth;
+        std::atomic<uint64_t> lreq{0}, ldone{0};
+        std::atomic<bool> lstop{false};
+        double t_launch = 0, t_wait = 0, t_copy = 0; int64_t t_n = 0;   // proto: the helper thread's round trip
+        const float* l_x = nullptr;
+        float* l_out = nullptr;   // where the thread puts the rows (the window's mapped rows), once they are back
+        int64_t l_n = 0;
+        const strata::kernels::exl3::ExpertLayout* l_lay = nullptr;
+        bool l_ok = true;
+        std::string l_err;
+        static bool thread_on() {
+            static const bool on = [] { const char* v = std::getenv("STRATA_EXL3_HELP_THREAD"); return v == nullptr || v[0] != '0'; }();
+            return on;
+        }
+        void launch_async(const float* x_host, int64_t n_tok, const strata::kernels::exl3::ExpertLayout& lay, float* out) {
+            if (!lth.joinable()) {
+                lth = std::thread([this] {
+                    if (const char* c = std::getenv("STRATA_EXL3_HELP_CPU"); c == nullptr || c[0] != '-') {
+                        cpu_set_t set;
+                        CPU_ZERO(&set);
+                        CPU_SET(c != nullptr ? std::atoi(c) : 11, &set);
+                        (void) pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+                    }
+                    uint64_t seen = 0;
+                    auto idle = std::chrono::steady_clock::now();
+                    while (!lstop.load(std::memory_order_acquire)) {
+                        const uint64_t r = lreq.load(std::memory_order_acquire);
+                        if (r == seen) {
+                            if (std::chrono::steady_clock::now() - idle > std::chrono::milliseconds(20))
+                                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                            else
+                                _mm_pause();
+                            continue;
+                        }
+                        seen = r;
+                        std::string e;
+                        const auto c0 = std::chrono::steady_clock::now();
+                        l_ok = launch(l_x, l_n, *l_lay, e);
+                        const auto c1 = std::chrono::steady_clock::now();
+                        auto c2 = c1;
+                        // the rows too, while the lane still runs: wait for the stream here (polled, the core is ours)
+                        if (l_ok && entries > 0) {
+                            cudaError_t q;
+                            while ((q = cudaStreamQuery(s)) == cudaErrorNotReady) _mm_pause();
+                            c2 = std::chrono::steady_clock::now();
+                            if (q != cudaSuccess) { l_ok = false; e = "device " + std::to_string(device) + ": " + cudaGetErrorString(q); }
+                            else
+                                for (int32_t m = 0; m < entries; ++m)
+                                    std::memcpy(l_out + (size_t) row_of[(size_t) m] * (size_t) n_embd,
+                                                h_rows + (size_t) m * (size_t) n_embd, (size_t) n_embd * sizeof(float));
+                        }
+                        {
+                            using us = std::chrono::duration<double, std::micro>;
+                            t_launch += us(c1 - c0).count(); t_wait += us(c2 - c1).count();
+                            t_copy += us(std::chrono::steady_clock::now() - c2).count(); ++t_n;
+                        }
+                        l_err = e;
+                        ldone.store(r, std::memory_order_release);
+                        idle = std::chrono::steady_clock::now();
+                    }
+                });
+            }
+            l_x = x_host; l_n = n_tok; l_lay = &lay; l_out = out;
+            lreq.fetch_add(1, std::memory_order_acq_rel);
+        }
+        bool wait_launch(std::string& err) {
+            const uint64_t r = lreq.load(std::memory_order_acquire);
+            while (ldone.load(std::memory_order_acquire) != r) _mm_pause();
+            if (!l_ok) { err = l_err; return false; }
+            return true;
+        }
         // waits for the rows and puts each in the caller's row of `out`
         bool finish(float* out, std::string& err) {
+            if (lth.joinable()) return wait_launch(err);   // the thread launched, waited and placed the rows
             if (entries == 0) return true;
             if (const cudaError_t e = cudaStreamSynchronize(s); e != cudaSuccess) {
                 err = "device " + std::to_string(device) + ": " + cudaGetErrorString(e);
@@ -1482,6 +1558,7 @@ struct Exl3Drive {
             return true;
         }
         ~X3Runner() {
+            if (lth.joinable()) { lstop.store(true, std::memory_order_release); lth.join(); }
             if (s == nullptr) return;
             const strata::core::OnDevice on(device);
             cudaStreamSynchronize(s);
@@ -1679,7 +1756,9 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
                     on_help[q] = true;
                 }
         }
-        if (ok && !h.launch(x_f, n_tok, (*t->lay)[(size_t) layer], err)) {
+        if (ok && Exl3Drive::X3Runner::thread_on()) {
+            if (h.entries > 0) h.launch_async(x_f, n_tok, (*t->lay)[(size_t) layer], out);
+        } else if (ok && !h.launch(x_f, n_tok, (*t->lay)[(size_t) layer], err)) {
             ok = false;
             err = "the helper tier's experts could not run: " + err;
         }
@@ -17419,6 +17498,11 @@ int main(int argc, char** argv) {
             std::printf("%-24s gpu plan %.1f  helper launch %.1f  adapt+jobs %.1f  lane %.1f  helper finish %.1f us a window-layer\n",
                         "EXL3 lane phases", exl3_drive.ph_gpu / c, exl3_drive.ph_help / c, exl3_drive.ph_jobs / c,
                         exl3_drive.ph_lane / c, exl3_drive.ph_fin / c);
+            if (exl3_drive.help.t_n > 0)
+                std::printf("%-24s launch %.1f  device (copies + kernels + rows back) %.1f  placing the rows %.1f us a call (%lld calls)\n",
+                            "EXL3 helper round trip", exl3_drive.help.t_launch / exl3_drive.help.t_n,
+                            exl3_drive.help.t_wait / exl3_drive.help.t_n, exl3_drive.help.t_copy / exl3_drive.help.t_n,
+                            (long long) exl3_drive.help.t_n);
         }
         if (exl3_hits && exl3_drive.win_calls > 0)
             std::printf("%-24s %.1f%% of the routes (%.2f entries in %.2f experts a window-layer) on the GPU tier\n",
