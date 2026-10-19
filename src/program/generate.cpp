@@ -1455,7 +1455,7 @@ struct Exl3Drive {
     struct X3Runner {
         int device = 0;
         cudaStream_t s = nullptr;
-        float *d_x = nullptr, *d_rows = nullptr, *h_rows = nullptr, *d_h = nullptr, *d_u = nullptr;
+        float *d_x = nullptr, *d_rows = nullptr, *h_rows = nullptr, *d_h = nullptr, *d_u = nullptr, *d_part = nullptr;
         uint32_t* d_cnt = nullptr;
         int32_t *h_plan = nullptr, *d_plan = nullptr;   // n_groups(1) | start(cap + 1) | tok(cap) | dst(cap) | pad | ptr(cap u64)
         int64_t cap = 0, n_tok_max = 0, ptr_off = 0, plan_ints = 0, n_embd = 0, n_ff = 0;
@@ -1479,6 +1479,8 @@ struct Exl3Drive {
                 cudaMalloc((void**) &d_h, (size_t) (cap * n_ff) * 4) != cudaSuccess ||
                 cudaMalloc((void**) &d_u, (size_t) (cap * n_ff) * 4) != cudaSuccess ||
                 cudaMalloc((void**) &d_cnt, ncnt * 4) != cudaSuccess || cudaMemset(d_cnt, 0, ncnt * 4) != cudaSuccess ||
+                (x3::group_partials((int) cap, (int) n_ff) > 0 &&
+                 cudaMalloc((void**) &d_part, x3::group_partials((int) cap, (int) n_ff) * 4) != cudaSuccess) ||
                 cudaMalloc((void**) &d_plan, (size_t) plan_ints * 4) != cudaSuccess ||
                 cudaHostAlloc((void**) &h_plan, (size_t) plan_ints * 4, cudaHostAllocPortable) != cudaSuccess ||
                 cudaHostAlloc((void**) &h_rows, (size_t) (cap * n_embd) * 4, cudaHostAllocPortable) != cudaSuccess) {
@@ -1522,16 +1524,25 @@ struct Exl3Drive {
             a.h = d_h;
             a.u = d_u;
             a.cnt = d_cnt;
+            a.part = d_part;
             a.lay = lay;
             a.max_groups = groups;
             a.max_entries = (int) cap;
             a.n_embd = (int) n_embd;
             a.n_ff = (int) n_ff;
-            if (cudaMemcpyAsync(d_plan, h_plan, (size_t) plan_ints * 4, cudaMemcpyHostToDevice, s) != cudaSuccess ||
-                cudaMemcpyAsync(d_x, x_host, (size_t) (n_tok * n_embd) * 4, cudaMemcpyHostToDevice, s) != cudaSuccess ||
-                !x3::grouped_experts(a, s) ||
-                cudaMemcpyAsync(h_rows, d_rows, (size_t) entries * (size_t) n_embd * 4, cudaMemcpyDeviceToHost, s) !=
-                    cudaSuccess) {
+            const bool ev = events_on();
+            if (ev && pev[0] == nullptr)
+                for (cudaEvent_t& e : pev) cudaEventCreate(&e);
+            if (ev) cudaEventRecord(pev[0], s);
+            bool okc = cudaMemcpyAsync(d_plan, h_plan, (size_t) plan_ints * 4, cudaMemcpyHostToDevice, s) == cudaSuccess &&
+                       cudaMemcpyAsync(d_x, x_host, (size_t) (n_tok * n_embd) * 4, cudaMemcpyHostToDevice, s) == cudaSuccess;
+            if (ev) cudaEventRecord(pev[1], s);
+            okc = okc && x3::grouped_experts(a, s);
+            if (ev) cudaEventRecord(pev[2], s);
+            okc = okc && cudaMemcpyAsync(h_rows, d_rows, (size_t) entries * (size_t) n_embd * 4, cudaMemcpyDeviceToHost, s) ==
+                             cudaSuccess;
+            if (ev) cudaEventRecord(pev[3], s);
+            if (!okc) {
                 err = "device " + std::to_string(device) + ": " + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -1544,6 +1555,9 @@ struct Exl3Drive {
         std::atomic<bool> lstop{false};
         int pin_cpu = 11;   // the launch thread's CPU (-1: not pinned)
         double t_launch = 0, t_wait = 0, t_copy = 0; int64_t t_n = 0;   // proto: the helper thread's round trip
+        cudaEvent_t pev[4] = {};                 // proto STRATA_EXL3_HELP_EVENTS=1: plan+x landed / kernels done / rows back
+        double t_up = 0, t_k = 0, t_down = 0; int64_t t_ev = 0;
+        static bool events_on() { static const bool on = [] { const char* v = std::getenv("STRATA_EXL3_HELP_EVENTS"); return v && v[0] == '1'; }(); return on; }
         const float* l_x = nullptr;
         float* l_out = nullptr;   // where the thread puts the rows (the window's mapped rows), once they are back
         int64_t l_n = 0;
@@ -1585,6 +1599,13 @@ struct Exl3Drive {
                             cudaError_t q;
                             while ((q = cudaStreamQuery(s)) == cudaErrorNotReady) _mm_pause();
                             c2 = std::chrono::steady_clock::now();
+                            if (events_on() && pev[0] != nullptr && q == cudaSuccess) {
+                                float a1 = 0, a2 = 0, a3 = 0;
+                                cudaEventElapsedTime(&a1, pev[0], pev[1]);
+                                cudaEventElapsedTime(&a2, pev[1], pev[2]);
+                                cudaEventElapsedTime(&a3, pev[2], pev[3]);
+                                t_up += a1 * 1000.0; t_k += a2 * 1000.0; t_down += a3 * 1000.0; ++t_ev;
+                            }
                             if (q != cudaSuccess) { l_ok = false; e = "device " + std::to_string(device) + ": " + cudaGetErrorString(q); }
                             else
                                 for (int32_t m = 0; m < entries; ++m)
@@ -1629,7 +1650,7 @@ struct Exl3Drive {
             if (s == nullptr) return;
             const strata::core::OnDevice on(device);
             cudaStreamSynchronize(s);
-            for (void* p : {(void*) d_x, (void*) d_rows, (void*) d_h, (void*) d_u, (void*) d_cnt, (void*) d_plan})
+            for (void* p : {(void*) d_x, (void*) d_rows, (void*) d_h, (void*) d_u, (void*) d_cnt, (void*) d_plan, (void*) d_part})
                 if (p != nullptr) cudaFree(p);
             if (h_plan != nullptr) cudaFreeHost(h_plan);
             if (h_rows != nullptr) cudaFreeHost(h_rows);
@@ -17894,6 +17915,10 @@ int main(int argc, char** argv) {
                             "EXL3 helper round trip", exl3_drive.help.t_launch / exl3_drive.help.t_n,
                             exl3_drive.help.t_wait / exl3_drive.help.t_n, exl3_drive.help.t_copy / exl3_drive.help.t_n,
                             (long long) exl3_drive.help.t_n);
+            for (const auto* r : {&exl3_drive.help, &exl3_drive.help2})
+                if (r->t_ev > 0)
+                    std::printf("%-24s device %d: uploads %.1f  kernels %.1f  rows back %.1f us a call (events)\n",
+                                "EXL3 helper stages", r->device, r->t_up / r->t_ev, r->t_k / r->t_ev, r->t_down / r->t_ev);
             if (exl3_drive.help2.t_n > 0)
                 std::printf("%-24s launch %.1f  device (copies + kernels + rows back) %.1f  placing the rows %.1f us a call (%lld calls)\n",
                             "EXL3 third round trip", exl3_drive.help2.t_launch / exl3_drive.help2.t_n,

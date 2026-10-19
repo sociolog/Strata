@@ -619,6 +619,7 @@ private:
     void* hit_scratch_ = nullptr;
     bool x3_on_ = false;           // --exl3: VerifyHits::exl3_lay given - the VRAM groups are EXL3 experts
     uint32_t* x3_cnt_ = nullptr;   // their kernels' gate/up pair counters (zero between launches)
+    float* x3_part_ = nullptr;     // proto: their gate/up's split-K partial sums (exl3::group_partials)
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     uint16_t* sh_bf16_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
