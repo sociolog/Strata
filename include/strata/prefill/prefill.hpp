@@ -60,6 +60,9 @@ struct Exl3PromptExperts {
     std::vector<kernels::exl3::ExpertLayout> lay;                    ///< per layer: the blob's parts
     std::vector<uint64_t> blob;                                      ///< per layer: an expert's bytes
     uint64_t max_blob = 0;
+    /// proto: each expert's place in the routing profile (layer * n_expert + e -> rank, 0 the hottest; empty: unknown) -
+    /// the helper's share of a prompt part takes the coldest (STRATA_EXL3_PF_HELP_PICK=cold, the default) - the fewest rows
+    std::vector<int32_t> rank;
     int ring = 512;         ///< slots of the copy ring (each max_blob bytes; 16..1024): one layer of experts ahead
     int light_rows = 64;    ///< an expert with at most this many rows of a chunk takes the tensor-core kernels
 };
