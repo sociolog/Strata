@@ -711,6 +711,7 @@ struct Options {
     bool stop_eos = false;
     std::vector<int64_t> eos_ids = {248044, 248046};
     bool spec_split = false;   ///< opt-in split verify window (the overlap study: exact, ~7% slower)
+    bool spec_split_set = false;   ///< --spec-split / --no-spec-split given (4Mile: else on with --exl3-lane)
     /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
     /// from each GPU's free VRAM); empty = one GPU
     std::string layer_split;
@@ -3451,7 +3452,7 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
-        else if (a == "--spec-split") o.spec_split = true;
+        else if (a == "--spec-split") { o.spec_split = true; o.spec_split_set = true; }
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
@@ -3546,7 +3547,7 @@ int main(int argc, char** argv) {
             else if (d.rfind("single:", 0) == 0) o.cvec_single = std::atoi(d.c_str() + 7);
             else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return 2; }
         }
-        else if (a == "--no-spec-split") o.spec_split = false;
+        else if (a == "--no-spec-split") { o.spec_split = false; o.spec_split_set = true; }
         else if (a == "--eos-ids") {
             std::string e;
             if (!parse_i64_list(next("--eos-ids"), o.eos_ids, e)) { std::fprintf(stderr, "--eos-ids: %s\n", e.c_str()); return 2; }
@@ -3969,6 +3970,10 @@ int main(int argc, char** argv) {
         if (const char* v = std::getenv("STRATA_SFX_SPAN")) span = std::max(0, std::atoi(v));
         o.spec = std::min(o.spec + span, 8);   // kVerifyMaxT
     }
+    // 4Mile: the split verify window on the EXL3 lane by default, for windows of 6+ tokens (STRATA_SPLIT_MIN_T; the
+    // lookup windows): a 73 %-quoted OpenCode step 57.5 -> 60.8 tok/s, prose unchanged (its windows stay whole).
+    // --no-spec-split turns it off.
+    if (o.exl3_lane && !o.spec_split_set) o.spec_split = true;
     // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
     // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
     // from mtp_max_t left K=1 and K=2 with a window identical to not passing the flag at all.

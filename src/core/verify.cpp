@@ -1015,7 +1015,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
-    const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
+    // 4Mile: STRATA_SPLIT_MIN_T (default 6; 2 = every window, as before) - the smallest window the split pipeline takes (10-20, 6.05 on 3090 + 3060: a split
+    // T4 window 42.9 -> 44.0 ms, T8 72.4 -> 66.8 ms - each half pays the dense pass again, so only long windows gain)
+    static const int split_min_t = [] { const char* v = std::getenv("STRATA_SPLIT_MIN_T"); return v != nullptr ? std::max(2, std::atoi(v)) : 6; }();
+    const int G = (split_ && T >= split_min_t && !batch_rec_) ? 2 : 1;   // a batch window is one group
     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
     const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
