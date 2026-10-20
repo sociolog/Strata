@@ -1257,6 +1257,17 @@ struct Exl3Adapt {
     float decay = 0.95f, margin = 1.0f;
     std::vector<float> miss;   // [n_layers * n_expert]: the lane's routes
     int64_t swaps = 0, swaps_help = 0, rounds = 0;
+    // 10-20 (the night run's crash "assign of expert 22271 to slot 1888: the slot is taken or the expert resident
+    // already"): an expert put back into a tier by something else - the elastic K/V's trim refill - kept the miss count
+    // the lane had given it while it was out, so a later round planned it again though it was resident.  `stale`: such
+    // candidates dropped in a round; `dropped`: swaps settle found no longer valid (both 0 when all is well)
+    int64_t stale = 0, dropped = 0;
+    bool resident_anywhere(int32_t key) const {
+        for (const Tier& T : tiers)
+            if (T.tier->h_res()[(size_t) key] >= 0) return true;
+        return false;
+    }
+    void forget_miss(int32_t key) { if (key >= 0 && (size_t) key < miss.size()) miss[(size_t) key] = 0.0f; }
     bool init(strata::kernels::Exl3VramTier* main, strata::kernels::Exl3VramTier* help,
               const strata::kernels::cpu::Exl3ExpertRam* r, int n, std::string& err) {
         ram = r;
@@ -1343,6 +1354,15 @@ struct Exl3Adapt {
             }
             const bool batch = spread_on();   // proto: the table uploaded once, not 2 synchronous copies a swap
             for (const Tier::Pending& p : T.pending) {
+                // a swap that is no longer valid (its slot taken or its expert resident since it was planned) is dropped:
+                // the victim stays, the slot goes back to the spares if it is still free
+                if (T.tier->owner(p.slot) >= 0 || resident_anywhere(p.key) || T.tier->owner(p.victim) < 0) {
+                    if (T.tier->owner(p.slot) < 0) T.spares.push_back(p.slot);
+                    T.chosen[(size_t) p.victim] = 0;
+                    if (miss[(size_t) p.key] < 0.0f) miss[(size_t) p.key] = 0.0f;
+                    ++dropped;
+                    continue;
+                }
                 if (!T.tier->release_slot(p.victim, err, !batch) || !T.tier->assign(p.slot, p.key, err, !batch)) return false;
                 T.use[(size_t) p.slot] = p.score;
                 miss[(size_t) p.key] = 0.0f;
@@ -1366,7 +1386,14 @@ struct Exl3Adapt {
             for (float& u : T.use) u *= decay;
         std::vector<std::pair<float, int32_t>> cand;
         for (int32_t key = 0; key < (int32_t) miss.size(); ++key)
-            if (miss[(size_t) key] > margin) cand.emplace_back(miss[(size_t) key], key);
+            if (miss[(size_t) key] > margin) {
+                if (resident_anywhere(key)) {   // put back by someone else: not a miss any more
+                    miss[(size_t) key] = 0.0f;
+                    ++stale;
+                    continue;
+                }
+                cand.emplace_back(miss[(size_t) key], key);
+            }
         const size_t want = std::min(cand.size(), (size_t) per_round * tiers.size());
         if (want == 0) return true;
         std::partial_sort(cand.begin(), cand.begin() + (std::ptrdiff_t) want, cand.end(),
@@ -8635,6 +8662,7 @@ int main(int argc, char** argv) {
         const int64_t ne = exl3_ram->n_expert();
         auto free_key = [&](int32_t key) { return hr[key] < 0 && (hh == nullptr || hh[key] < 0); };
         std::vector<std::pair<int64_t, int32_t>> fill;
+        static const bool trim_forget = [] { const char* v = std::getenv("STRATA_EXL3_KV_TRIM_FORGET"); return v == nullptr || v[0] != '0'; }();
         size_t pi = 0;
         std::vector<uint8_t> taken((size_t) (exl3_ram->n_layers() * ne), 0);
         for (int64_t q = lo0; q < kvx.lo; ++q) {
@@ -8661,7 +8689,10 @@ int main(int argc, char** argv) {
         }
         for (const auto& [q, key] : fill) {
             if (!xt.assign(q, key, e, false)) { std::fprintf(stderr, "strata: the elastic K/V: %s\n", e.c_str()); return false; }
-            if (exl3_drive.adapt != nullptr) exl3_drive.adapt->take_back(q);
+            if (exl3_drive.adapt != nullptr) {
+                exl3_drive.adapt->take_back(q);
+                if (trim_forget) exl3_drive.adapt->forget_miss(key);   // resident again: its misses while out are history
+            }
         }
         for (int64_t q = lo0 + (int64_t) fill.size(); q < kvx.lo; ++q)   // no expert left to put there: a spare
             if (exl3_drive.adapt != nullptr) { exl3_drive.adapt->take_back(q); exl3_drive.adapt->tiers[0].spares.push_back((int32_t) q); }
@@ -16666,6 +16697,17 @@ int main(int argc, char** argv) {
                              (double) (exl3_drive.win_jobs - x3_jobs0) / wc,
                              (long long) ((exl3_drive.adapt != nullptr ? exl3_drive.adapt->swaps : 0) - x3_swaps0),
                              (long long) (fb >> 20));
+                // (10-20) stale swap candidates / invalid swaps the adaptive tier dropped - the night crash's cause, now
+                // caught; the totals since start, printed only when they move
+                static int64_t x3_stale_seen = 0, x3_drop_seen = 0;
+                if (exl3_drive.adapt != nullptr &&
+                    (exl3_drive.adapt->stale != x3_stale_seen || exl3_drive.adapt->dropped != x3_drop_seen)) {
+                    x3_stale_seen = exl3_drive.adapt->stale;
+                    x3_drop_seen = exl3_drive.adapt->dropped;
+                    std::fprintf(stderr, "strata serve: EXL3 tier adapt: %lld stale candidates and %lld invalid swaps dropped "
+                                         "since start (experts already resident again)\n",
+                                 (long long) x3_stale_seen, (long long) x3_drop_seen);
+                }
             }
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count - #588: so that share is said beside it (raising --pcie-frac
