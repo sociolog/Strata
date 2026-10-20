@@ -76,6 +76,7 @@
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
+#include "strata/spec/suffix_vote_drafter.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/program/batch_groups.hpp"
@@ -1102,7 +1103,7 @@ void usage() {
 }
 
 // --lookup-chain: the context's last tokens for the draft sources (at most 64), the MTP's pending drafts last
-int chain_tail(const strata::spec::SuffixDrafter& sfx, const int32_t* pending, int n_pending, std::vector<int32_t>& tail) {
+int chain_tail(const strata::spec::LookupDrafter& sfx, const int32_t* pending, int n_pending, std::vector<int32_t>& tail) {
     const std::vector<int32_t>& h = sfx.history();
     const int keep = std::max(0, std::min((int) h.size(), 64 - n_pending));
     tail.assign(h.end() - keep, h.end());
@@ -3962,7 +3963,11 @@ int main(int argc, char** argv) {
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
-        o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
+        // 4Mile: STRATA_SFX_SPAN sets how much longer than the MTP's a lookup window may be (default 2; 4 with the
+        // vote drafter, whose proposals stop where its candidates disagree)
+        int span = strata::spec::LookupDrafter::vote_on() ? 4 : 2;
+        if (const char* v = std::getenv("STRATA_SFX_SPAN")) span = std::max(0, std::atoi(v));
+        o.spec = std::min(o.spec + span, 8);   // kVerifyMaxT
     }
     // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
     // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
@@ -12348,7 +12353,7 @@ int main(int argc, char** argv) {
         if (use_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
-        strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        strata::spec::LookupDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
@@ -15444,7 +15449,7 @@ int main(int argc, char** argv) {
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
             std::vector<int32_t> cbuf((size_t) S, 0), ctail;
-            strata::spec::PromptLookupSource lookup_src(sfx);
+            strata::spec::PromptLookupSource lookup_src(sfx.base());
             static const bool chain_fixed = std::getenv("STRATA_LOOKUP_CHAIN_FIXED") != nullptr;   // no policy gate
             int64_t draft_offered = 0, draft_accepted = 0;
             // what the session holds once this request is done: the prompt read so far, then every committed token
@@ -17768,13 +17773,13 @@ int main(int argc, char** argv) {
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
-        strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        strata::spec::LookupDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
         std::vector<int32_t> cbuf((size_t) o.spec, 0), ctail;
-        strata::spec::PromptLookupSource lookup_src(sfx);
+        strata::spec::PromptLookupSource lookup_src(sfx.base());
         const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
         if (sfx_on) {
             for (int64_t t : o.tokens) sfx.append((int32_t) t);

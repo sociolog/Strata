@@ -11,6 +11,7 @@
 //   copy      history = the whole prompt; generate its middle third again (output quoting input: edits)
 // No model runs; this measures the drafter on text, not on the model's own outputs.
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/spec/suffix_vote_drafter.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -154,5 +155,25 @@ int main(int argc, char** argv) {
         return 0;
     }
     unit_tests();
+    // 4Mile: the vote drafter - an exact repeat drafts its continuation; disagreeing occurrences stop the draft where
+    // they split; propose_after() leaves the history as it was
+    {
+        strata::spec::SuffixVoteDrafter d;
+        const std::vector<int32_t> h = {1, 2, 3, 4, 5, 6, 7, 9, 9, 1, 2, 3};
+        d.append(h.data(), h.size());
+        int32_t out[8] = {};
+        check(d.propose(4, out) == 4 && out[0] == 4 && out[1] == 5 && out[2] == 6 && out[3] == 7, "vote: exact repeat");
+        check(d.last_match() == 3 && d.last_support() == 1, "vote: match length and support");
+        const std::vector<int32_t> h2 = {4, 5, 8, 8, 1, 2, 3};   // a second occurrence of 1 2 3 4 5, then 8 (not 6)
+        d.append(h2.data(), h2.size());
+        const int k = d.propose(6, out);
+        check(k == 2 && out[0] == 4 && out[1] == 5, "vote: stops where the candidates split evenly");
+        const size_t n = d.size();
+        const int32_t extra[2] = {4, 5};
+        check(d.propose_after(extra, 2, 2, out) >= 1 && d.size() == n, "vote: propose_after keeps the history");
+        strata::spec::SuffixVoteDrafter e;
+        e.append(h.data(), 4);
+        check(e.propose(4, out) == 0, "vote: no earlier occurrence, no proposal");
+    }
     return g_fail ? 1 : 0;
 }
