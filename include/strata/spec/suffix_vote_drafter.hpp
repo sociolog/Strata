@@ -72,8 +72,11 @@ private:
     std::vector<double> votes_w_;
 };
 
-/// The engine's lookup drafter: the prompt-lookup one (always kept: --lookup-chain reads it), and with
-/// STRATA_SFX_VOTE=1 the vote drafter beside it, which then makes the proposals.  Both see every token.
+/// The engine's lookup drafter: the prompt-lookup one (always kept: --lookup-chain reads it) and the vote drafter
+/// beside it, which makes the proposals (ON by default since 10-20, with lookup windows 4 longer than the MTP's:
+/// a 73 %-quoted OpenCode step +3.2-3.7 %, English prose and typical code unchanged, Serbian prose -0.8 %, Mile: "I
+/// do not mind if Serbian is a bit slower if overall system is faster").  STRATA_SFX_VOTE=0: the prompt-lookup
+/// drafter alone, as before (and STRATA_SFX_SPAN=2 its old window length).  Both see every token.
 class LookupDrafter {
 public:
     LookupDrafter(int min_match, int max_match, size_t capacity_tokens) : old_(min_match, max_match, capacity_tokens) {
@@ -86,7 +89,7 @@ public:
         }
     }
     static bool vote_on() {
-        static const bool on = [] { const char* v = std::getenv("STRATA_SFX_VOTE"); return v != nullptr && v[0] == '1'; }();
+        static const bool on = [] { const char* v = std::getenv("STRATA_SFX_VOTE"); return v == nullptr || v[0] != '0'; }();
         return on;
     }
     void reset() { old_.reset(); if (vote_) vote_->reset(); }
