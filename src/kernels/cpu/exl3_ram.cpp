@@ -59,6 +59,21 @@ Exl3ExpertRam::~Exl3ExpertRam() {
 
 bool Exl3ExpertRam::open(const std::string& dir, int n_layers, int n_expert, int threads, uint64_t budget,
                          std::string& err) {
+    return open_impl(dir, n_layers, n_expert, threads, budget, nullptr, err);
+}
+
+bool Exl3ExpertRam::open_subset(const std::string& dir, int n_layers, int n_expert, int threads,
+                                const std::vector<uint8_t>& keep, std::string& err) {
+    if (keep.size() != (size_t) n_layers * (size_t) n_expert) {
+        err = "EXL3 RAM tier: the subset's table has " + std::to_string(keep.size()) + " entries, not " +
+              std::to_string((size_t) n_layers * (size_t) n_expert);
+        return false;
+    }
+    return open_impl(dir, n_layers, n_expert, threads, 0, &keep, err);
+}
+
+bool Exl3ExpertRam::open_impl(const std::string& dir, int n_layers, int n_expert, int threads, uint64_t budget,
+                              const std::vector<uint8_t>* keep, std::string& err) {
     if (base_ != nullptr) {
         err = "EXL3 RAM tier: already loaded";
         return false;
@@ -70,6 +85,20 @@ bool Exl3ExpertRam::open(const std::string& dir, int n_layers, int n_expert, int
     threads = std::clamp(threads, 1, 32);
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<LayerFmt> lay((size_t) n_layers);
+    std::vector<int32_t> idx;
+    std::vector<int64_t> n_kept((size_t) n_layers, n_expert);
+    int64_t kept_all = (int64_t) n_layers * n_expert;
+    if (keep != nullptr) {
+        idx.assign((size_t) n_layers * (size_t) n_expert, -1);
+        kept_all = 0;
+        for (int l = 0; l < n_layers; ++l) {
+            int32_t c = 0;
+            for (int e = 0; e < n_expert; ++e)
+                if ((*keep)[(size_t) l * (size_t) n_expert + (size_t) e]) idx[(size_t) l * (size_t) n_expert + (size_t) e] = c++;
+            n_kept[(size_t) l] = c;
+            kept_all += c;
+        }
+    }
     std::vector<std::string> files;
     std::vector<Read> reads;
     uint8_t* map = nullptr;
@@ -117,12 +146,13 @@ bool Exl3ExpertRam::open(const std::string& dir, int n_layers, int n_expert, int
             f.svh_d = f.suh_d + up64(2 * (uint64_t) f.ff);
             f.blob = up64(f.svh_d + 2 * (uint64_t) f.h);
             f.base = total;
-            total += f.blob * (uint64_t) n_expert;
+            total += f.blob * (uint64_t) n_kept[(size_t) l];
         }
         if (budget > 0 && total > budget)
             return fail(std::to_string(gib(total)) + " GiB of experts against a budget of " + std::to_string(gib(budget)) +
                         " GiB");
         // 2. the tier, and every tensor's place in it (its size checked against the layer's shape)
+        if (total == 0) return fail("the subset keeps no expert");
         void* m = ::mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (m == MAP_FAILED) return fail("cannot map " + std::to_string(gib(total)) + " GiB: " + std::strerror(errno));
         map = (uint8_t*) m;
@@ -151,8 +181,10 @@ bool Exl3ExpertRam::open(const std::string& dir, int n_layers, int n_expert, int
                 {"down_proj.svh", f.svh_d, 2 * (uint64_t) f.h},
             };
             for (int e = 0; e < n_expert; ++e) {
+                const int64_t at = idx.empty() ? e : idx[(size_t) l * (size_t) n_expert + (size_t) e];
+                if (at < 0) continue;   // not in the subset
                 const std::string b = expert_base(l, e);
-                uint8_t* blob = map + f.base + (uint64_t) e * f.blob;
+                uint8_t* blob = map + f.base + (uint64_t) at * f.blob;
                 for (const auto& p : part) {
                     std::string path;
                     size_t off = 0, bytes = 0;
@@ -216,6 +248,8 @@ bool Exl3ExpertRam::open(const std::string& dir, int n_layers, int n_expert, int
     if (bad.load()) return fail(first_error);
     lay_ = std::move(lay);
     n_expert_ = n_expert;
+    idx_ = std::move(idx);
+    kept_ = kept_all;
     base_ = map;
     bytes_ = map_bytes_ = total;
     load_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -224,7 +258,8 @@ bool Exl3ExpertRam::open(const std::string& dir, int n_layers, int n_expert, int
 
 Exl3Expert Exl3ExpertRam::expert(int layer, int e) const {
     const LayerFmt& f = lay_[(size_t) layer];
-    const uint8_t* b = base_ + f.base + (uint64_t) e * f.blob;
+    const int64_t at = idx_.empty() ? e : idx_[(size_t) layer * (size_t) n_expert_ + (size_t) e];
+    const uint8_t* b = base_ + f.base + (uint64_t) std::max<int64_t>(at, 0) * f.blob;   // (a subset's missing expert: not asked)
     Exl3Expert x;
     x.gate = Exl3Part{(const uint32_t*) b, (const uint16_t*) (b + f.suh_g), (const uint16_t*) (b + f.svh_g), f.h, f.ff,
                       f.k2g};
@@ -237,7 +272,9 @@ Exl3Expert Exl3ExpertRam::expert(int layer, int e) const {
 
 const uint8_t* Exl3ExpertRam::blob(int layer, int e) const {
     const LayerFmt& f = lay_[(size_t) layer];
-    return base_ + f.base + (uint64_t) e * f.blob;
+    const int64_t at = idx_.empty() ? e : idx_[(size_t) layer * (size_t) n_expert_ + (size_t) e];
+    if (at < 0) return nullptr;
+    return base_ + f.base + (uint64_t) at * f.blob;
 }
 
 uint64_t Exl3ExpertRam::blob_bytes(int layer) const { return lay_[(size_t) layer].blob; }
@@ -260,7 +297,8 @@ std::string Exl3ExpertRam::describe() const {
     char buf[96];
     std::snprintf(buf, sizeof buf, " (%.2f MB an expert%s), %.1f GiB, loaded in %.1f s", (double) max_blob / 1e6,
                   kinds.size() > 1 ? " at most" : "", gib(bytes_), load_s_);
-    return std::to_string(lay_.size()) + " layers x " + std::to_string(n_expert_) + " experts, gate/up/down K " + ks + buf;
+    const std::string sub = idx_.empty() ? "" : " (a subset: " + std::to_string(kept_) + " of them)";
+    return std::to_string(lay_.size()) + " layers x " + std::to_string(n_expert_) + " experts" + sub + ", gate/up/down K " + ks + buf;
 }
 
 }  // namespace strata::kernels::cpu

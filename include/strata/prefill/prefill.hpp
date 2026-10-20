@@ -58,6 +58,9 @@ struct Exl3PromptExperts {
     std::function<const uint8_t*(int64_t layer, int64_t e)> help;
     int help_device = -1;
     std::vector<kernels::exl3::ExpertLayout> lay;                    ///< per layer: the blob's parts
+    /// 4Mile hybrid: the parts of a blob `host` gives (streamed through the ring) when they differ from the VRAM copies'
+    /// (`lay`, which `vram` and `help` give): another model's experts in host memory. Empty: `lay` for both.
+    std::vector<kernels::exl3::ExpertLayout> lay_host;
     std::vector<uint64_t> blob;                                      ///< per layer: an expert's bytes
     uint64_t max_blob = 0;
     /// proto: each expert's place in the routing profile (layer * n_expert + e -> rank, 0 the hottest; empty: unknown) -

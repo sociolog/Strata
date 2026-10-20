@@ -30,6 +30,13 @@ public:
     /// failed allocation; nothing is left half-loaded.  Any bitrate the lane takes: K 1..8 and the half-integer 1.5 /
     /// 2.5 / 3.5 (an SC model's layers differ in K; each layer's own).
     bool open(const std::string& model_dir, int n_layers, int n_expert, int threads, uint64_t budget, std::string& err);
+    /// 4Mile hybrid: only the experts with keep[layer * n_expert + e] != 0 get a place (the VRAM tiers' source, the
+    /// 6.05 model's hottest experts beside a complete 4-bit lane tier); the others have none - has() is false and
+    /// blob() null for them, expert() must not be asked.
+    bool open_subset(const std::string& model_dir, int n_layers, int n_expert, int threads, const std::vector<uint8_t>& keep,
+                     std::string& err);
+    bool has(int layer, int e) const { return idx_.empty() || idx_[(size_t) layer * (size_t) n_expert_ + (size_t) e] >= 0; }
+    int64_t kept() const { return kept_; }
     bool loaded() const { return base_ != nullptr; }
     /// Pointers into the tier (valid while it lives); layer and expert must be in range.
     Exl3Expert expert(int layer, int e) const;
@@ -58,6 +65,10 @@ private:
     };
     std::vector<LayerFmt> lay_;
     int n_expert_ = 0;
+    std::vector<int32_t> idx_;   // open_subset: [layer * n_expert + e] -> the expert's place in its layer (-1: none)
+    int64_t kept_ = 0;
+    bool open_impl(const std::string& model_dir, int n_layers, int n_expert, int threads, uint64_t budget,
+                   const std::vector<uint8_t>* keep, std::string& err);
     uint8_t* base_ = nullptr;
     uint64_t bytes_ = 0, map_bytes_ = 0;
     double load_s_ = 0.0;

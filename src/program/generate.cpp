@@ -433,6 +433,8 @@ struct Options {
     std::string exl3_dir;              // an EXL3 model dir (docs/EXL3.md): weights come from safetensors, not a pack
     std::string ple_exl3;              // the EXL3 n-gram table (ngram_embedding.safetensors)
     bool exl3_lane = false;           // EXL3: every routed expert on the CPU lane from a RAM tier (exl3_lane_moe.hpp)
+    std::string exl3_lane_dir;        // 4Mile hybrid (--exl3-lane-dir): the lane's experts from this model (a 4-bit one)
+    int64_t exl3_tier_keep = 0;       // 4Mile hybrid (--exl3-tier-keep): the --exl3 model's hottest experts kept for the tiers
     std::string exl3_lane_profile;    // --exl3-lane: fill the EXL3 VRAM tier from this routing profile (the GPU share)
     int64_t exl3_vram_tier_mib = -1;  // --exl3-vram-tier: that tier's VRAM in MiB; -1 auto (what is left), 0 none
     int64_t exl3_helper_tier_mib = 0; // --exl3-helper-tier: a second tier on the helper card, MiB; -1 auto, 0 none
@@ -1217,6 +1219,27 @@ inline int64_t exl3_pf_help_max() {
     }();
     return v;
 }
+// a RAM tier's blob layout of `layer` (its expert 0: every expert of a layer has the same parts at the same offsets) -
+// what the GPU paths read of an expert that tier gave them
+strata::kernels::exl3::ExpertLayout exl3_layout_of(const strata::kernels::cpu::Exl3ExpertRam& r, int layer) {
+    namespace x3 = strata::kernels::exl3;
+    x3::ExpertLayout L{};
+    int e0 = 0;
+    while (e0 < r.n_expert() && !r.has(layer, e0)) ++e0;   // a subset: its first expert the layer keeps
+    if (e0 >= r.n_expert()) return L;
+    const strata::kernels::cpu::Exl3Expert x = r.expert(layer, e0);
+    const uint8_t* b = r.blob(layer, e0);
+    const strata::kernels::cpu::Exl3Part* p3[3] = {&x.gate, &x.up, &x.down};
+    for (int q = 0; q < 3; ++q) {
+        L.trellis[q] = (size_t) ((const uint8_t*) p3[q]->trellis - b);
+        L.suh[q] = (size_t) ((const uint8_t*) p3[q]->suh - b);
+        L.svh[q] = (size_t) ((const uint8_t*) p3[q]->svh - b);
+        L.k2[q] = p3[q]->k2;
+    }
+    L.cb = 2;   // the tier takes mul1 experts only (checked at its load)
+    return L;
+}
+
 struct Exl3Adapt {
     struct Tier {
         strata::kernels::Exl3VramTier* tier = nullptr;
@@ -1389,6 +1412,10 @@ struct Exl3Adapt {
         std::vector<std::pair<float, int32_t>> cand;
         for (int32_t key = 0; key < (int32_t) miss.size(); ++key)
             if (miss[(size_t) key] > margin) {
+                if (!ram->has((int) (key / n_expert), (int) (key % n_expert))) {   // the hybrid: no copy for the tiers
+                    miss[(size_t) key] = 0.0f;
+                    continue;
+                }
                 if (resident_anywhere(key)) {   // put back by someone else: not a miss any more
                     miss[(size_t) key] = 0.0f;
                     ++stale;
@@ -3229,6 +3256,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "--ple-exl3") o.ple_exl3 = next("--ple-exl3");
         else if (a == "--exl3-lane") o.exl3_lane = true;
+        else if (a == "--exl3-lane-dir") o.exl3_lane_dir = next("--exl3-lane-dir");
+        else if (a == "--exl3-tier-keep") o.exl3_tier_keep = std::max<int64_t>(0, std::atoll(next("--exl3-tier-keep")));
         else if (a == "--exl3-lane-profile") o.exl3_lane_profile = next("--exl3-lane-profile");
         else if (a == "--exl3-tier-adapt") o.exl3_tier_adapt = std::max(0, std::atoi(next("--exl3-tier-adapt")));
         else if (a == "--exl3-vram-tier" || a == "--exl3-helper-tier" || a == "--exl3-helper2-tier") {
@@ -7392,6 +7421,13 @@ int main(int argc, char** argv) {
     Exl3Drive exl3_drive;
     std::unique_ptr<strata::kernels::Exl3ExpertStream> exl3_stream;
     std::unique_ptr<strata::kernels::cpu::Exl3ExpertRam> exl3_ram;
+    // 4Mile hybrid (--exl3-lane-dir): exl3_ram holds the lane model's experts (every one: the lane, the prompt path's
+    // stream), exl3_tram the --exl3 model's hottest (the VRAM tiers' source: their fill, refills and swaps); exl3_tr is
+    // whichever the tiers read (exl3_ram without the hybrid)
+    std::unique_ptr<strata::kernels::cpu::Exl3ExpertRam> exl3_tram;
+    const strata::kernels::cpu::Exl3ExpertRam* exl3_tr = nullptr;
+    std::vector<std::pair<int32_t, int32_t>> exl3_ranked_tier;   // exl3_ranked, the experts exl3_tr holds only
+    std::vector<strata::kernels::exl3::ExpertLayout> exl3_lay_host;   // the hybrid's lane-model layout (else = exl3_lay)
     std::unique_ptr<strata::kernels::cpu::Exl3LaneMoe> exl3_moe;
     // --exl3-lane: a blob's parts per layer (the GPU paths' view of the RAM tier's experts), the profile's ranking for
     // the VRAM tier (--exl3-lane-profile) and the tier itself (made once the prompt is read)
@@ -7414,7 +7450,7 @@ int main(int argc, char** argv) {
     struct Exl3Pin {
         void* p = nullptr;
         ~Exl3Pin() { if (p != nullptr) (void) cudaHostUnregister(p); }
-    } exl3_pin;
+    } exl3_pin, exl3_tpin;   // exl3_tpin: the hybrid's tier source
     if (o.exl3_lane && o.exl3_dir.empty()) {
         std::fprintf(stderr, "strata generate: --exl3-lane needs --exl3 <dir>\n");
         return 2;
@@ -7425,7 +7461,11 @@ int main(int argc, char** argv) {
         int io = 8;
         if (const char* v = std::getenv("STRATA_EXL3_LANE_IO")) io = std::max(1, std::atoi(v));
         exl3_ram = std::make_unique<strata::kernels::cpu::Exl3ExpertRam>();
-        if (!exl3_ram->open(o.exl3_dir, (int) g.n_layers, (int) g.n_expert, io, 0, err)) {
+        if (!o.exl3_lane_dir.empty() && o.exl3_lane_profile.empty()) {
+            std::fprintf(stderr, "strata generate: --exl3-lane-dir needs --exl3-lane-profile (it picks the tiers' experts)\n");
+            return 2;
+        }
+        if (!exl3_ram->open(o.exl3_lane_dir.empty() ? o.exl3_dir : o.exl3_lane_dir, (int) g.n_layers, (int) g.n_expert, io, 0, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -7443,20 +7483,10 @@ int main(int argc, char** argv) {
             // a blob's parts, per layer (offsets from its first byte; the tier's own layout, which expert() reads): what
             // the GPU paths - the prompt path, the VRAM tier - read of an expert
             namespace x3 = strata::kernels::exl3;
-            exl3_lay.assign((size_t) g.n_layers, x3::ExpertLayout{});
-            for (int64_t l = 0; l < g.n_layers; ++l) {
-                const strata::kernels::cpu::Exl3Expert x = exl3_ram->expert((int) l, 0);
-                const uint8_t* b = exl3_ram->blob((int) l, 0);
-                const strata::kernels::cpu::Exl3Part* p3[3] = {&x.gate, &x.up, &x.down};
-                x3::ExpertLayout& L = exl3_lay[(size_t) l];
-                for (int r = 0; r < 3; ++r) {
-                    L.trellis[r] = (size_t) ((const uint8_t*) p3[r]->trellis - b);
-                    L.suh[r] = (size_t) ((const uint8_t*) p3[r]->suh - b);
-                    L.svh[r] = (size_t) ((const uint8_t*) p3[r]->svh - b);
-                    L.k2[r] = p3[r]->k2;
-                }
-                L.cb = 2;   // the tier takes mul1 experts only (checked at its load)
-            }
+            // (the tiers' layout, exl3_lay, is made below once the tiers' source is known: the hybrid's is another model)
+            exl3_lay_host.assign((size_t) g.n_layers, x3::ExpertLayout{});
+            for (int64_t l = 0; l < g.n_layers; ++l) exl3_lay_host[(size_t) l] = exl3_layout_of(*exl3_ram, (int) l);
+            exl3_lay = exl3_lay_host;
             exl3_drive.lay = &exl3_lay;
         }
         // STRATA_EXL3_OLD_SHARE=1: the 10-16 GPU share (#1764's per-layer stream cache, per-token calls from the pool),
@@ -7472,6 +7502,29 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: EXL3 VRAM tier: %zu experts ranked by %s; filled once the prompt "
                                      "is read (--exl3-vram-tier)\n", exl3_ranked.size(), o.exl3_lane_profile.c_str());
         }
+        exl3_tr = exl3_ram.get();
+        if (!o.exl3_lane_dir.empty()) {
+            // 4Mile hybrid: the tiers' experts from the --exl3 model (its hottest --exl3-tier-keep, default 9000 - about
+            // a quarter more than the 3090 and the 3060 hold at 6.05, room for the swaps), the lane's from --exl3-lane-dir
+            const int64_t keep_n = std::min<int64_t>(o.exl3_tier_keep > 0 ? o.exl3_tier_keep : 9000, (int64_t) exl3_ranked.size());
+            std::vector<uint8_t> keep((size_t) (g.n_layers * g.n_expert), 0);
+            for (int64_t i = 0; i < keep_n; ++i)
+                keep[(size_t) (exl3_ranked[(size_t) i].first * g.n_expert + exl3_ranked[(size_t) i].second)] = 1;
+            exl3_tram = std::make_unique<strata::kernels::cpu::Exl3ExpertRam>();
+            int io2 = 8;
+            if (const char* v = std::getenv("STRATA_EXL3_LANE_IO")) io2 = std::max(1, std::atoi(v));
+            if (!exl3_tram->open_subset(o.exl3_dir, (int) g.n_layers, (int) g.n_expert, io2, keep, err)) {
+                std::fprintf(stderr, "strata generate: the hybrid's tier source: %s\n", err.c_str());
+                return 1;
+            }
+            exl3_tr = exl3_tram.get();
+            for (int64_t l = 0; l < g.n_layers; ++l) exl3_lay[(size_t) l] = exl3_layout_of(*exl3_tram, (int) l);
+            std::fprintf(stderr, "strata generate: EXL3 hybrid: the lane and the prompt path's stream on %s, the VRAM "
+                                 "tiers on %s's %lld hottest experts (%s)\n", o.exl3_lane_dir.c_str(), o.exl3_dir.c_str(),
+                         (long long) keep_n, exl3_tram->describe().c_str());
+        }
+        for (const auto& pr : exl3_ranked)
+            if (exl3_tr->has(pr.first, pr.second)) exl3_ranked_tier.push_back(pr);
         if (!o.exl3_lane_profile.empty() && old_share) {
             // the GPU share: #1764's stream with its VRAM cache seeded once, from the RAM tier, with each layer's
             // hottest experts by the profile; never evicted, nothing read from the file
@@ -7542,6 +7595,14 @@ int main(int argc, char** argv) {
             }
             exl3_pf.host = [r = exl3_ram.get()](int64_t l, int64_t e) { return r->blob((int) l, (int) e); };
             exl3_pf.lay = exl3_lay;
+            exl3_pf.lay_host = exl3_lay_host;   // the hybrid: the streamed experts' layout (the lane model's)
+            if (exl3_tram != nullptr && exl3_tpin.p == nullptr) {   // the tiers' refills after each prompt part copy from it
+                if (cudaHostRegister(const_cast<uint8_t*>(exl3_tram->mapping()), (size_t) exl3_tram->mapping_bytes(),
+                                     cudaHostRegisterPortable) == cudaSuccess)
+                    exl3_tpin.p = const_cast<uint8_t*>(exl3_tram->mapping());
+                else
+                    (void) cudaGetLastError();
+            }
             if (!exl3_ranked.empty()) {   // proto: the profile's order, for the helper's pick of a prompt part's coldest experts
                 exl3_pf.rank.assign((size_t) (g.n_layers * g.n_expert), INT32_MAX);
                 for (size_t i = 0; i < exl3_ranked.size(); ++i)
@@ -8669,12 +8730,15 @@ int main(int argc, char** argv) {
         // the slots back: the experts they gave up first (the latest first), then the profile's hottest not held
         const int32_t* hr = xt.h_res_table();
         const int32_t* hh = exl3_helper != nullptr ? exl3_helper->h_res_table() : nullptr;
-        const int64_t ne = exl3_ram->n_expert();
-        auto free_key = [&](int32_t key) { return hr[key] < 0 && (hh == nullptr || hh[key] < 0); };
+        const int64_t ne = exl3_tr->n_expert();
+        // (the hybrid: only an expert the tiers' source holds)
+        auto free_key = [&](int32_t key) {
+            return hr[key] < 0 && (hh == nullptr || hh[key] < 0) && exl3_tr->has((int) (key / ne), (int) (key % ne));
+        };
         std::vector<std::pair<int64_t, int32_t>> fill;
         static const bool trim_forget = [] { const char* v = std::getenv("STRATA_EXL3_KV_TRIM_FORGET"); return v == nullptr || v[0] != '0'; }();
         size_t pi = 0;
-        std::vector<uint8_t> taken((size_t) (exl3_ram->n_layers() * ne), 0);
+        std::vector<uint8_t> taken((size_t) (exl3_tr->n_layers() * ne), 0);
         for (int64_t q = lo0; q < kvx.lo; ++q) {
             int32_t key = -1;
             while (key < 0 && !kvx.evicted.empty()) {
@@ -8682,14 +8746,14 @@ int main(int argc, char** argv) {
                 kvx.evicted.pop_back();
                 if (free_key(k2) && !taken[(size_t) k2]) key = k2;
             }
-            for (; key < 0 && pi < exl3_ranked.size(); ++pi) {
-                const int32_t k2 = exl3_ranked[pi].first * (int32_t) ne + exl3_ranked[pi].second;
+            for (; key < 0 && pi < exl3_ranked_tier.size(); ++pi) {
+                const int32_t k2 = exl3_ranked_tier[pi].first * (int32_t) ne + exl3_ranked_tier[pi].second;
                 if (free_key(k2) && !taken[(size_t) k2]) key = k2;
             }
             if (key < 0) break;
             taken[(size_t) key] = 1;
             const int l = (int) (key / ne), x = (int) (key % ne);
-            cudaMemcpyAsync(xt.slot_ptr(q), exl3_ram->blob(l, x), (size_t) exl3_ram->blob_bytes(l), cudaMemcpyHostToDevice,
+            cudaMemcpyAsync(xt.slot_ptr(q), exl3_tr->blob(l, x), (size_t) exl3_tr->blob_bytes(l), cudaMemcpyHostToDevice,
                             nullptr);
             fill.emplace_back(q, key);
         }
@@ -9244,7 +9308,7 @@ int main(int argc, char** argv) {
                     exl3_tier->use_external(exl3_xr->base());
                 }
             }
-            if (!exl3_tier->init(*exl3_ram, exl3_ranked, budget, err, dev0, nullptr, spares) ||
+            if (!exl3_tier->init(*exl3_tr, exl3_ranked_tier, budget, err, dev0, nullptr, spares) ||
                 !exl3_drive.tok.init(dev0, 1, (int64_t) ss.k, g.n_embd, g.n_ff, err)) {
                 std::fprintf(stderr, "strata %s: %s\n", who, err.c_str());
                 return false;
@@ -9297,7 +9361,7 @@ int main(int argc, char** argv) {
                 // --exl3-tier-adapt N (STRATA_EXL3_ADAPT_HELPER=0: the helper's tier stays static): 2N spare slots here too
                 const int64_t spares = o.exl3_tier_adapt > 0 && o.spec >= 2 && exl3_adapt_helper() ? 2 * (int64_t) o.exl3_tier_adapt
                                                                                                       : 0;
-                if (!exl3_helper->init(*exl3_ram, exl3_ranked, budget, err, dev1, exl3_tier ? exl3_tier->h_res() : nullptr,
+                if (!exl3_helper->init(*exl3_tr, exl3_ranked_tier, budget, err, dev1, exl3_tier ? exl3_tier->h_res() : nullptr,
                                        spares) ||
                     !exl3_drive.help.init(dev1, strata::kernels::cpu::MAXT, (int64_t) strata::kernels::cpu::MAXT * ss.k,
                                           g.n_embd, g.n_ff, err)) {
@@ -9343,13 +9407,13 @@ int main(int argc, char** argv) {
                 }() << 20;
                 const uint64_t budget = o.exl3_helper2_tier_mib > 0 ? (uint64_t) o.exl3_helper2_tier_mib << 20
                                                                     : (fb2 > reserve ? (uint64_t) fb2 - reserve : 0);
-                std::vector<int32_t> excl((size_t) (exl3_ram->n_layers() * exl3_ram->n_expert()), -1);
+                std::vector<int32_t> excl((size_t) (exl3_tr->n_layers() * exl3_tr->n_expert()), -1);
                 for (const strata::kernels::Exl3VramTier* x : {exl3_tier.get(), exl3_helper.get()})
                     if (x != nullptr)
                         for (size_t i = 0; i < excl.size(); ++i)
                             if (x->h_res_table()[i] >= 0) excl[i] = 0;
                 exl3_helper2 = std::make_unique<strata::kernels::Exl3VramTier>();
-                if (!exl3_helper2->init(*exl3_ram, exl3_ranked, budget, err, dev2, excl.data(), 0) ||
+                if (!exl3_helper2->init(*exl3_tr, exl3_ranked_tier, budget, err, dev2, excl.data(), 0) ||
                     !exl3_drive.help2.init(dev2, strata::kernels::cpu::MAXT, (int64_t) strata::kernels::cpu::MAXT * ss.k,
                                            g.n_embd, g.n_ff, err)) {
                     std::fprintf(stderr, "strata %s: %s\n", who, err.c_str());
@@ -9368,14 +9432,15 @@ int main(int argc, char** argv) {
     // did not lock it)
     auto exl3_start_adapt = [&](Exl3Adapt& ad, const char* who) -> bool {
         if (exl3_tier != nullptr && o.exl3_tier_adapt > 0 && o.spec >= 2) {
-            if (exl3_pin.p == nullptr) {
-                if (cudaHostRegister(const_cast<uint8_t*>(exl3_ram->mapping()), (size_t) exl3_ram->mapping_bytes(),
+            Exl3Pin& tp = exl3_tram != nullptr ? exl3_tpin : exl3_pin;   // the swaps copy from the tiers' source
+            if (tp.p == nullptr) {
+                if (cudaHostRegister(const_cast<uint8_t*>(exl3_tr->mapping()), (size_t) exl3_tr->mapping_bytes(),
                                      cudaHostRegisterPortable) == cudaSuccess)
-                    exl3_pin.p = const_cast<uint8_t*>(exl3_ram->mapping());
+                    tp.p = const_cast<uint8_t*>(exl3_tr->mapping());
                 else
                     (void) cudaGetLastError();   // pageable: each copy is staged by the driver (slower, still correct)
             }
-            if (!ad.init(exl3_tier.get(), exl3_adapt_helper() ? exl3_helper.get() : nullptr, exl3_ram.get(),
+            if (!ad.init(exl3_tier.get(), exl3_adapt_helper() ? exl3_helper.get() : nullptr, exl3_tr,
                          o.exl3_tier_adapt, err)) {
                 std::fprintf(stderr, "strata %s: %s\n", who, err.c_str());
                 return false;
@@ -9877,7 +9942,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: the EXL3 prompt path's init: %s\n", cudaGetErrorString(se));
                     return 1;
                 }
-                if (!xt->lend(exl3_first_now, once, err) || !xt->restore(once, *exl3_ram, err)) {
+                if (!xt->lend(exl3_first_now, once, err) || !xt->restore(once, *exl3_tr, err)) {
                     std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                     return 1;
                 }
@@ -14482,7 +14547,7 @@ int main(int argc, char** argv) {
                 std::future<bool> help_refill;
                 if (exl3_hlent_first >= 0) {
                     if (!sp.bind_exl3_help(nullptr, 0, 0, e)) return false;
-                    help_refill = std::async(std::launch::async, [&] { return exl3_helper->restore(exl3_hlent, *exl3_ram, help_err); });
+                    help_refill = std::async(std::launch::async, [&] { return exl3_helper->restore(exl3_hlent, *exl3_tr, help_err); });
                 }
                 auto help_done = [&]() -> bool {
                     if (!help_refill.valid()) return true;
@@ -14501,7 +14566,7 @@ int main(int argc, char** argv) {
                     return true;
                 };
                 if (exl3_lent_first < 0) return help_done();
-                const bool main_ok = exl3_tier->restore(exl3_lent, *exl3_ram, e);
+                const bool main_ok = exl3_tier->restore(exl3_lent, *exl3_tr, e);
                 std::string main_err = e;
                 if (!help_done()) return false;   // (waited for either way: the thread reads exl3_hlent)
                 if (!main_ok) {
@@ -17033,7 +17098,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < exl3_ranked.size() && (int64_t) i < skip; ++i)
                     excl[(size_t) (exl3_ranked[i].first * g.n_expert + exl3_ranked[i].second)] = 0;
                 pf_cli_tier = std::make_unique<strata::kernels::Exl3VramTier>();
-                if (!pf_cli_tier->init(*exl3_ram, exl3_ranked, (uint64_t) std::atoll(hv) << 20, err, dev1, excl.data(), 0)) {
+                if (!pf_cli_tier->init(*exl3_tr, exl3_ranked_tier, (uint64_t) std::atoll(hv) << 20, err, dev1, excl.data(), 0)) {
                     std::fprintf(stderr, "strata generate: STRATA_EXL3_PF_HELP_CLI: %s\n", err.c_str());
                     return 1;
                 }

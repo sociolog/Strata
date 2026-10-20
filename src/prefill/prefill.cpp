@@ -4081,6 +4081,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 for (int64_t i = 0; i < T * K; ++i)
                                     if (const int32_t p = slot_h[(size_t) i]; p >= rows_loc) hpair[p - rows_loc] = (int32_t) i;
                             const x3::ExpertLayout& HL = m.x3->lay[(size_t) l];
+                            // (the hybrid: an expert the helper streams from host memory is the lane model's)
+                            const x3::ExpertLayout& HLs = m.x3->lay_host.empty() ? HL : m.x3->lay_host[(size_t) l];
                             {
                                 const core::OnDevice od(H.dev);
                                 const bool h_tc = x3::device_ok();
@@ -4148,6 +4150,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     const cudaStream_t sq = H.s[q];
                                     const int32_t hi = H.hidx.empty() ? -1 : H.hidx[(size_t) l * NX + e];
                                     const uint8_t* blob = hi >= 0 ? H.b.ring + (size_t) (hi % H.R) * H.rblob : m.x3->help(l, e);
+                                    const x3::ExpertLayout& EL = hi >= 0 ? HLs : HL;   // streamed, or its tier copy
                                     if (hi >= 0) {   // its copy issued (the unrouted ones before it released), then awaited
                                         H.release_until((size_t) hi, m.cnt);
                                         cudaStreamWaitEvent(sq, H.rcopied[(size_t) (hi % H.R)], 0);
@@ -4156,7 +4159,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (h_tc && ne <= m.x3->light_rows) {
                                         x3::SetArgs sa;
                                         sa.wbase = blob;
-                                        sa.lay = HL;
+                                        sa.lay = EL;
                                         sa.n_exp = 1;
                                         sa.bounds = dbnd + i;   // [r0, r0 + ne)
                                         sa.row0 = (int) r0;
@@ -4168,13 +4171,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     } else {
                                         auto mat = [&](int r) {
                                             x3::Mat mm;
-                                            mm.trellis = (const uint32_t*) (blob + HL.trellis[r]);
-                                            mm.suh = (const uint16_t*) (blob + HL.suh[r]);
-                                            mm.svh = (const uint16_t*) (blob + HL.svh[r]);
+                                            mm.trellis = (const uint32_t*) (blob + EL.trellis[r]);
+                                            mm.suh = (const uint16_t*) (blob + EL.suh[r]);
+                                            mm.svh = (const uint16_t*) (blob + EL.svh[r]);
                                             mm.k = r < 2 ? (int) N : 640;
                                             mm.n = r < 2 ? 640 : (int) N;
-                                            mm.k2 = HL.k2[r];
-                                            mm.cb = HL.cb;
+                                            mm.k2 = EL.k2[r];
+                                            mm.cb = EL.cb;
                                             return mm;
                                         };
                                         const x3::Mat mg = mat(0), mu = mat(1), md = mat(2);
@@ -4262,6 +4265,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         };
                         const bool x3_tc = x3::device_ok();
                         const x3::ExpertLayout& XL = m.x3->lay[(size_t) l];
+                        // (the hybrid: a streamed expert - a ring slot - is the lane model's, a resident one the tier's)
+                        const x3::ExpertLayout& XLs = m.x3->lay_host.empty() ? XL : m.x3->lay_host[(size_t) l];
                         // the experts go round the streams in id order (rows, weight buffer and slot are each expert's
                         // own, so they never touch); the other streams start after the tables above, and the combine
                         // below waits for all of them
@@ -4299,12 +4304,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                                 ++stats_.experts_resident;
                             }
+                            const x3::ExpertLayout& EL = sl >= 0 ? XLs : XL;
                             pt.mark(kPfGemmGU, cs);
                             if (x3_tc && ne <= m.x3->light_rows) {
                                 // few rows: gate/up + swiglu and down on the tensor cores, the trellis decoded once a block
                                 x3::SetArgs sa;
                                 sa.wbase = blob;
-                                sa.lay = XL;
+                                sa.lay = EL;
                                 sa.n_exp = 1;
                                 sa.bounds = m.x3_bounds + m.x3_pos[(size_t) e];   // [off[e], off[e] + ne)
                                 sa.row0 = o0;
@@ -4319,13 +4325,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 // outputs rotated by svh (gu_epilogue does gate and up's, the swiglu and down's input)
                                 auto mat = [&](int r) {
                                     x3::Mat mm;
-                                    mm.trellis = (const uint32_t*) (blob + XL.trellis[r]);
-                                    mm.suh = (const uint16_t*) (blob + XL.suh[r]);
-                                    mm.svh = (const uint16_t*) (blob + XL.svh[r]);
+                                    mm.trellis = (const uint32_t*) (blob + EL.trellis[r]);
+                                    mm.suh = (const uint16_t*) (blob + EL.suh[r]);
+                                    mm.svh = (const uint16_t*) (blob + EL.svh[r]);
                                     mm.k = r < 2 ? (int) N : 640;
                                     mm.n = r < 2 ? 640 : (int) N;
-                                    mm.k2 = XL.k2[r];
-                                    mm.cb = XL.cb;
+                                    mm.k2 = EL.k2[r];
+                                    mm.cb = EL.cb;
                                     return mm;
                                 };
                                 const x3::Mat mg = mat(0), mu = mat(1), md = mat(2);
