@@ -108,6 +108,12 @@ struct WeightRef {
     /// STRATA_HC_Q8 (experiment): non-null when `data` holds int8 codes [ne1][ne0] of a BF16 hyper-connection
     /// projection quantized Q8_0-style (one fp32 scale per 32 contiguous values, `q8_scale[ne1][ne0 / 32]`).
     const float* q8_scale = nullptr;
+    /// STRATA_EXL3_HC8=1 (the hc8 read): an 8-bit copy of a BF16 hyper-connection projection made at load (int8
+    /// codes [ne1][ne0], one f16 scale per 32 values, a row's scales every `hc8_srow`; fused_gr.hpp).  `data` keeps
+    /// the BF16 copy for the paths without an hc8 kernel (the prompt path, the single-token path, the drafter).
+    const int8_t* hc8_q = nullptr;
+    const uint16_t* hc8_s = nullptr;
+    int hc8_srow = 0;
 };
 
 struct LoadReport {

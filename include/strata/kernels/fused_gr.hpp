@@ -17,6 +17,7 @@
 // must be different buffers (every block reads the former while one block writes the latter).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::kernels {
@@ -49,7 +50,32 @@ struct FusedGrArgs {
     /// 32 contiguous values here ([row][col / 32]).  w_inject stays bf16.
     const float* s_down = nullptr;
     const float* s_up = nullptr;
+    /// STRATA_EXL3_HC8=1 (the hc8 read, ported from Basalt's hc8_gr.cu, MIT): non-null hc8_qd / hc8_qu select it in
+    /// fused_gr_read_multi.  8-bit copies of w_down / w_up / w_inject: int8 codes [rows][cols] (cols contiguous) and
+    /// one f16 scale per 32 consecutive values of a row, a row's scales every `*_srow` f16 (hc8_srow(cols)).
+    /// hc8_qi null with w_inject set: the read refuses (the inject rows must be 8-bit too).
+    const int8_t* hc8_qd = nullptr;
+    const uint16_t* hc8_sd = nullptr;
+    const int8_t* hc8_qu = nullptr;
+    const uint16_t* hc8_su = nullptr;
+    const int8_t* hc8_qi = nullptr;
+    const uint16_t* hc8_si = nullptr;
+    int hc8_sd_row = 0, hc8_su_row = 0, hc8_si_row = 0;
 };
+
+/// The hc8 copies' scale row stride: cols / 32 rounded up to a multiple of 8 (16-byte runs).
+inline int hc8_srow(int64_t cols) { return (int) (((cols / 32) + 7) / 8 * 8); }
+/// Bytes of an hc8 copy of a [rows][cols] matrix: the codes, then the scales (16-byte aligned).
+inline size_t hc8_bytes(int64_t rows, int64_t cols) {
+    return (((size_t) rows * (size_t) cols + 15) & ~(size_t) 15) + (size_t) rows * (size_t) hc8_srow(cols) * 2;
+}
+/// Quantize the bf16 matrix w [rows][cols] (device; cols a multiple of 32) into `out` (hc8_bytes(rows, cols) bytes):
+/// s = f16(absmax / 127) per 32 values, q = clamp(rint(x / s), +-127) against the rounded scale (Basalt's
+/// hc8_quant_kernel).  *q / *s receive the codes' and the scales' addresses inside `out`.
+/// `s32` (optional, rows * cols / 32 floats): the same scales as fp32 [rows][cols / 32] (STRATA_HC_REQ8's layout, for
+/// the paths that read int8 codes + q8_scale).
+void hc8_quantize(const uint16_t* w, int64_t rows, int64_t cols, void* out, const int8_t** q, const uint16_t** s,
+                  void* stream, float* s32 = nullptr);
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
 /// STRATA_HC_Q8: n int8 codes with one fp32 scale per 32 -> bf16 (the prompt path's GEMMs take bf16).
