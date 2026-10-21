@@ -37,6 +37,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/dense_tc.hpp"
 #include "strata/kernels/native_gr_postops.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/native_qsa.hpp"
@@ -168,6 +169,31 @@ inline bool g_qdedup() { static const bool on = [] { const char* v = std::getenv
 // S26 STRATA_QFUSE=1: activation q8_1 images written by their producers (the GDN output norm) - the same bytes
 // fork F4 (Eddoursul): 2-4 token dense projections read an interleaved copy of the q8_1 activations (bitwise the same
 // outputs); STRATA_MMVQ_IL=0 keeps native_mmvq's multi-column kernels
+// STRATA_DENSE_TC=1 (opt-in, ported from Basalt, MIT): the window's dense Q8_0 projections on int8 tensor cores
+// (dense_tc.hpp; sm_80+, n_in a multiple of 512).  Not bitwise native_mmvq (float rounding, last bits), but every token's
+// output is bitwise independent of the window width T, so speculation stays exact.  STRATA_DENSE_TC_MASK picks the
+// projections (bits): 1 GDN qkv + z, 2 GDN out, 4 QSA q / k / v, 8 QSA out, 16 the head; STRATA_DENSE_TC=1 alone
+// takes kDenseTcDefault = 1 | 4 | 16 (3090, 2026-10-21: the out-projections (6144 -> 2560) stay on native_mmvq, which
+// is faster there at T <= 4; dense_tc_bench).  Measured end to end: 4.18 +0.6..+2 % (the gain is bit 4), 6.05 long
+// prompts -3.6 % (bit 4 again: the QSA query projection on its side stream; mask 16 is neutral there).  Set before
+// graph capture.
+constexpr int kDenseTcDefault = 1 | 4 | 16;
+inline int g_dense_tc() {
+    static const int m = [] {
+        const char* v = std::getenv("STRATA_DENSE_TC");
+        if (v == nullptr || v[0] != '1') return 0;
+        const char* mk = std::getenv("STRATA_DENSE_TC_MASK");
+        return mk != nullptr ? std::atoi(mk) : kDenseTcDefault;
+    }();
+    return m;
+}
+// the projection on the tensor-core kernel when its bit is on and it applies (Q8_0, 1..8 columns); false: the caller's path
+inline bool dense_tc_try(int bit, int type, const void* w, const void* xq, float* out, int n_in, int n_out, int n,
+                         cudaStream_t s) {
+    if ((g_dense_tc() & bit) == 0 || type != 8 || n < 1 || n > 8 || !strata::kernels::dense_tc_q8_0_ok(n_in)) return false;
+    strata::kernels::dense_tc_q8_0(w, xq, out, n_in, n_out, n, s);
+    return true;
+}
 inline bool g_mmvq_il() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL"); return v == nullptr || v[0] != '0'; }(); return on; }
 // 143-amdk: STRATA_QFUSE_HC - only the hyper-connection read writes its consumer's q8_1 image (not the GDN recurrence): gfx12 default (=0 / 1 forces off / on)
 inline bool g_qfuse_hc() {
@@ -1315,7 +1341,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             native_quantize_q8_1(x, xq_, n_in, n, cs);
             il_ready = false;
         };
-        auto mm = [&](const WeightRef* w, float* out, int n_in, int n_out) {
+        auto mm = [&](int tc_bit, const WeightRef* w, float* out, int n_in, int n_out) {
+            if (dense_tc_try(tc_bit, w->native_type, w->native_data, xq_, out, n_in, n_out, n, cs)) return;
             if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out)) {
                 if (!il_ready && n >= 2) {   // one column reads the plain q8_1 blocks
                     strata::kernels::native_q8_1_interleave(xq_, xil_, n_in, n, cs);
@@ -1363,8 +1390,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         il_ready = true;
                     }
                     if (!branch(pfork_, cs, side2_, "fork")) return false;
-                    mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
-                    if (g_il) strata::kernels::native_mmvq_il(wg->native_type, wg->native_data, xq_, xil_, z_ + (size_t) tb * ZV,
+                    mm(1, wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
+                    if (dense_tc_try(1, wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, side2_)) {
+                    } else if (g_il) strata::kernels::native_mmvq_il(wg->native_type, wg->native_data, xq_, xil_, z_ + (size_t) tb * ZV,
                                                               (int) N, (int) ZV, n, side2_);
                     else native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, side2_);
                     if (cudaEventRecord(pjoin_, side2_) != cudaSuccess) { err = "verify: the gate projection's branch could not join"; return false; }
@@ -1375,11 +1403,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                  (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
                                  (int) HV, n, df_side_[0]);
                     fork(1);
+                    if (!dense_tc_try(1, wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
+                                      df_side_[1]))
                     native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
                                 df_side_[1]);
                 }
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
-                if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                if (!side_proj) mm(1, wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1412,7 +1442,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                if (!side_proj) mm(1, wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";
@@ -1461,7 +1491,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
                 if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
                 else il_ready = false;
-                mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                mm(2, wout, bo_ + tb * N, (int) ZV, (int) N);
                 rank1_out_apply(bo_ + tb * N, n, N, N, wout->r1_a, wout->r1_b, cs);   // strata-out-rank1
             } else {
                 // ======================= QSA =======================
@@ -1514,6 +1544,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool qbr = br && qb;
                 if (qbr) {
                     fork(0);
+                    if (!dense_tc_try(4, wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                                      (int) (NH * 2 * HD), n, df_side_[0]))
                     native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
                                 (int) (NH * 2 * HD), n, df_side_[0]);
                     copy_rows_strided(qcur_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, (int64_t) n * NH, HD, 2 * HD,
@@ -1593,8 +1625,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool q_il = side_proj && g_mmvq_il() &&
                                   strata::kernels::native_mmvq_il_supported(wq->native_type, n, (int) (NH * 2 * HD));
                 auto q_chain = [&](cudaStream_t ns) -> bool {
-                    if (ns == cs) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
-                    else if (q_il) strata::kernels::native_mmvq_il(wq->native_type, wq->native_data, xq_, xil_,
+                    if (ns == cs) mm(4, wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
+                    else if (dense_tc_try(4, wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                                          (int) (NH * 2 * HD), n, ns)) {
+                    } else if (q_il) strata::kernels::native_mmvq_il(wq->native_type, wq->native_data, xq_, xil_,
                                                                    qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), n, ns);
                     else native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
                                      (int) (NH * 2 * HD), n, ns);
@@ -1646,8 +1680,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 if (!sidem) idx_key(cs);
                 stamp(l, 7, grp);
-                mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
-                mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                mm(4, wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                mm(4, wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -1831,7 +1865,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 14, grp);
                 quant_in(attn32_ + tb * NH * HD, (int) (NH * HD));
-                mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
+                mm(8, wo, bo_ + tb * N, (int) (NH * HD), (int) N);
                 rank1_out_apply(bo_ + tb * N, n, N, N, wo->r1_a, wo->r1_b, cs);   // strata-out-rank1
             }
         } catch (const std::exception& e) {
@@ -2245,7 +2279,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
-                if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
+                if (dense_tc_try(16, head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, (int) T, cs)) {
+                } else if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
                     if (T >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);
                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, head_logits_, (int) N,
                                                     (int) n_vocab_, (int) T, cs);
