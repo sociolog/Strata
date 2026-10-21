@@ -415,6 +415,15 @@ not in the schedule.
   1.5x the byte counts predict.  In the pooled prefill the dense projections are 20-32 ms of a 1.55 s batch
   (9.0 tok/s measured), so ~1% there, while the decode reads those weights every token and gains the 18.4 ms:
   with the experts skipped, the dense work goes **21.1 -> 34.5 tok/s** (47.4 -> 28.9 ms/token, four runs).
+- **The hyper-connection read on 8-bit copies (opt-in, `STRATA_EXL3_HC8`).**  Basalt's `hc8_gr.cu` read (MIT,
+  third_party/basalt/LICENSE) is ported into `fused_gr.cu` (the `hc8` namespace): int8 codes plus one f16 scale per
+  32 values of a row, made from the staged BF16 at load.  `STRATA_EXL3_HC8=1` adds the copies next to the BF16 ones
+  (+659 MiB, which the VRAM expert tier pays for: no net gain); `STRATA_EXL3_HC8=2` keeps the layers' down / up
+  projections only as 8-bit copies, which also serve as `STRATA_HC_REQ8`'s int8 rows for the prompt path and the
+  single-token path (the inject rows and the final mixer keep BF16 plus a copy).  Not bitwise: on the identity
+  corpus it sits at the level of a pure summation-order change (`STRATA_GR_V3=1`).  `STRATA_EXL3_HC_Q8_OLD=1` brings
+  back 448e6afe's Q8_0 copies with the BF16 kept, for its bisect: still broken (same-top 79 %), so the break is in
+  `launch_q8`, not in dropping the BF16 copies.  `fused_gr_bench` checks the hc8 read against the BF16 read.
 - **The v-head reorder is part of the weight, and a requantized copy has to carry it.**  The GDN's v projections
   are staged with their v heads permuted (`Vr::OutV`/`Out`/`In`: `attn_qkv`, `attn_gate`, `ssm_out`) and the
   activations are permuted to match; `stage_exl3` reorders the trellis and the scales, so the requantizer runs the

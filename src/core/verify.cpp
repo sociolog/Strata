@@ -88,6 +88,13 @@ bool window_copy_logits(void* w, int t, float* host);
 namespace strata::core {
 namespace {
 
+// STRATA_EXL3_HC8: a read's 8-bit copies (exl3_pack.cpp) into its arguments; `wi` null for the final mixer
+void hc8_args(strata::kernels::FusedGrArgs& a, const WeightRef* wd, const WeightRef* wu, const WeightRef* wi) {
+    a.hc8_qd = wd->hc8_q; a.hc8_sd = wd->hc8_s; a.hc8_sd_row = wd->hc8_srow;
+    a.hc8_qu = wu->hc8_q; a.hc8_su = wu->hc8_s; a.hc8_su_row = wu->hc8_srow;
+    if (wi != nullptr) { a.hc8_qi = wi->hc8_q; a.hc8_si = wi->hc8_s; a.hc8_si_row = wi->hc8_srow; }
+}
+
 constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
@@ -1265,6 +1272,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.q8_down = (const uint8_t*) wd[half]->hc_q8; a.q8_up = (const uint8_t*) wu[half]->hc_q8;
                 a.q8_inject = (const uint8_t*) wi[half]->hc_q8;
                 a.s_down = wd[half]->q8_scale; a.s_up = wu[half]->q8_scale;
+                if (wd[half]->hc8_q != nullptr) {   // STRATA_EXL3_HC8: the hc8 read on the 8-bit copies
+                    hc8_args(a, wd[half], wu[half], wi[half]);
+                }
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
                 if (qcnt_ != nullptr) {   // S26 STRATA_QFUSE: the consumer's q8_1 image written by the read itself
@@ -2201,6 +2211,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.rs = rs_ + t * HC;
                 a.inject_out = head_inj_;
                 a.mixed = head_mixed_ + t * N;
+                if (hd->hc8_q != nullptr && hu->hc8_q != nullptr) hc8_args(a, hd, hu, nullptr);   // STRATA_EXL3_HC8
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         } else if (head_mix_multi_enabled() && head_ != nullptr && head_->loaded()) {
@@ -2216,6 +2227,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
                 fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
                 fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N;
+                if (hd->hc8_q != nullptr && hu->hc8_q != nullptr) hc8_args(fa[t], hd, hu, nullptr);   // STRATA_EXL3_HC8
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         } else {

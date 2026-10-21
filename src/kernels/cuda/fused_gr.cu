@@ -2170,6 +2170,340 @@ void launch_q8(const GrMulti& m, float* scratch, cudaStream_t st, unsigned long 
     }
 }
 
+// ================================ the hc8 read (STRATA_EXL3_HC8=1) ================================
+// Ported from Basalt (github.com/jesdga95/basalt @ fb0944c: src/kernels/cuda/hc8_gr.cu, the read's three kernels and
+// launcher, and src/kernels/cuda/hc_fused.cu's hc8_quant_kernel).  Copyright (c) 2026 Jesús Gulfo, MIT License; the
+// full notice is in third_party/basalt/LICENSE.  Changes: the 8-bit copies come as explicit q / s pointers in
+// FusedGrArgs (no hc8_view registry), `mixed`'s q8_1 image (STRATA_QFUSE) is written by the up kernel's last block of a
+// 32-column group, and the GPU stamps of the verify profile are kept.
+//
+//   norm : R' = R + bo_prev * 2 sigmoid(inj_prev / hc) into R_out (when apply),  rs[c] = rsqrt(mean(R'[c]^2) + eps)
+//   down : lo[k] = silu((q_down[k] . xn) / hc),  inject[c] = q_inject[c] . xn,  xn = R' * w_norm * rs (on the fly)
+//   up   : mixed[d] = mean_c xn[c,d] * sigmoid(q_up[c*n_embd + d] . lo)
+//
+// The codes are int8 [rows][cols] with one f16 scale per 32 consecutive values of a row (s = f16(absmax / 127),
+// q = rint(x / s)).  Every token's values come from the same operations in the same order whatever the token count.
+// Not bitwise the BF16 read (weight rounding, ~1e-3 KL): opt-in.  It does not write xn (no consumer reads it after
+// the read).
+#if !defined(__HIPCC__)
+namespace hc8 {
+constexpr int MT = kFusedGrMaxT;
+constexpr int MAX_HC = 4;
+constexpr int MAX_LR = 512;
+constexpr int G8 = 32;
+constexpr int DOWN_ROWS = 2;      // rows per down CTA
+constexpr int DOWN_THREADS = 160;
+constexpr int UP_THREADS = 256;
+constexpr int UP_COLS8 = UP_THREADS / 32;   // columns per up CTA (a warp a column)
+static_assert(N % UP_COLS8 == 0 && 32 % UP_COLS8 == 0, "an up CTA never straddles a q8_1 group");
+static_assert(HC <= MAX_HC && LR <= MAX_LR && LR % 4 == 0 && N % G8 == 0, "hc8 geometry");
+
+struct P {
+    const float* R[MT];
+    float* R_out[MT];
+    const float* bo[MT];
+    const float* inj_prev[MT];
+    float* lo[MT];
+    float* rs[MT];
+    float* inj_out[MT];
+    float* mixed[MT];
+    uint8_t* q8_mixed[MT];
+    unsigned* q8_cnt;
+    const float* w_norm;
+    const int8_t* qd;
+    const uint16_t* sd;
+    const int8_t* qu;
+    const uint16_t* su;
+    const int8_t* qi;
+    const uint16_t* si;
+    int sd_row, su_row, si_row;
+    int T, n, hc, lr, ninj;
+    bool apply;
+    float eps;
+};
+
+__device__ __forceinline__ const float* src_of(const P& p, int t) { return p.apply ? p.R_out[t] : p.R[t]; }
+__device__ __forceinline__ float s8(uint32_t w, int j) { return (float) (int) (int8_t) (w >> (8 * j)); }
+__device__ __forceinline__ float f16f(uint16_t h) { return __half2float(__ushort_as_half(h)); }
+
+// one CTA per (stream, token)
+__global__ void norm_kernel(P p) {
+    __shared__ float red[32];
+    const int c = blockIdx.x, t = blockIdx.y;
+    const int n = p.n;
+    const float* r = p.R[t] + (size_t) c * n;
+    float w = 0.0f;
+    if (p.apply) w = 2.0f / (1.0f + expf(-p.inj_prev[t][c] / (float) p.hc));
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = r[i];
+        if (p.apply) {
+            v = fmaf(p.bo[t][i], w, v);
+            p.R_out[t][(size_t) c * n + i] = v;
+        }
+        ss = fmaf(v, v, ss);
+    }
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int k = 0; k < (int) (blockDim.x >> 5); ++k) s += red[k];
+        p.rs[t][c] = rsqrtf(s / (float) n + p.eps);
+    }
+}
+
+// DOWN_ROWS rows of [q_down; q_inject] per CTA; a thread takes whole scale groups
+__global__ void __launch_bounds__(DOWN_THREADS) down_kernel(P p) {
+    __shared__ float red[DOWN_THREADS / 32][DOWN_ROWS][MT];
+    const int blk = blockIdx.x;
+    const int D8 = p.n * p.hc, gpr = D8 / G8, nrows = p.lr + p.ninj;
+    const int8_t* q[DOWN_ROWS];
+    const uint16_t* s[DOWN_ROWS];
+#pragma unroll
+    for (int r = 0; r < DOWN_ROWS; ++r) {
+        const int k = min(blk * DOWN_ROWS + r, nrows - 1);
+        if (k < p.lr) { q[r] = p.qd + (size_t) k * D8; s[r] = p.sd + (size_t) k * p.sd_row; }
+        else { q[r] = p.qi + (size_t) (k - p.lr) * D8; s[r] = p.si + (size_t) (k - p.lr) * p.si_row; }
+    }
+    float acc[DOWN_ROWS][MT];
+#pragma unroll
+    for (int r = 0; r < DOWN_ROWS; ++r)
+#pragma unroll
+        for (int t = 0; t < MT; ++t) acc[r][t] = 0.0f;
+    for (int g = threadIdx.x; g < gpr; g += blockDim.x) {
+        const int col0 = g * G8, c = col0 / p.n;
+        float wq[DOWN_ROWS][G8];
+        float sc[DOWN_ROWS];
+        {
+            float wn[G8];
+            const float4* w4 = reinterpret_cast<const float4*>(p.w_norm + col0);
+#pragma unroll
+            for (int j = 0; j < G8 / 4; ++j) {
+                const float4 v = w4[j];
+                wn[4 * j] = v.x; wn[4 * j + 1] = v.y; wn[4 * j + 2] = v.z; wn[4 * j + 3] = v.w;
+            }
+#pragma unroll
+            for (int r = 0; r < DOWN_ROWS; ++r) {
+                const uint4 a = reinterpret_cast<const uint4*>(q[r] + col0)[0];
+                const uint4 b = reinterpret_cast<const uint4*>(q[r] + col0)[1];
+                const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+                for (int i = 0; i < G8; ++i) wq[r][i] = s8(w[i >> 2], i & 3) * wn[i];
+                sc[r] = f16f(s[r][g]);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (t < p.T) {
+                const float4* x4 = reinterpret_cast<const float4*>(src_of(p, t) + col0);
+                float d[DOWN_ROWS];
+#pragma unroll
+                for (int r = 0; r < DOWN_ROWS; ++r) d[r] = 0.0f;
+#pragma unroll
+                for (int j = 0; j < G8 / 4; ++j) {
+                    const float4 v = x4[j];
+#pragma unroll
+                    for (int r = 0; r < DOWN_ROWS; ++r) {
+                        d[r] = fmaf(wq[r][4 * j], v.x, d[r]);
+                        d[r] = fmaf(wq[r][4 * j + 1], v.y, d[r]);
+                        d[r] = fmaf(wq[r][4 * j + 2], v.z, d[r]);
+                        d[r] = fmaf(wq[r][4 * j + 3], v.w, d[r]);
+                    }
+                }
+                const float rs = p.rs[t][c];
+#pragma unroll
+                for (int r = 0; r < DOWN_ROWS; ++r) acc[r][t] = fmaf(sc[r] * rs, d[r], acc[r][t]);
+            }
+        }
+    }
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+#pragma unroll
+    for (int r = 0; r < DOWN_ROWS; ++r)
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (t < p.T) {
+                float v = acc[r][t];
+                for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+                if (lane == 0) red[warp][r][t] = v;
+            }
+        }
+    __syncthreads();
+    if (threadIdx.x < DOWN_ROWS * MT) {
+        const int r = threadIdx.x / MT, t = threadIdx.x % MT, k = blk * DOWN_ROWS + r;
+        if (t < p.T && k < nrows) {
+            float v = 0.0f;
+            for (int w = 0; w < (int) (blockDim.x >> 5); ++w) v += red[w][r][t];
+            if (k < p.lr) {
+                const float x = v / (float) p.hc;
+                p.lo[t][k] = x / (1.0f + expf(-x));
+            } else {
+                p.inj_out[t][k - p.lr] = v;
+            }
+        }
+    }
+}
+
+// STRATA_QFUSE: the q8_1 image of `mixed` (gr_q8_tail's quantizer, the bytes native_quantize_q8_1 writes): the last of
+// the 32 / UP_COLS8 CTAs that own a 32-column group (a per-group counter, reset by that CTA) reads the group back.
+__device__ __forceinline__ void q8_tail(const P& p, int d0) {
+    __shared__ int last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned* c = p.q8_cnt + d0 / 32;
+        last = atomicAdd(c, 1u) == (unsigned) (32 / UP_COLS8 - 1);
+        if (last) atomicExch(c, 0u);
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (warp >= p.T) return;
+    const int c0 = (d0 / 32) * 32;
+    const float xi = *reinterpret_cast<const volatile float*>(p.mixed[warp] + c0 + lane);
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float d = q8_1_finite(amax / 127.0f);
+    const int8_t q = q8_1_quant(xi, d, amax);
+    GrQ81* y = reinterpret_cast<GrQ81*>(p.q8_mixed[warp]) + c0 / 32;
+    y->qs[lane] = q;
+    if (lane == 0) y->ds = q8_1_ds(d, sum);
+}
+
+// one warp per output column d: the hc rows c*n + d, lo staged in shared memory; a lane takes 4-value chunks
+__global__ void __launch_bounds__(UP_THREADS) up_kernel(P p) {
+    __shared__ __align__(16) float slo[MT * MAX_LR];
+    const int lr = p.lr;
+    for (int i = threadIdx.x; i < p.T * lr; i += blockDim.x) slo[i] = p.lo[i / lr][i % lr];
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int d0 = blockIdx.x * UP_COLS8;
+    const int d = d0 + warp;   // n % UP_COLS8 == 0: every warp has a column
+    const int nch = lr / 4;   // chunks of 4 per row
+    float part[MAX_HC][MT];
+#pragma unroll
+    for (int c = 0; c < MAX_HC; ++c)
+#pragma unroll
+        for (int t = 0; t < MT; ++t) part[c][t] = 0.0f;
+#pragma unroll
+    for (int c = 0; c < MAX_HC; ++c) {
+        if (c < p.hc) {
+            const size_t row = (size_t) c * p.n + d;
+            const uint32_t* qr = reinterpret_cast<const uint32_t*>(p.qu + row * lr);
+            const uint16_t* sr = p.su + row * p.su_row;
+#pragma unroll
+            for (int j = 0; j < MAX_LR / 128; ++j) {
+                const int ch = lane + 32 * j;
+                if (ch < nch) {
+                    const uint32_t w = qr[ch];
+                    const float sc = f16f(sr[ch / (G8 / 4)]);
+                    const float q0 = s8(w, 0), q1 = s8(w, 1), q2 = s8(w, 2), q3 = s8(w, 3);
+#pragma unroll
+                    for (int t = 0; t < MT; ++t) {
+                        if (t < p.T) {
+                            const float4 l = *reinterpret_cast<const float4*>(slo + t * lr + 4 * ch);
+                            float v = q0 * l.x;
+                            v = fmaf(q1, l.y, v);
+                            v = fmaf(q2, l.z, v);
+                            v = fmaf(q3, l.w, v);
+                            part[c][t] = fmaf(sc, v, part[c][t]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < MAX_HC; ++c)
+#pragma unroll
+        for (int t = 0; t < MT; ++t)
+            if (c < p.hc && t < p.T)
+                for (int o = 16; o > 0; o >>= 1) part[c][t] += __shfl_xor_sync(0xffffffffu, part[c][t], o);
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        if (t < p.T && lane == t) {
+            const float* src = src_of(p, t);
+            float m = 0.0f;
+#pragma unroll
+            for (int c = 0; c < MAX_HC; ++c) {
+                if (c < p.hc) {
+                    const size_t i = (size_t) c * p.n + d;
+                    const float xn = src[i] * p.w_norm[i] * p.rs[t][c];
+                    m = fmaf(xn, 1.0f / (1.0f + expf(-part[c][t])), m);
+                }
+            }
+            p.mixed[t][d] = m / (float) p.hc;
+        }
+    }
+    if (p.q8_cnt != nullptr) q8_tail(p, d0);
+}
+
+// hc_fused.cu's hc8_quant_kernel: q = round(w / s) in [-127, 127], s = f16(absmax / 127) per G8 consecutive values
+// of a row; a row's `gpr` scales start every `srow` f16
+__global__ void quant_kernel(const uint16_t* w, int64_t groups, int gpr, int srow, int8_t* q, uint16_t* sc, float* s32) {
+    const int64_t gi = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (gi >= groups) return;
+    float x[G8], amax = 0.0f;
+    for (int i = 0; i < G8; ++i) {
+        x[i] = __uint_as_float((uint32_t) w[gi * G8 + i] << 16);
+        amax = fmaxf(amax, fabsf(x[i]));
+    }
+    const __half h = __float2half_rn(amax / 127.0f);
+    const float s = __half2float(h);
+    sc[gi / gpr * srow + gi % gpr] = __half_as_ushort(h);
+    if (s32 != nullptr) s32[gi] = s;
+    for (int i = 0; i < G8; ++i) {
+        const float v = s > 0.0f ? fminf(fmaxf(rintf(x[i] / s), -127.0f), 127.0f) : 0.0f;
+        q[gi * G8 + i] = (int8_t) v;
+    }
+}
+
+// The read on the 8-bit copies; true when it wrote the q8_1 images (every token's q8_mixed set).
+bool launch(const GrMulti& m, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+    const FusedGrArgs& a0 = m.a[0];
+    const bool inj = a0.w_inject != nullptr || a0.hc8_qi != nullptr;
+    if (a0.hc8_qd == nullptr || a0.hc8_qu == nullptr || a0.hc8_sd == nullptr || a0.hc8_su == nullptr ||
+        (inj && (a0.hc8_qi == nullptr || a0.hc8_si == nullptr)) || a0.hc8_sd_row < D / 32 ||
+        a0.hc8_su_row < LR / 32 || (inj && a0.hc8_si_row < D / 32)) {
+        std::fprintf(stderr, "hc8 read: a read's matrices are not all 8-bit copies (down %p up %p inject %p)\n",
+                     (const void*) a0.hc8_qd, (const void*) a0.hc8_qu, (const void*) a0.hc8_qi);
+        std::exit(1);
+    }
+    P p{};
+    bool q8 = a0.q8_cnt != nullptr;
+    for (int t = 0; t < m.T; ++t) {
+        const FusedGrArgs& x = m.a[t];
+        if ((inj && !x.inject_out) || x.apply != a0.apply || x.hc8_qd != a0.hc8_qd || x.hc8_qu != a0.hc8_qu ||
+            x.hc8_qi != a0.hc8_qi) {
+            std::fprintf(stderr, "hc8 read: invalid arguments for token %d\n", t);
+            std::exit(1);
+        }
+        p.R[t] = x.R; p.R_out[t] = x.R_out; p.bo[t] = x.bo_prev; p.inj_prev[t] = x.inj_prev;
+        p.lo[t] = x.lo; p.rs[t] = x.rs; p.inj_out[t] = x.inject_out; p.mixed[t] = x.mixed;
+        p.q8_mixed[t] = x.q8_mixed;
+        q8 = q8 && x.q8_mixed != nullptr;
+    }
+    p.q8_cnt = q8 ? a0.q8_cnt : nullptr;
+    p.w_norm = a0.w_norm;
+    p.qd = a0.hc8_qd; p.sd = a0.hc8_sd; p.sd_row = a0.hc8_sd_row;
+    p.qu = a0.hc8_qu; p.su = a0.hc8_su; p.su_row = a0.hc8_su_row;
+    if (inj) { p.qi = a0.hc8_qi; p.si = a0.hc8_si; p.si_row = a0.hc8_si_row; }
+    p.T = m.T; p.n = N; p.hc = HC; p.lr = LR; p.ninj = inj ? HC : 0;
+    p.apply = a0.apply; p.eps = a0.eps;
+    norm_kernel<<<dim3((unsigned) HC, (unsigned) m.T), 256, 0, st>>>(p);
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
+    down_kernel<<<(unsigned) ((p.lr + p.ninj + DOWN_ROWS - 1) / DOWN_ROWS), DOWN_THREADS, 0, st>>>(p);
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+    up_kernel<<<(unsigned) (N / UP_COLS8), UP_THREADS, 0, st>>>(p);
+    return q8;
+}
+}  // namespace hc8
+#endif
+
 }  // namespace
 
 #if STRATA_GR_FAST_BUILD
@@ -2199,7 +2533,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     for (int t = 0; t < n_tok; ++t) {
         m.a[t] = a[t];
         const FusedGrArgs& x = a[t];
-        if (!x.R || !x.w_norm || !((x.w_down && x.w_up) || (x.q8_down && x.q8_up)) || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
+        if (!x.R || !x.w_norm || !((x.w_down && x.w_up) || (x.q8_down && x.q8_up) || (x.hc8_qd && x.hc8_qu)) || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
             x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm || x.q8_down != a[0].q8_down ||
             x.q8_up != a[0].q8_up || x.q8_inject != a[0].q8_inject) {
@@ -2215,6 +2549,17 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
+#if !defined(__HIPCC__)
+    if (a[0].hc8_qd != nullptr) {   // STRATA_EXL3_HC8: the hc8 read (Basalt's, on the 8-bit copies)
+        const bool wrote = hc8::launch(m, st, stamp_buf, stamp_i0);
+        const cudaError_t e8 = cudaGetLastError();
+        if (e8 != cudaSuccess) {
+            std::fprintf(stderr, "fused_gr_read_multi hc8: %s\n", cudaGetErrorString(e8));
+            std::exit(1);
+        }
+        return wrote;
+    }
+#endif
     if (a[0].q8_down != nullptr && a[0].q8_up != nullptr) {   // inject: Q8_0 copy, or the BF16 rows
         launch_q8(m, xn_scratch, st, stamp_buf, stamp_i0);   // S23 experiment: STRATA_HC_Q8=1
         const cudaError_t eq = cudaGetLastError();
@@ -2358,6 +2703,28 @@ void fused_gr_dequant_q8_0(const uint8_t* q8, uint16_t* bf16, int64_t n_blocks, 
 
 void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks, void* stream) {
     gr_quantize_q8_0_kernel<<<(unsigned) ((n_blocks + 7) / 8), 256, 0, (cudaStream_t) stream>>>(bf16, out, n_blocks);
+}
+
+void hc8_quantize(const uint16_t* w, int64_t rows, int64_t cols, void* out, const int8_t** q, const uint16_t** s,
+                  void* stream, float* s32) {
+    if (w == nullptr || out == nullptr || rows < 1 || cols < 32 || cols % 32 != 0) {
+        std::fprintf(stderr, "hc8_quantize: invalid arguments (%lld x %lld)\n", (long long) rows, (long long) cols);
+        std::exit(1);
+    }
+    int8_t* qp = (int8_t*) out;
+    uint16_t* sp = (uint16_t*) ((uint8_t*) out + (((size_t) rows * (size_t) cols + 15) & ~(size_t) 15));
+    const int srow = hc8_srow(cols);
+    cudaMemsetAsync(sp, 0, (size_t) rows * srow * 2, (cudaStream_t) stream);
+#if !defined(__HIPCC__)
+    const int64_t groups = rows * cols / 32;
+    hc8::quant_kernel<<<(unsigned) ((groups + 255) / 256), 256, 0, (cudaStream_t) stream>>>(w, groups, (int) (cols / 32),
+                                                                                           srow, qp, sp, s32);
+#else
+    std::fprintf(stderr, "hc8_quantize: not built for HIP\n");
+    std::exit(1);
+#endif
+    if (q) *q = qp;
+    if (s) *s = sp;
 }
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
