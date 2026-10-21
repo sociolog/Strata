@@ -3570,6 +3570,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                    ld_y);
                     pt.mark(kPfGdnOut, cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
+                    strata::kernels::rank1_out_apply(m.bo, T, N, N, wo->r1_a, wo->r1_b, m.cs);   // strata-out-rank1
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
@@ -3808,6 +3809,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a)) return false;
+                    strata::kernels::rank1_out_apply(m.bo, T, N, N, wo->r1_a, wo->r1_b, m.cs);   // strata-out-rank1
                     ++qsa_index;
                     if (!kv_prefetch_after(l + 1, qsa_index)) return false;
                 } else {
@@ -3887,6 +3889,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                        strata::kernels::rank1_out_apply(m.shared, T, N, N, wsd->r1_a, wsd->r1_b, m.cs);   // strata-out-rank1
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
                         m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                         if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);

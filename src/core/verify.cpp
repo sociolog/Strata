@@ -1452,6 +1452,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
                 else il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                rank1_out_apply(bo_ + tb * N, n, N, N, wout->r1_a, wout->r1_b, cs);   // strata-out-rank1
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -1821,6 +1822,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 14, grp);
                 quant_in(attn32_ + tb * NH * HD, (int) (NH * HD));
                 mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
+                rank1_out_apply(bo_ + tb * N, n, N, N, wo->r1_a, wo->r1_b, cs);   // strata-out-rank1
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
@@ -1947,6 +1949,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
                                     qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
                                     (sg_ready ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0));
+                rank1_out_apply(shared_ + tb * N, n, N, N, wsd->r1_a, wsd->r1_b, sh_stream);   // strata-out-rank1
                 sg_gated_[grp] = sg_ready;
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();

@@ -3,6 +3,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace strata::kernels {
@@ -169,6 +171,39 @@ void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* b
                                                             (int) g_cvec.n_embd, (int) g_cvec.hc, r_ld, bo, bo_ld,
                                                             inj, inj_ld, write ? 1 : 0);
     if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("cvec_apply: launch failed");
+}
+
+}  // namespace strata::kernels
+
+namespace strata::kernels {
+namespace {
+__global__ void rank1_out_kernel(float* __restrict__ y, int n, int64_t ldy, const float* __restrict__ a,
+                                 const float* __restrict__ b) {
+    float* row = y + (int64_t) blockIdx.x * ldy;
+    __shared__ float red[THREADS / 32];
+    __shared__ float dot_s;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < n; i += THREADS) acc += a[i] * row[i];
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < THREADS / 32; ++w) s += red[w];
+        dot_s = s;
+    }
+    __syncthreads();
+    const float d = dot_s;
+    for (int i = threadIdx.x; i < n; i += THREADS) row[i] -= b[i] * d;
+}
+}  // namespace
+
+void rank1_out_apply(float* y, int64_t T, int64_t n, int64_t ldy, const float* a, const float* b, void* stream) {
+    if (a == nullptr || b == nullptr || T < 1) return;
+    static const bool trace = std::getenv("STRATA_RANK1_TRACE") != nullptr;   // debug: which paths run the correction
+    if (trace) std::fprintf(stderr, "rank1_out_apply T=%lld n=%lld\n", (long long) T, (long long) n);
+    rank1_out_kernel<<<(unsigned) T, THREADS, 0, (cudaStream_t) stream>>>(y, (int) n, ldy > 0 ? ldy : n, a, b);
+    if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("rank1_out_apply: launch failed");
 }
 
 }  // namespace strata::kernels
