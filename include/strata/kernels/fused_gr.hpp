@@ -96,6 +96,28 @@ constexpr int kFusedGrMaxT = 8;
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
 
+/// STRATA_HC_FUSED=1 (opt-in; CUDA sm_80+): the read of `fused_gr_read_multi` - and, given `rt`, the router GEMV and
+/// the top-10 after it - as ONE persistent kernel (an in-order work queue; Basalt's hc_fused design redesigned for
+/// cp.async cards, MIT).  Every output is BITWISE the unfused path's (the bf16 read's split/staged variant or the hc8
+/// read, bf16_gemv_fp32_mmvf_multi + native_router_top10_multi); only launches and overlap change.  =2: the read only.
+/// `ctr`: kHcFusedCtrBytes of zeroed device memory owned by the caller (each launch leaves it zeroed); reads that may
+/// run concurrently need different blocks.  Returns 0 when it did not run (the caller runs the unfused read and
+/// router), 1 when it ran the read, 2 when it also wrote rt's logits, ids and weights.  It never writes q8_mixed.
+struct HcFusedRouter {
+    const uint16_t* w = nullptr;   ///< bf16 [512][n_embd] (ffn_gate_inp)
+    float* logits = nullptr;       ///< [n_tok][512]
+    int32_t* ids = nullptr;        ///< [n_tok][10]
+    float* weights = nullptr;      ///< [n_tok][10]
+};
+constexpr size_t kHcFusedCtrBytes = 6 * 256;
+int hc_fused_mode();
+/// hcf_bench only: a device buffer of 5 u64 per item ([item, sm, claimed, waited, done] in ns) every fused read writes
+/// (null: off), and the CTAs of the last launch.
+void hcf_trace_set(void* dev_buf);
+int hcf_last_grid();
+int fused_gr_read_fused(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* ctr, const HcFusedRouter* rt,
+                        void* stream, unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
+
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);
 /// The multi read's variants (#315; not main's opt-in STRATA_GR_V3 read, which sums in another order), all computing

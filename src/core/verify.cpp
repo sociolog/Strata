@@ -639,6 +639,7 @@ Verifier::~Verifier() {
     if (arena_b_) cudaFree(arena_b_);
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (qcnt_) cudaFree(qcnt_);
+    if (hcf_ctr_) cudaFree(hcf_ctr_);
     if (d_spec_) cudaFree(d_spec_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
@@ -1023,6 +1024,16 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             qcnt_ = nullptr;
         }
     }
+    if (strata::kernels::hc_fused_mode() > 0) {   // STRATA_HC_FUSED: a counter set per (layer, half, group), zeroed once
+        const size_t bytes = (size_t) (g.n_layers + 1) * 4 * strata::kernels::kHcFusedCtrBytes;
+        if (cudaMalloc(&hcf_ctr_, bytes) != cudaSuccess || cudaMemset(hcf_ctr_, 0, bytes) != cudaSuccess) {
+            cudaGetLastError();
+            if (hcf_ctr_) cudaFree(hcf_ctr_);
+            hcf_ctr_ = nullptr;
+        }
+        std::fprintf(stderr, "strata verify: STRATA_HC_FUSED=%d: the fused hyper-connection read%s\n",
+                     strata::kernels::hc_fused_mode(), hcf_ctr_ ? (strata::kernels::hc_fused_mode() == 2 ? "" : " + router + top-10") : " could not get its counters (off)");
+    }
     if (all_resident_ || device_plan_) {
         bool ok2 = true;
         if (device_plan_)
@@ -1307,7 +1318,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             pending = false;
         }
-        auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
+        bool rt_fused = false;   // STRATA_HC_FUSED: the FFN-side read also wrote the router's logits, ids and weights
+        auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out,
+                                 const strata::kernels::HcFusedRouter* rt = nullptr) {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = tb; t < te; ++t) {
                 FusedGrArgs& a = fa[t - tb];
@@ -1330,6 +1343,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
             }
             if (strata::kernels::fused_gr_read_persist(fa, n, cs)) return false;   // STRATA_HC_PERSIST=1; q8_mixed is never set there
+            if (hcf_ctr_ != nullptr) {   // STRATA_HC_FUSED: one launch (bitwise the unfused read [and router]); 0 = not here
+                void* ctr = static_cast<char*>(hcf_ctr_) + (size_t) ((l * 2 + half) * 2 + grp) * strata::kernels::kHcFusedCtrBytes;
+                const int r = strata::kernels::fused_gr_read_fused(fa, n, xn_ + (size_t) tb * HC * N, ctr, rt, cs,
+                                                                   (prof_on_ && grp == 0) ? prof_ : nullptr,
+                                                                   (int) (l * kProfPer + (half == 0 ? 27 : 30)));
+                if (r > 0) {
+                    rt_fused = r == 2;
+                    return false;   // the fused read never writes the q8_1 images
+                }
+            }
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
@@ -1893,7 +1916,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
-        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
+        // STRATA_HC_FUSED: the router GEMV + top-10 ride in the FFN-side read where the unfused path below would run
+        // bf16_gemv_fp32_mmvf_multi + native_router_top10_multi (the fused read checks the kernel-level conditions)
+        strata::kernels::HcFusedRouter hrt;
+        const strata::kernels::HcFusedRouter* hrt_p = nullptr;
+        if (hcf_ctr_ != nullptr && strata::kernels::hc_fused_mode() != 2) {
+            const WeightRef* wr = v.get("ffn_gate_inp.weight");
+            const bool sgi = lfuse_on(n) && g_lfuse_gate() && v.get("ffn_gate_inp_shexp.weight") != nullptr;
+            if (dec_batch && n > 1 && wr != nullptr && wr->data != nullptr && native_router_enabled() && NE == 512 &&
+                K == 10 && !sgi) {
+                hrt.w = (const uint16_t*) wr->data; hrt.logits = logits_ + tb * NE; hrt.ids = ids_ + tb * K;
+                hrt.weights = w_ + tb * K;
+                hrt_p = &hrt;
+            }
+        }
+        rt_fused = false;
+        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_, hrt_p);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
@@ -1915,7 +1953,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+        if (rt_fused) {
+            // STRATA_HC_FUSED: logits_, ids_ and w_ are written (bitwise the two launches below)
+        } else if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
                     sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
