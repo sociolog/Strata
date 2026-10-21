@@ -357,7 +357,9 @@ st_begin(layer, 15, stream);
     if (!w_out->native_data) {
         quantize_q8_K(b.y, b.y_q8k, g.ssm_value_dim, stream);
         quantize_q8_0(b.y, b.y_q8_0, g.ssm_value_dim, stream);
-    }    if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0, b.y_q8k, out, g.ssm_value_dim, g.n_embd,                        v.name("ssm_out.weight"), stream, err, b.y)) return false;    st_end(layer, 15, stream);    return true;}
+    }    if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0, b.y_q8k, out, g.ssm_value_dim, g.n_embd,                        v.name("ssm_out.weight"), stream, err, b.y)) return false;
+    strata::kernels::rank1_out_apply(out, 1, g.n_embd, g.n_embd, w_out->r1_a, w_out->r1_b, stream);   // strata-out-rank1
+    st_end(layer, 15, stream);    return true;}
 // ================================ the MoE block ================================
 uint64_t moe_buffers_bytes(const ModelGeometry& g, int64_t k) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2,
 // x_bf16
@@ -463,6 +465,7 @@ f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
         exl3_shared_expert(x, (const Exl3Mat*) w_sgate->exl3, (const Exl3Mat*) w_sup->exl3,
                            (const Exl3Mat*) w_sdown->exl3, (const uint16_t*) w_ginp->data, b.shared,
                            (int) g.n_embd, (int) g.n_ff, stream);
+        rank1_out_apply(b.shared, 1, g.n_embd, g.n_embd, w_sdown->r1_a, w_sdown->r1_b, stream);   // strata-out-rank1
         return true;
     }
     NativeSharedWeights native;
@@ -477,6 +480,7 @@ f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
                       f_up, p_up.codes, p_up.scales, p_up.offset, f_down, p_down.codes, p_down.scales,
                       p_down.offset, (const uint16_t*) w_ginp->data, b.sh_scratch, b.shared,
                       g.n_embd, g.n_ff, /*tpr=*/32, stream, x, &native);
+        rank1_out_apply(b.shared, 1, g.n_embd, g.n_embd, w_sdown->r1_a, w_sdown->r1_b, stream);   // strata-out-rank1
     } catch (const std::exception& error) {
         err = v.name("shared_expert") + ": " + error.what();
         return false;
@@ -1253,7 +1257,9 @@ try {
 } else {
     s_gemv_q8k_split(b.attn_q8k, p_o.codes, p_o.scales, p_o.offset, out,
                     g.n_head * g.head_dim, g.n_embd, f_o, stream);
-}    return true;}
+}
+    strata::kernels::rank1_out_apply(out, 1, g.n_embd, g.n_embd, w_attno->r1_a, w_attno->r1_b, stream);   // strata-out-rank1
+    return true;}
 // ================================ THE DOORBELL ================================
 namespace {}
 // namespace

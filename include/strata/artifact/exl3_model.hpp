@@ -105,6 +105,7 @@ public:
         weight_map_ = exl3_detail::parse_weight_map(ss.str());
     }
 
+    const std::string& dir() const { return dir_; }
     bool has(const std::string& base) const { return weight_map_.count(base + ".trellis") != 0; }
     /// The shard path and the FILE byte range of a tensor, for readers that pread instead of touching the mmap.
     bool locate(const std::string& name, std::string& path, size_t& off, size_t& bytes) const {

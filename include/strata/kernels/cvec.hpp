@@ -63,3 +63,14 @@ void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* b
                 int64_t inj_ld, bool write, void* stream);
 
 }  // namespace strata::kernels
+
+namespace strata::kernels {
+
+/// An exact rank-1 correction of a residual writer's OUTPUT (the model folder's `strata-out-rank1.safetensors`,
+/// exl3_pack.cpp): for each of T rows `y + t * ldy` of n values, `y <- y - b (a . y)`.  With a = r, b = alpha r this is
+/// the abliteration edit W' = W (I - alpha r r^T) of the writer, without touching (or re-encoding) its weights.
+/// The caller passes the writer's WeightRef fields; a null `a` is a no-op (no launch), so a model without the file
+/// runs exactly the kernels it ran before.
+void rank1_out_apply(float* y, int64_t T, int64_t n, int64_t ldy, const float* a, const float* b, void* stream);
+
+}  // namespace strata::kernels

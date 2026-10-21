@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -444,7 +445,7 @@ bool stage_exl3(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGeometry& g, c
 // against the read and nothing else could hold them.
 bool stage_exl3_requantized(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGeometry& g, const std::string& hf_base,
                             const std::string& engine_name, WeightTable& wt, std::string& err, uint64_t& bytes_out,
-                            void* q8_scratch) {
+                            void* q8_scratch, const float* fold_a = nullptr, const float* fold_b = nullptr) {
     Exl3Linear L;
     int bits = 0;
     try {
@@ -506,6 +507,21 @@ bool stage_exl3_requantized(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGe
     // cost 78 slots per layer (measured: 216 slots/layer at 18.5 GiB free against 294 at 25.3 GiB).
     (void) cudaFree(d_w); d_w = nullptr;
 
+    // STRATA_RANK1_FOLD=1 (an A/B arm of strata-out-rank1.safetensors, see Exl3Pack::build): the writer's output
+    // correction y <- y - b (a . y) folded into the reconstructed weight before the Q8_0 rounding,
+    // Wt'[o][i] = Wt[o][i] - b[o] c[i] with c = a^T Wt (fp64), instead of the exact post-op after the GEMV.
+    std::vector<double> fold_c;
+    if (fold_a != nullptr) {
+        std::vector<uint16_t> all((size_t) n_in * (size_t) n_out);
+        if (cudaMemcpy(all.data(), d_wt, all.size() * 2, cudaMemcpyDeviceToHost) != cudaSuccess)
+            return fail("rank-1 fold download", cudaGetLastError());
+        fold_c.assign((size_t) n_in, 0.0);
+        for (int o = 0; o < n_out; ++o) {
+            const double ao = fold_a[o];
+            const uint16_t* row = all.data() + (size_t) o * (size_t) n_in;
+            for (int i = 0; i < n_in; ++i) fold_c[(size_t) i] += ao * (double) f16_to_f32(row[i]);
+        }
+    }
     const ggml_type qtype = GGML_TYPE_Q8_0;
     const size_t row_bytes = ggml_row_size(qtype, n_in);
     if (!alloc(&d_q, row_bytes * (size_t) n_out)) return false;
@@ -529,6 +545,12 @@ bool stage_exl3_requantized(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGe
                 return;
             }
             for (size_t i = 0; i < elems; ++i) f32[i] = f16_to_f32(h16[i]);
+            if (!fold_c.empty())
+                for (int rr = 0; rr < nr; ++rr) {
+                    const double bo = fold_b[r0 + rr];
+                    float* row = f32.data() + (size_t) rr * (size_t) n_in;
+                    for (int i = 0; i < n_in; ++i) row[i] = (float) ((double) row[i] - bo * fold_c[(size_t) i]);
+                }
             // `ggml_quantize_chunk` offsets BOTH sides itself: `src + start` and `dst + start_row*row_size`.
             // So both pointers are shifted back by `start` and the function lands on this chunk's buffers.
             const float* src_base = f32.data() - (size_t) r0 * (size_t) n_in;
@@ -707,6 +729,71 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
                 std::fprintf(stderr, "exl3 dense: q8_1 scratch for max_in=%lld (%zu bytes)\n", (long long) max_in,
                              (size_t) strata::kernels::native_q8_1_bytes((int) max_in));
         }
+        // ---- strata-out-rank1.safetensors (optional, opt-in by its presence in the model folder): an exact rank-1
+        // correction of residual writers' outputs, `<hf linear>.out_rank1.a` / `.out_rank1.b` (F32, the output
+        // dim each): y <- y - b (a . y) after the projection (rank1_out_apply at the writers' call sites), so an
+        // edit W' = W (I - alpha r r^T) runs on the base's own weights with no re-encode.  Only the residual writers
+        // (ssm_out, attn_output, ffn_down_shexp) may carry one.  Without the file nothing below changes anything.
+        std::unique_ptr<SafetensorsFile> r1file;
+        {
+            const std::string p = im.model.dir() + "/strata-out-rank1.safetensors";
+            if (std::FILE* fp = std::fopen(p.c_str(), "rb")) {
+                std::fclose(fp);
+                try { r1file = std::make_unique<SafetensorsFile>(p); }
+                catch (const std::exception& e) { err = "exl3: " + p + ": " + e.what(); return false; }
+            }
+        }
+        const char* fold_env = std::getenv("STRATA_RANK1_FOLD");
+        const bool r1_fold = r1file && fold_env != nullptr && std::atoi(fold_env) != 0;
+        int r1_used = 0;
+        auto r1_find = [&](const std::string& hf_base, int64_t n_out, const float** a, const float** b) -> bool {
+            *a = *b = nullptr;
+            if (!r1file) return true;
+            const StTensor* ta = r1file->find(hf_base + ".out_rank1.a");
+            const StTensor* tb = r1file->find(hf_base + ".out_rank1.b");
+            if (!ta && !tb) return true;
+            if (!ta || !tb || ta->dtype != "F32" || tb->dtype != "F32" || (int64_t) ta->nelem() != n_out ||
+                (int64_t) tb->nelem() != n_out) {
+                err = "exl3: strata-out-rank1.safetensors: " + hf_base + ": .out_rank1.a and .b must both be F32 [" +
+                      std::to_string((long long) n_out) + "]";
+                return false;
+            }
+            *a = (const float*) r1file->data(*ta);
+            *b = (const float*) r1file->data(*tb);
+            return true;
+        };
+        auto r1_writer = [](const RoleSpec& r) {
+            return std::strcmp(r.engine, "ssm_out.weight") == 0 || std::strcmp(r.engine, "attn_output.weight") == 0 ||
+                   std::strcmp(r.engine, "ffn_down_shexp.weight") == 0;
+        };
+        // after `eng` is staged: the post-op's device vectors on its WeightRef
+        auto r1_attach = [&](const RoleSpec& r, const std::string& hf_base, const std::string& eng, const float* a,
+                             const float* b) -> bool {
+            if (a == nullptr) return true;
+            if (!r1_writer(r)) {
+                err = "exl3: strata-out-rank1.safetensors: " + hf_base + " is not a residual writer (ssm_out, "
+                      "attn_output, ffn_down_shexp)";
+                return false;
+            }
+            ++r1_used;
+            if (r1_fold) return true;   // folded into the requantized weight (stage_exl3_requantized)
+            const WeightRef* cur = wt.find(eng);
+            if (cur == nullptr) { err = "exl3: rank-1 correction: " + eng + " was not staged"; return false; }
+            const size_t bytes = (size_t) cur->ne1 * sizeof(float);
+            float *da = nullptr, *db = nullptr;
+            try { da = (float*) im.alloc(bytes); db = (float*) im.alloc(bytes); }
+            catch (const std::exception& e) { err = e.what(); return false; }
+            if (cudaMemcpy(da, a, bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemcpy(db, b, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "exl3: rank-1 correction upload: " + std::string(cudaGetErrorString(cudaGetLastError()));
+                return false;
+            }
+            WeightRef w = *cur;
+            w.r1_a = da;
+            w.r1_b = db;
+            wt.set(eng, w);
+            return true;
+        };
         for (const RoleSpec& r : kGlobal)
             if (r.exl3 && !(use_q5(r) ? stage_exl3_requantized(im, r, g, r.hf, r.engine, wt, err, exl3_bytes_, q8_scratch)
                                       : stage_exl3(im, r, g, r.hf, r.engine, wt, err, exl3_bytes_))) return false;
@@ -719,11 +806,22 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
                     if (r.qsa_only && !qsa) continue;
                     if (r.gdn_only && qsa) continue;
                     std::string eng = "blk." + std::to_string(layer) + "." + r.engine;
-                    if (!(use_q5(r) ? stage_exl3_requantized(im, r, g, kLayerPrefix + std::to_string(layer) + "." + r.hf,
-                                                             eng, wt, err, exl3_bytes_, q8_scratch)
-                                    : stage_exl3(im, r, g, kLayerPrefix + std::to_string(layer) + "." + r.hf, eng, wt,
-                                                 err, exl3_bytes_)))
+                    const std::string hf_base = kLayerPrefix + std::to_string(layer) + "." + r.hf;
+                    const float *r1a = nullptr, *r1b = nullptr;
+                    if (r1file) {
+                        int64_t n_out = 0;
+                        try { n_out = im.model.linear(hf_base).out(); } catch (const std::exception& e) { err = e.what(); return false; }
+                        if (!r1_find(hf_base, n_out, &r1a, &r1b)) return false;
+                        if (r1a != nullptr && r1_fold && !use_q5(r)) {
+                            err = "exl3: STRATA_RANK1_FOLD needs the requantized dense path (not STRATA_EXL3_DENSE=exl3)";
+                            return false;
+                        }
+                    }
+                    if (!(use_q5(r) ? stage_exl3_requantized(im, r, g, hf_base, eng, wt, err, exl3_bytes_, q8_scratch,
+                                                             r1_fold ? r1a : nullptr, r1_fold ? r1b : nullptr)
+                                    : stage_exl3(im, r, g, hf_base, eng, wt, err, exl3_bytes_)))
                         return false;
+                    if (!r1_attach(r, hf_base, eng, r1a, r1b)) return false;
                 }
                 return true;
             };
@@ -732,6 +830,17 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
                 return false;
         }
 
+        if (r1file) {
+            size_t n_corr = 0;
+            for (const auto& kv : r1file->tensors()) n_corr += kv.first.size() > 12 && kv.first.compare(kv.first.size() - 12, 12, ".out_rank1.a") == 0;
+            if ((size_t) r1_used != n_corr) {
+                err = "exl3: strata-out-rank1.safetensors holds " + std::to_string(n_corr) + " corrections, " +
+                      std::to_string(r1_used) + " matched a staged writer";
+                return false;
+            }
+            std::fprintf(stderr, "exl3: strata-out-rank1.safetensors: %d residual writers corrected (%s)\n", r1_used,
+                         r1_fold ? "folded into the Q8_0 weights, STRATA_RANK1_FOLD" : "exact post-op after the projection");
+        }
         // ---- validate against the engine's own shape contract
         if (!check_all(wt, g, err)) return false;
         LoadReport rep;

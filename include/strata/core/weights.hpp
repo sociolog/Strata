@@ -97,6 +97,11 @@ struct WeightRef {
     /// owned by the EXL3 loader.  Null for every pack/native tensor; when set, `gemv_quantized` runs
     /// `exl3_gemv_f32` instead of the canonical/native paths.
     const void* exl3 = nullptr;
+    /// Optional exact rank-1 correction of this linear's OUTPUT, `y <- y - r1_b (r1_a . y)` (device, ne1 f32 each),
+    /// from an EXL3 model folder's `strata-out-rank1.safetensors` (exl3_pack.cpp).  Null for every tensor otherwise;
+    /// the writers' call sites run `rank1_out_apply` after the projection only when it is set.
+    const float* r1_a = nullptr;
+    const float* r1_b = nullptr;
     /// Plan v0.3 P1: false when the loader SKIPPED this tensor's canonical bytes because another form serves it
     /// (native GGUF projections, the native head).  The metadata above stays valid; `data` is null.
     bool resident = true;
