@@ -169,28 +169,48 @@ inline bool g_qdedup() { static const bool on = [] { const char* v = std::getenv
 // S26 STRATA_QFUSE=1: activation q8_1 images written by their producers (the GDN output norm) - the same bytes
 // fork F4 (Eddoursul): 2-4 token dense projections read an interleaved copy of the q8_1 activations (bitwise the same
 // outputs); STRATA_MMVQ_IL=0 keeps native_mmvq's multi-column kernels
-// STRATA_DENSE_TC=1 (opt-in, ported from Basalt, MIT): the window's dense Q8_0 projections on int8 tensor cores
-// (dense_tc.hpp; sm_80+, n_in a multiple of 512).  Not bitwise native_mmvq (float rounding, last bits), but every token's
-// output is bitwise independent of the window width T, so speculation stays exact.  STRATA_DENSE_TC_MASK picks the
-// projections (bits): 1 GDN qkv + z, 2 GDN out, 4 QSA q / k / v, 8 QSA out, 16 the head; STRATA_DENSE_TC=1 alone
-// takes kDenseTcDefault = 1 | 4 | 16 (3090, 2026-10-21: the out-projections (6144 -> 2560) stay on native_mmvq, which
-// is faster there at T <= 4; dense_tc_bench).  Measured end to end: 4.18 +0.6..+2 % (the gain is bit 4), 6.05 long
-// prompts -3.6 % (bit 4 again: the QSA query projection on its side stream; mask 16 is neutral there).  Set before
-// graph capture.
-constexpr int kDenseTcDefault = 1 | 4 | 16;
+// STRATA_DENSE_TC (opt-in, ported from Basalt, MIT): the window's dense Q8_0 projections on int8 tensor cores
+// (dense_tc.hpp; sm_80+, n_in a multiple of 512).  Not bitwise native_mmvq (float rounding, last bits); the kernel's
+// own output is bitwise independent of the window width T.  STRATA_DENSE_TC_MASK picks the projections (bits): 1 GDN
+// qkv + z, 2 GDN out, 4 QSA q / k / v, 8 QSA out, 16 the head.
+//   =1 (auto, the default mode): each projection takes the kernel only from the width where it wins on the 3090
+//      (dense_tc_bench, 2026-10-21; native_mmvq runs 700-800 GB/s at 1-4 columns and the ring kernel pays ~3 us more
+//      a launch): qkv and QSA q (n_out >= 10240) from 4 columns, z (6144) from 5, the out-projections (n_in > 4096)
+//      from 6, the head from 3, never the 512-row k / v; mask 31.  A token's output then depends on the width class
+//      (TC or mmvq), not on T itself; both are at the reordering floor of the quality check.
+//      STRATA_DENSE_TC_MIN_T=k replaces every threshold by k (k / v stay on mmvq).
+//   =2: the step-2 behaviour - every width, mask 21 (GDN qkv + z, QSA q / k / v, the head).
+// Set before graph capture.
+constexpr int kDenseTcAlways = 1 | 4 | 16;
+constexpr int kDenseTcAuto = 1 | 2 | 4 | 8 | 16;
+inline int g_dense_tc_mode() {
+    static const int m = [] { const char* v = std::getenv("STRATA_DENSE_TC"); return v != nullptr && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0; }();
+    return m;
+}
 inline int g_dense_tc() {
     static const int m = [] {
-        const char* v = std::getenv("STRATA_DENSE_TC");
-        if (v == nullptr || v[0] != '1') return 0;
+        if (g_dense_tc_mode() == 0) return 0;
         const char* mk = std::getenv("STRATA_DENSE_TC_MASK");
-        return mk != nullptr ? std::atoi(mk) : kDenseTcDefault;
+        return mk != nullptr ? std::atoi(mk) : g_dense_tc_mode() == 1 ? kDenseTcAuto : kDenseTcAlways;
     }();
     return m;
 }
-// the projection on the tensor-core kernel when its bit is on and it applies (Q8_0, 1..8 columns); false: the caller's path
+// the smallest column count where the ring kernel beats native_mmvq for this shape (mode 1)
+inline int dense_tc_min_n(int n_in, int n_out) {
+    static const int all = [] { const char* v = std::getenv("STRATA_DENSE_TC_MIN_T"); return v != nullptr ? std::max(1, std::atoi(v)) : 0; }();
+    if (n_out <= 1024) return 1 << 20;   // QSA k / v, the shared expert: launch-bound, mmvq wins at every width
+    if (all > 0) return all;
+    if (n_out >= 100000) return 3;       // the head (2560 -> 248320): 783.7 vs 884.2 us at 3 columns
+    if (n_in > 4096) return 6;           // out-projections (6144 -> 2560): 25.6 vs 25.3 us at 5, 25.6 vs 28.4 at 6
+    if (n_out >= 10240) return 4;        // GDN qkv 38.1 vs 40.9, QSA q 45.9 vs 47.7 us at 4 (37.9 vs 37.6 / 45.7 vs 44.1 at 3)
+    return 5;                            // GDN z (2560 -> 6144): 25.3 vs 24.3 at 4, 26.4 vs 27.9 at 5
+}
+// the projection on the tensor-core kernel when its bit is on and it applies (Q8_0, 1..8 columns, and in mode 1 from
+// its shape's crossover width); false: the caller's path
 inline bool dense_tc_try(int bit, int type, const void* w, const void* xq, float* out, int n_in, int n_out, int n,
                          cudaStream_t s) {
     if ((g_dense_tc() & bit) == 0 || type != 8 || n < 1 || n > 8 || !strata::kernels::dense_tc_q8_0_ok(n_in)) return false;
+    if (g_dense_tc_mode() == 1 && n < dense_tc_min_n(n_in, n_out)) return false;
     strata::kernels::dense_tc_q8_0(w, xq, out, n_in, n_out, n, s);
     return true;
 }
