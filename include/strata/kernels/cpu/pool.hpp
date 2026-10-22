@@ -198,6 +198,15 @@ public:
     /// write disjoint memory; `ctx` and what it points to must outlive the call.  At most 65,535 tasks.
     using TaskFn = void (*)(void* ctx, int task, int thread);
     void run_tasks(int n, TaskFn fn, void* ctx);
+    /// proto (STRATA_EXL3_LANE_WARM): a phase of `n` tasks the host does NOT wait for - the workers' idle time between
+    /// two layers (the host never drains it).  Every later phase (any run*, through wait_parked) first stops it: the
+    /// tasks poll bg_stopping() and return, the host claims what is left unclaimed (so no late worker can take a task
+    /// of it once the next phase is described), then waits for every worker to park.  The tasks must only read.
+    void start_background(int n, TaskFn fn, void* ctx);
+    void stop_background();
+    /// Only tells a background phase to stop (no wait): its workers park while the host prepares the next phase.
+    void signal_background_stop() { if (bg_live_) bg_stop_.store(true, std::memory_order_relaxed); }
+    bool bg_stopping() const { return bg_stop_.load(std::memory_order_relaxed); }
 
     /// Total `_mm_pause` iterations spent waiting, over all workers, is no longer counted - see the note on the
     /// atomics below.  It was a LOCKED read-modify-write in the park loop, so measuring the contention added to
@@ -280,6 +289,9 @@ private:
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
+    alignas(64) std::atomic<bool> bg_stop_{false};   // proto: start_background's phase is to stop
+    bool bg_live_ = false;                           // host only: a background phase may still have tasks
+    uint32_t bg_epoch_ = 0;
     // The sleep after `kSpinBeforeSleep`.  `sleepers_` is how `publish` knows whether anyone needs waking, so the
     // token path pays one uncontended load per publish and never takes the mutex while the workers spin.
     alignas(64) std::atomic<uint32_t> sleepers_{0};

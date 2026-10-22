@@ -642,7 +642,29 @@ uint32_t ExpertPool::begin_batch(int n) {
     return e;
 }
 
+void ExpertPool::start_background(int n, TaskFn fn, void* ctx) {
+    if (n <= 0 || n > 0xffff || fn == nullptr || n_ < 1) return;
+    wait_parked("before a background phase");   // stops a previous one
+    bg_stop_.store(false, std::memory_order_relaxed);
+    task_fn_ = fn;
+    task_ctx_ = ctx;
+    mode_ = 7;
+    njobs_ = n;
+    bg_epoch_ = begin_batch(n);
+    bg_live_ = true;
+}
+
+void ExpertPool::stop_background() {
+    if (!bg_live_) return;
+    bg_stop_.store(true, std::memory_order_relaxed);
+    while (claim(bg_epoch_) >= 0) done_.fetch_add(1, std::memory_order_relaxed);   // the unclaimed rest: none left to take
+    bg_live_ = false;
+    wait_parked("after a background phase");
+    hstate_.store(kIdle, std::memory_order_relaxed);
+}
+
 void ExpertPool::wait_parked(const char* what) {
+    if (bg_live_) stop_background();
     hstate_.store(kWaitParked, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
     uint32_t spins = 0;
@@ -880,6 +902,7 @@ void ExpertPool::run_tasks(int n, TaskFn fn, void* ctx) {
         std::abort();
     }
     const auto t0 = std::chrono::steady_clock::now();
+    stop_background();   // proto: its workers may still read task_fn_ / task_ctx_
     task_fn_ = fn;
     task_ctx_ = ctx;
     run_phase(7, n);

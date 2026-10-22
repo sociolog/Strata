@@ -1371,7 +1371,8 @@ endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3.cpp
-            src/kernels/cpu/exl3_lane.cpp src/kernels/cpu/exl3_lane_moe.cpp src/kernels/cpu/exl3_ram.cpp)
+            src/kernels/cpu/exl3_lane.cpp src/kernels/cpu/exl3_lane_moe.cpp src/kernels/cpu/exl3_ram.cpp
+            src/kernels/cpu/exl3_lane_warm.cpp)
 # exl3_lane.cpp takes no per-file ISA flags: its AVX-512 and AVX2 kernels carry target attributes and run where
 # cpu_avx512bw_ok() / cpu_avx2_ok() say so, the scalar tier everywhere else
 target_include_directories(strata_kernels_cpu PUBLIC include)
