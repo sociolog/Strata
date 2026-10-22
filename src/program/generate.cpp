@@ -92,6 +92,7 @@
 #include "strata/kernels/exl3_experts.hpp"
 #include "strata/kernels/exl3_tier.hpp"
 #include "strata/kernels/cpu/exl3_ram.hpp"
+#include "strata/kernels/cpu/exl3_lane_warm.hpp"
 #include "strata/core/family_layout.hpp"
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
@@ -1487,6 +1488,7 @@ struct Exl3Drive {
     int64_t win_calls = 0, win_entries = 0, win_jobs = 0;
     double win_ms = 0;
     double ph_gpu = 0, ph_help = 0, ph_jobs = 0, ph_lane = 0, ph_fin = 0;   // proto: where a window-layer's host time goes
+    double ph_fin_help = 0, ph_fin_pump = 0;   // proto: ph_fin's wait for the helper's rows and the adapt copy issued
     std::vector<int16_t> job_of;      // n_expert entries: a window's expert -> its job (-1: none yet)
     std::vector<int32_t> touched;     // the experts the call gave a job; job_of is reset through them
     // --exl3-lane-profile: the VRAM tier (kernels/exl3_tier.hpp).  A window publishes the routes to its experts as the
@@ -1738,6 +1740,16 @@ struct Exl3Drive {
     };
     X3Runner tok;    // the token path's share of the tier (device 0)
     Exl3Adapt* adapt = nullptr;   // --exl3-tier-adapt: the windows' route counts
+    // proto STRATA_EXL3_LANE_WARM=N: between two layers of a window the idle lane workers predict the next layer's lane
+    // experts (its router on this layer's input) and read the likeliest N into their caches (kernels/cpu/exl3_lane_warm)
+    strata::kernels::cpu::Exl3LaneWarm* warm = nullptr;
+    static const uint8_t* lane_blob(void* ctx, int layer, int e) {   // the RAM blob if the lane would run (layer, e)
+        const Exl3Drive* t = (const Exl3Drive*) ctx;
+        if (t->tier != nullptr && t->tier->blob(layer, e) != nullptr) return nullptr;
+        if (t->helper != nullptr && t->helper->blob(layer, e) != nullptr) return nullptr;
+        if (t->helper2 != nullptr && t->helper2->blob(layer, e) != nullptr) return nullptr;
+        return t->ram->blob(layer, e);
+    }
     X3Runner help;   // the helper tier's, both pools (device 1)
     X3Runner help2;  // proto: the third tier's (device 2)
 };
@@ -1847,6 +1859,7 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
                            int64_t layer) {
     Exl3Drive* t = (Exl3Drive*) user;
     const Clock::time_point a = Clock::now();
+    if (t->warm != nullptr && t->pool != nullptr) t->pool->signal_background_stop();   // parks while the plan is made
     namespace cpu = strata::kernels::cpu;
     std::string err;
     bool ok = t->ram != nullptr && t->moe != nullptr && t->pool != nullptr && t->n_embd > 0;
@@ -2028,6 +2041,7 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
                 ++j.nt;
             }
         for (int32_t e : t->touched) t->job_of[(size_t) e] = -1;
+        if (t->warm != nullptr) t->warm->score((int) layer, t->touched.data(), (int) t->touched.size());
         a3 = Clock::now();
         if (ok && njobs > 0) ok = t->moe->run(*t->pool, t->jobs.data(), njobs, err);
         a4 = Clock::now();
@@ -2040,7 +2054,10 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
         ok = false;
         err = "the third tier's experts failed: " + err;
     }
+    const Clock::time_point a4h = Clock::now();
     if (ok && t->adapt != nullptr && Exl3Adapt::spread_on() && !t->adapt->pump(1, err)) ok = false;
+    t->ph_fin_help += std::chrono::duration<double, std::milli>(a4h - a4).count();
+    t->ph_fin_pump += std::chrono::duration<double, std::milli>(Clock::now() - a4h).count();
     if (!ok) {
         // as the single-token hook: a wrong row would be weighted and added downstream, so the engine stops
         std::fprintf(stderr, "strata generate: EXL3 CPU lane failed in a verify window at layer %lld: %s - stopping\n",
@@ -2048,6 +2065,9 @@ void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int
         std::fflush(stderr);
         std::abort();
     }
+    if (t->warm != nullptr)
+        t->warm->start(*t->pool, (int) layer, x_f, (int) n_tok,
+                       t->ram->blob_bytes((int) ((layer + 1) % t->ram->n_layers())));
     // proto: STRATA_EXL3_ROUTE_DUMP=PATH - each window-layer's routes and where they ran (0 lane, 1 VRAM tier, 2 helper):
     // int32 layer, n_tok, k, then n_tok*k int32 ids, then n_tok*k uint8 placements
     {
@@ -7429,6 +7449,7 @@ int main(int argc, char** argv) {
     std::vector<std::pair<int32_t, int32_t>> exl3_ranked_tier;   // exl3_ranked, the experts exl3_tr holds only
     std::vector<strata::kernels::exl3::ExpertLayout> exl3_lay_host;   // the hybrid's lane-model layout (else = exl3_lay)
     std::unique_ptr<strata::kernels::cpu::Exl3LaneMoe> exl3_moe;
+    std::unique_ptr<strata::kernels::cpu::Exl3LaneWarm> exl3_warm;   // proto STRATA_EXL3_LANE_WARM
     // --exl3-lane: a blob's parts per layer (the GPU paths' view of the RAM tier's experts), the profile's ranking for
     // the VRAM tier (--exl3-lane-profile) and the tier itself (made once the prompt is read)
     std::vector<strata::kernels::exl3::ExpertLayout> exl3_lay;
@@ -7477,6 +7498,41 @@ int main(int argc, char** argv) {
         exl3_drive.ram = exl3_ram.get();
         exl3_drive.moe = exl3_moe.get();
         exl3_drive.pool = &pool;
+        if (const char* wv = std::getenv("STRATA_EXL3_LANE_WARM"); wv != nullptr && std::atoi(wv) > 0) {
+            std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
+            bool rok = true;
+            for (int64_t l = 0; l < g.n_layers && rok; ++l) {
+                const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+                const uint64_t ne = (uint64_t) (g.n_expert * g.n_embd);
+                rok = w != nullptr && (w->bytes == ne * 2 || w->bytes == ne * 4);
+                if (!rok) break;
+                std::vector<uint8_t> raw((size_t) w->bytes);
+                rok = cudaMemcpy(raw.data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+                routers[(size_t) l].resize((size_t) ne);
+                for (uint64_t i = 0; rok && i < ne; ++i) {
+                    if (w->bytes == ne * 2) {
+                        std::memcpy(&routers[(size_t) l][(size_t) i], raw.data() + 2 * i, 2);
+                    } else {
+                        uint32_t u;
+                        std::memcpy(&u, raw.data() + 4 * i, 4);
+                        routers[(size_t) l][(size_t) i] = (uint16_t) (u >> 16);
+                    }
+                }
+            }
+            const int nsel = std::atoi(wv);
+            exl3_warm = std::make_unique<strata::kernels::cpu::Exl3LaneWarm>();
+            if (rok && exl3_warm->init(routers, (int) g.n_embd, (int) g.n_expert, (int) g.n_expert_used, nsel, &Exl3Drive::lane_blob,
+                                       &exl3_drive, err)) {
+                exl3_drive.warm = exl3_warm.get();
+                std::fprintf(stderr, "strata generate: proto STRATA_EXL3_LANE_WARM=%d: the lane's idle workers warm the next "
+                                     "layer's %d likeliest lane experts (its router on this layer's input)\n", nsel, nsel);
+            } else {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata generate: STRATA_EXL3_LANE_WARM: off (%s)\n",
+                             rok ? err.c_str() : "a layer's router is not a BF16/F32 n_expert x n_embd tensor");
+                exl3_warm.reset();
+            }
+        }
         exl3_drive.n_embd = g.n_embd;
         exl3_drive.n_ff = g.n_ff;
         {
@@ -18097,9 +18153,18 @@ int main(int argc, char** argv) {
                         (double) exl3_drive.win_entries / (double) exl3_drive.win_calls);
         if (exl3_win && exl3_drive.win_calls > 0) {
             const double c = (double) exl3_drive.win_calls * 1e-3;
-            std::printf("%-24s gpu plan %.1f  helper launch %.1f  adapt+jobs %.1f  lane %.1f  helper finish %.1f us a window-layer\n",
+            std::printf("%-24s gpu plan %.1f  helper launch %.1f  adapt+jobs %.1f  lane %.1f  helper finish %.1f (helper rows %.1f, "
+                        "adapt copy %.1f) us a window-layer\n",
                         "EXL3 lane phases", exl3_drive.ph_gpu / c, exl3_drive.ph_help / c, exl3_drive.ph_jobs / c,
-                        exl3_drive.ph_lane / c, exl3_drive.ph_fin / c);
+                        exl3_drive.ph_lane / c, exl3_drive.ph_fin / c, exl3_drive.ph_fin_help / c, exl3_drive.ph_fin_pump / c);
+            if (const auto* w = exl3_drive.warm; w != nullptr && w->st_layers > 0)
+                std::printf("%-24s %.2f lane experts a window-layer; predicted %.2f (recall %.1f%%), warmed: recall %.1f%%; "
+                            "%.1f MB read a window-layer, %lld of %lld warm-ups read in full, %lld predictions late\n",
+                            "EXL3 lane warm-up", (double) w->st_lane / w->st_layers, (double) w->st_pred / w->st_layers,
+                            100.0 * w->st_hit / std::max<int64_t>(1, w->st_lane),
+                            100.0 * w->st_warmed_hit / std::max<int64_t>(1, w->st_lane),
+                            (double) w->st_bytes.load() / 1e6 / w->st_warm_starts, (long long) w->st_done.load(),
+                            (long long) w->st_warm_starts, (long long) w->st_late);
             if (exl3_drive.help.t_n > 0)
                 std::printf("%-24s launch %.1f  device (copies + kernels + rows back) %.1f  placing the rows %.1f us a call (%lld calls)\n",
                             "EXL3 helper round trip", exl3_drive.help.t_launch / exl3_drive.help.t_n,
