@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -536,6 +537,11 @@ void MtpDrafter::record_top2(int j) {
         else if (b2 < 0 || v > lg_host_[(size_t) b2]) b2 = i;
     }
     top2_[(size_t) j] = b2 < 0 ? -1 : dhead_ != nullptr ? dvocab_host_[(size_t) b2] : (int32_t) b2;
+    // the runner-up's probability under the draft head (softmax over the head's rows, as the draft's own)
+    if ((int) top2p_.size() < max_t_) top2p_.assign((size_t) max_t_, 0.0f);
+    double z = 0;
+    if (b1 >= 0) for (int64_t i = 0; i < nv; ++i) z += std::exp((double) lg_host_[(size_t) i] - lg_host_[(size_t) b1]);
+    top2p_[(size_t) j] = b2 < 0 || z <= 0 ? 0.0f : (float) (std::exp((double) lg_host_[(size_t) b2] - lg_host_[(size_t) b1]) / z);
 }
 
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
@@ -1631,7 +1637,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     };
 
     int n = 0;
-    if (min_p <= 0.0f && max_steps > 0) {
+    // STRATA_MTP_TOP2: the step-by-step path below, each step's logits read before the next overwrites them
+    if (min_p <= 0.0f && max_steps > 0 && !top2_env()) {
         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
@@ -1693,6 +1700,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         tl = Clock::now();
         wait_step(0);
         if (dt) g_dt.wait0_ms += hms(tl);
+        if (top2_env() && cudaStreamSynchronize(cs_) == cudaSuccess) record_top2(0);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
@@ -1711,6 +1719,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             tl = Clock::now();
             wait_step(j);
             if (dt) g_dt.waitj_ms += hms(tl);
+            if (top2_env() && cudaStreamSynchronize(cs_) == cudaSuccess) record_top2(j);
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             if (probs) probs[j] = pj;

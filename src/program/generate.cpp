@@ -17842,7 +17842,17 @@ int main(int argc, char** argv) {
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
-        if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
+        // STRATA_SPEC_TRACE=FILE (diagnostic): a line per round - the position, the MTP's chain (drafts, probabilities
+        // and, with STRATA_MTP_TOP2=1, the runner-ups and theirs), the lookup's proposal, the window, the verifier's
+        // picks, the accepted drafts and the round's time - then the emitted tokens.  STRATA_SPEC_TRACE_FULL=1: the
+        // MTP drafts its whole chain every round (no min-probability stop, no --mtp-max-t cap), so a replay can price
+        // other windows; the windows themselves are chosen as before
+        std::FILE* strace = nullptr;
+        if (const char* f = std::getenv("STRATA_SPEC_TRACE")) strace = std::fopen(f, "w");
+        const bool strace_full = strace != nullptr && std::getenv("STRATA_SPEC_TRACE_FULL") != nullptr;
+        const float draft_min_p = strace_full ? 0.0f : (float) o.spec_min_p;
+        std::string sline;
+        if (use_mtp && S_mtp < o.spec && !strace_full) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::LookupDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
@@ -17871,10 +17881,11 @@ int main(int argc, char** argv) {
             }
             if (first_window) T = 1;
             bool from_sfx = false;
-            int sfx_match = 0;
+            int sfx_match = 0, sfx_k_trace = 0;
             if (o.suffix_draft > 0 && !first_window) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
+                sfx_k_trace = k;
                 if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
                     const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
@@ -17925,6 +17936,22 @@ int main(int argc, char** argv) {
             if (adapt_nowait()) apply_pending(false);
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+            if (strace != nullptr) {
+                char b[96];
+                std::snprintf(b, sizeof b, "R %lld %d %d %d |", (long long) p, T, T_mtp, (int) from_sfx);
+                sline = b;
+                for (int j = 0; use_mtp && j < o.spec - 1 && dprob[(size_t) j] > 0.0f; ++j) {
+                    std::snprintf(b, sizeof b, " %d:%.4f:%d:%.4f", (int) drafts[(size_t) j], dprob[(size_t) j],
+                                  (int) mtp.top2(j), mtp.top2_prob(j));
+                    sline += b;
+                }
+                std::snprintf(b, sizeof b, " | %d %d:", o.suffix_draft > 0 && !first_window ? sfx_k_trace : 0, sfx_match);
+                sline += b;
+                for (int j = 0; o.suffix_draft > 0 && !first_window && j < sfx_k_trace; ++j) {
+                    std::snprintf(b, sizeof b, " %d", (int) sbuf[(size_t) j]);
+                    sline += b;
+                }
+            }
             if (!(exl3_win ? ver.run(T, window.data(), p, &drive_exl3_pool_multi, &exl3_drive, outv.data(), err)
                            : ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err))) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -18008,7 +18035,7 @@ int main(int argc, char** argv) {
                 break;
             }
             const bool drafted = !use_mtp || (int64_t) produced.size() >= max_new ||
-                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), draft_min_p);
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {
@@ -18019,6 +18046,11 @@ int main(int argc, char** argv) {
             p += a + 1;
             const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             total_ms += round_ms;
+            if (strace != nullptr) {
+                std::fprintf(strace, "%s | %d %.3f |", sline.c_str(), a, round_ms);
+                for (int i = 0; i < T; ++i) std::fprintf(strace, " %d", (int) outv[(size_t) i]);
+                std::fprintf(strace, "\n");
+            }
             if (timed_round && chain_n == 0) policy.observe(from_sfx, T, a, sfx_match, round_ms);
             else if (timed_round) policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);
             if (rounds % 64 == 0)
@@ -18031,6 +18063,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (hashes != nullptr) std::fclose(hashes);
+        if (strace != nullptr) {
+            std::fprintf(strace, "E %lld", (long long) n_prompt);
+            for (int64_t t : produced) std::fprintf(strace, " %lld", (long long) t);
+            std::fprintf(strace, "\n");
+            std::fclose(strace);
+        }
         std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
