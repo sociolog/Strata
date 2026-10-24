@@ -248,6 +248,12 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
+    /// <mtp>/experts.fmt ("GU_TYPE D_TYPE", GGUF type ids): the 512 experts as native blobs [gate | up | down rows] run by
+    /// native_expert_grouped (e.g. Q4_0 / Q8_0 at a higher precision than the Q2_0 default); absent: the Q2_0 blobs
+    int nat_gu_ = -1, nat_d_ = -1;
+    uint64_t expert_blob_ = 0;
+    uint8_t* nat_xq_ = nullptr;
+    void* nat_scratch_ = nullptr;
     // Slot drafters borrow immutable weights and head; each still owns its state and scratch.
     bool owns_weights_ = true;
     bool owns_draft_head_ = true;
